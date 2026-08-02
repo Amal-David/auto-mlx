@@ -163,13 +163,9 @@ class ObservationBundle:
 
     @property
     def accepted(self) -> bool:
-        """Recompute structural acceptance; never trust summary booleans."""
+        """G0 withholds public acceptance until a supervisor exists."""
 
-        try:
-            recomputed = self.recompute_measurements()
-            return recomputed.accepted and self._warmups_are_bound()
-        except (AttributeError, ContractError, TypeError, ValueError):
-            return False
+        return False
 
     @property
     def promotion_eligible(self) -> bool:
@@ -184,21 +180,28 @@ class ObservationBundle:
         validate_sha256(self.workload_hash)
         if type(self.runtime) is not RuntimeIdentity:
             return False
-        for value in (
-            self.baseline_runner_id,
-            self.candidate_runner_id,
-            self.isolation_provider_id,
-            self.isolation_verifier_id,
-        ):
+        for value in (self.baseline_runner_id, self.candidate_runner_id):
             if type(value) is not str or not value:
                 return False
-        for value in (
-            self.baseline_runner_digest,
-            self.candidate_runner_digest,
-            self.isolation_identity,
-            self.isolation_verifier_identity,
-        ):
+        for value in (self.baseline_runner_digest, self.candidate_runner_digest):
             validate_sha256(value)
+        isolation_values = (
+            self.isolation_provider_id,
+            self.isolation_identity,
+            self.isolation_verifier_id,
+            self.isolation_verifier_identity,
+            self.isolation_requirements,
+        )
+        if all(value is None for value in isolation_values):
+            return True
+        if any(value is None for value in isolation_values):
+            return False
+        if type(self.isolation_provider_id) is not str or not self.isolation_provider_id:
+            return False
+        if type(self.isolation_verifier_id) is not str or not self.isolation_verifier_id:
+            return False
+        validate_sha256(self.isolation_identity)
+        validate_sha256(self.isolation_verifier_identity)
         if type(self.isolation_requirements) is not frozenset:
             return False
         return self.isolation_requirements == execution_policy.required_isolation
@@ -317,8 +320,6 @@ class Evaluator:
         self._candidate_runner_id = candidate_runner_id
         self._oracle = oracle
         self._artifact_root = artifact_root
-        self._provider = provider
-        self._authority = authority
         self._block_count = self._policy.measurement_runs
         self._policy_digest = sha256_hex(self._policy.to_dict())
         self._execution_policy_digest = _execution_policy_digest(self._execution_policy)
@@ -329,8 +330,6 @@ class Evaluator:
         record = plan.execute(
             self._execution_policy,
             registry=self._registry,
-            provider=self._provider,
-            authority=self._authority,
             observation_id=sample_id,
             arm=arm,
         )
@@ -357,11 +356,6 @@ class Evaluator:
             candidate_runner_digest=candidate_plan.runner_digest,
             oracle=self._oracle,
             require_isolation=True,
-            isolation_provider_id=self._provider.provider_id if self._provider else None,
-            isolation_identity=self._provider.identity if self._provider else None,
-            isolation_verifier_id=self._authority.verifier_id if self._authority else None,
-            isolation_verifier_identity=self._authority.identity if self._authority else None,
-            isolation_requirements=self._execution_policy.required_isolation if self._provider and self._authority else None,
         )
         samples: list[MeasurementSample] = []
         for block in measurement_plan.blocks:
@@ -387,13 +381,13 @@ class Evaluator:
             baseline_runner_digest=baseline_plan.runner_digest,
             candidate_runner_id=candidate_plan.runner_id,
             candidate_runner_digest=candidate_plan.runner_digest,
-            isolation_provider_id=self._provider.provider_id if self._provider else None,
-            isolation_identity=self._provider.identity if self._provider else None,
-            isolation_verifier_id=self._authority.verifier_id if self._authority else None,
-            isolation_verifier_identity=self._authority.identity if self._authority else None,
+            isolation_provider_id=None,
+            isolation_identity=None,
+            isolation_verifier_id=None,
+            isolation_verifier_identity=None,
             warmups=tuple(warmups),
             measurements=measurements,
-            isolation_requirements=self._execution_policy.required_isolation if self._provider and self._authority else None,
+            isolation_requirements=None,
             policy_digest=self._policy_digest,
             execution_policy_digest=self._execution_policy_digest,
             measurement_block_count=count,

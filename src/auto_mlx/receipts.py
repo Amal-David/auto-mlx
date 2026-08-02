@@ -1088,7 +1088,6 @@ def _receipt_from_observation_bundle(
     if not isinstance(oracle, ExactOutputOracle):
         raise ContractError("receipt adapter requires the evaluator ExactOutputOracle", code=FailureCode.ORACLE_MISMATCH)
     recomputed_measurements = bundle.recompute_measurements()
-    accepted = recomputed_measurements.accepted and bundle.accepted
     evaluator_bundle = _observation_bundle_to_wire(
         bundle,
         frozen_policy,
@@ -1110,9 +1109,9 @@ def _receipt_from_observation_bundle(
                     0,
                 )
             )
-    failure = None if accepted else Failure(
+    failure = Failure(
         FailureCode.RUNTIME_FAILURE,
-        "evaluator observation bundle was rejected",
+        "G0 evaluator observation bundle is rejected; production isolation is unavailable",
         {"reasons": list(recomputed_measurements.rejection_reasons)},
     )
     return Receipt(
@@ -1125,7 +1124,7 @@ def _receipt_from_observation_bundle(
         created_at_ns=created_at_ns,
         failure=failure,
         evaluator_bundle=evaluator_bundle,
-        status="complete" if accepted else "failed",
+        status="failed",
     )
 
 

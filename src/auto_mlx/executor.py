@@ -783,7 +783,7 @@ class ExecutionRecord:
         for value in (self.stdout_truncated, self.stderr_truncated, self.output_truncated):
             if type(value) is not bool:
                 raise ContractError("output flags must be booleans", code=FailureCode.WRONG_TYPE)
-        if self.isolation is not None and not isinstance(self.isolation, VerifiedIsolation):
+        if self.isolation is not None and type(self.isolation) is not VerifiedIsolation:
             raise ContractError("isolation must be provider-issued", code=FailureCode.WRONG_TYPE)
         if not isinstance(self.cleanup, CleanupObservation):
             raise ContractError("cleanup must be a CleanupObservation", code=FailureCode.WRONG_TYPE)

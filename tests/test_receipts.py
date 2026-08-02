@@ -13,11 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, sha256_hex
 from auto_mlx.errors import ContractError, Failure, FailureCode, UnknownFieldError
-from auto_mlx.evaluator import Evaluator, Observation, ObservationBundle
+from auto_mlx.evaluator import Evaluator, Observation, ObservationBundle, _execution_policy_digest, _execution_policy_from_contract
 from auto_mlx.executor import ExecutionRecord, ExecutionStatus, IsolationAuthority, IsolationClaim, IsolatedProcess, IsolationProvider, TrustedRunner, TrustedRunnerRegistry
 from auto_mlx.measurement import MeasurementSample, PairedMeasurementPlan, assemble_measurement_bundle
 from auto_mlx.oracle import ExactOutputOracle
-from auto_mlx.promotion import rollback
+from auto_mlx.promotion import ACTIVATE, make_promotion_decision, rollback
 from auto_mlx.receipts import (
     MAX_CURRENT_POINTER_BYTES,
     MAX_STORED_DECISION_BYTES,
@@ -309,18 +309,40 @@ class ReceiptTests(unittest.TestCase):
             isolation_identity=provider.identity,
             isolation_verifier_id=authority.verifier_id,
             isolation_verifier_identity=authority.identity,
+            isolation_requirements=frozenset({"network_denial", "descendant_containment"}),
             warmups=warmups,
             measurements=measurements,
+            policy_digest=sha256_hex(self.policy.to_dict()),
+            execution_policy_digest=_execution_policy_digest(_execution_policy_from_contract(self.policy)),
+            measurement_block_count=self.policy.measurement_runs,
+            evaluation_policy=self.policy,
+            execution_policy=_execution_policy_from_contract(self.policy),
+            oracle=oracle,
+            oracle_descriptor=oracle.descriptor,
         )
-        with self.assertRaises(ContractError):
-            Receipt.from_observation_bundle(
-                bundle,
-                self.workload,
-                self.candidate,
-                self.policy,
-                oracle=oracle,
-                created_at_ns=100,
-            )
+        self.assertFalse(bundle.accepted)
+        self.assertFalse(bundle.promotion_eligible)
+        receipt = Receipt.from_observation_bundle(
+            bundle,
+            self.workload,
+            self.candidate,
+            self.policy,
+            oracle=oracle,
+            created_at_ns=100,
+        )
+        self.assertEqual(receipt.status, "failed")
+        self.assertIsNotNone(receipt.failure)
+        validation = validate_receipt(
+            receipt,
+            attestation=receipt_attestation(receipt, self.key),
+            attestation_key=self.key,
+        )
+        decision = make_promotion_decision(
+            validation,
+            now_ns=110,
+            attestation_key=self.key,
+        )
+        self.assertNotEqual(decision.action, ACTIVATE)
 
     def test_actual_evaluator_slower_candidate_preserves_signed_regression(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

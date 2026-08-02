@@ -43,6 +43,30 @@ class TestOnlyIsolationAuthority(IsolationAuthority):
         return self._attest(provider, claim)
 
 
+class ExplodingFixtureProvider(FixtureIsolationProvider):
+    @property
+    def provider_id(self):
+        raise AssertionError("evaluator must not read provider_id")
+
+    @property
+    def identity(self):
+        raise AssertionError("evaluator must not read provider identity")
+
+
+class ExplodingFixtureAuthority(TestOnlyIsolationAuthority):
+    @property
+    def verifier_id(self):
+        raise AssertionError("evaluator must not read verifier_id")
+
+    @property
+    def identity(self):
+        raise AssertionError("evaluator must not read verifier identity")
+
+    @property
+    def production_eligible(self):
+        raise AssertionError("evaluator must not read production eligibility")
+
+
 class EligibleFixtureAuthority(IsolationAuthority):
     """Synthetic positive-path evidence; this is not a production sandbox."""
 
@@ -78,7 +102,7 @@ class EvaluatorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _evaluator(self, *, provider=None) -> Evaluator:
+    def _evaluator(self, *, provider=None, authority=None) -> Evaluator:
         return Evaluator(
             self.registry,
             baseline_runner_id="baseline",
@@ -93,7 +117,7 @@ class EvaluatorTests(unittest.TestCase):
                 max_output_bytes=4096,
             ),
             provider=self.provider if provider is None else provider,
-            authority=self.authority,
+            authority=self.authority if authority is None else authority,
         )
 
     def test_evaluator_returns_only_complete_provenance_bound_observations(self) -> None:
@@ -106,11 +130,31 @@ class EvaluatorTests(unittest.TestCase):
         self.assertEqual(len(bundle.raw_records), 10)
         self.assertTrue(all(record.status is ExecutionStatus.SANDBOX_UNAVAILABLE for record in bundle.raw_records))
         self.assertEqual(bundle.oracle_descriptor.expected_digest, ExactOutputOracle(b"ok\n").expected_digest)
-        self.assertEqual(bundle.isolation_provider_id, "evaluator-fixture-isolation")
-        self.assertEqual(bundle.isolation_identity, "6" * 64)
-        self.assertEqual(bundle.isolation_verifier_id, "evaluator-test-verifier")
-        self.assertTrue(all(not record.isolation.production_eligible for record in bundle.raw_records if record.isolation))
+        self.assertIsNone(bundle.isolation_provider_id)
+        self.assertIsNone(bundle.isolation_identity)
+        self.assertIsNone(bundle.isolation_verifier_id)
+        self.assertIsNone(bundle.isolation_verifier_identity)
+        self.assertIsNone(bundle.isolation_requirements)
+        self.assertIn("production_isolation_unavailable", bundle.measurements.rejection_reasons)
         self.assertFalse(bundle.promotion_eligible)
+
+    def test_evaluate_never_reads_external_isolation_metadata(self) -> None:
+        bundle = self._evaluator(
+            provider=ExplodingFixtureProvider(),
+            authority=ExplodingFixtureAuthority(),
+        ).evaluate(self.proposal)
+        self.assertFalse(bundle.accepted)
+        self.assertEqual(
+            (
+                bundle.isolation_provider_id,
+                bundle.isolation_identity,
+                bundle.isolation_verifier_id,
+                bundle.isolation_verifier_identity,
+                bundle.isolation_requirements,
+            ),
+            (None, None, None, None, None),
+        )
+        self.assertIn("production_isolation_unavailable", bundle.measurements.rejection_reasons)
 
     def test_failed_warmup_blocks_accepted_evidence(self) -> None:
         bundle = self._evaluator().evaluate(self.proposal)

@@ -8,7 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx.errors import ContractError, Failure, FailureCode
-from auto_mlx.executor import ExecutionRecord, ExecutionStatus, IsolationAuthority, IsolationClaim, IsolationProvider
+from auto_mlx.executor import ExecutionRecord, ExecutionStatus, IsolationAuthority, IsolationClaim, IsolationProvider, VerifiedIsolation
 from auto_mlx.measurement import (
     MeasurementRejected,
     MeasurementSample,
@@ -111,7 +111,8 @@ class MeasurementTests(unittest.TestCase):
             for index, slot in enumerate(block.slots)
         ]
         bundle = assemble_measurement_bundle(self.plan, samples)
-        self.assertTrue(bundle.accepted)
+        self.assertFalse(bundle.accepted)
+        self.assertIn("production_isolation_unavailable", bundle.rejection_reasons)
         self.assertFalse(bundle.promotion_eligible)
         self.assertEqual(len(bundle.raw_samples), 8)
         self.assertEqual(len(bundle.raw_records), 8)
@@ -195,6 +196,73 @@ class MeasurementTests(unittest.TestCase):
         bundle = assemble_measurement_bundle(self.plan, samples)
         self.assertFalse(bundle.accepted)
         self.assertTrue(any("isolation_provider_mismatch" in reason for reason in bundle.rejection_reasons))
+
+    def test_isolation_subclass_is_rejected_where_identity_matters(self) -> None:
+        class ForgedIsolation(VerifiedIsolation):
+            pass
+
+        base = self.authority._attest(self.provider, self.provider._claim("a" * 64))
+        forged = ForgedIsolation(
+            base.provider_id,
+            base.identity,
+            base.verifier_id,
+            base.verifier_identity,
+            base.requirements,
+            base.attestation_digest,
+            True,
+            _authority=self.authority,
+        )
+        object.__setattr__(forged, "production_eligible", True)
+        with self.assertRaises(ContractError):
+            ExecutionRecord(
+                candidate_id=self.candidate_id,
+                workload_hash=self.workload_hash,
+                runner_id=self.baseline_runner_id,
+                runner_digest=self.baseline_runner_digest,
+                status=ExecutionStatus.SUCCESS,
+                parent_elapsed_ns=100,
+                returncode=0,
+                stdout=b"ok\n",
+                isolation=forged,
+            )
+        mutated = self._sample(self.plan.blocks[0].slots[0]).record
+        object.__setattr__(mutated, "isolation", forged)
+        samples = [
+            MeasurementSample(
+                item.sample_id,
+                item.block_id,
+                item.slot_index,
+                item.arm,
+                mutated if item.sample_id == self.plan.blocks[0].slots[0].sample_id else self._sample(item).record,
+                self.oracle.evaluate(b"ok\n"),
+            )
+            for block in self.plan.blocks
+            for item in block.slots
+        ]
+        bundle = assemble_measurement_bundle(self.plan, samples)
+        self.assertFalse(bundle.accepted)
+        self.assertTrue(any("isolation_type_mismatch" in reason for reason in bundle.rejection_reasons))
+
+    def test_non_isolated_raw_measurements_can_remain_structurally_accepted(self) -> None:
+        plan = PairedMeasurementPlan.create(
+            1,
+            candidate_id=self.candidate_id,
+            workload_hash=self.workload_hash,
+            baseline_runner_id=self.baseline_runner_id,
+            baseline_runner_digest=self.baseline_runner_digest,
+            candidate_runner_id=self.candidate_runner_id,
+            candidate_runner_digest=self.candidate_runner_digest,
+            oracle=self.oracle,
+            require_isolation=False,
+        )
+        samples = [
+            self._sample(slot, isolation=False)
+            for block in plan.blocks
+            for slot in block.slots
+        ]
+        bundle = assemble_measurement_bundle(plan, samples)
+        self.assertTrue(bundle.accepted)
+        self.assertFalse(bundle.promotion_eligible)
 
     def test_success_with_nonzero_returncode_is_not_a_measurement_record(self) -> None:
         slot = self.plan.blocks[0].slots[0]

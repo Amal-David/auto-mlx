@@ -13,7 +13,7 @@ from typing import Any, Final, Literal
 
 from .canonical import sha256_hex
 from .errors import AutoMLXError, ContractError, FailureCode
-from .executor import ExecutionRecord, ExecutionStatus
+from .executor import ExecutionRecord, ExecutionStatus, VerifiedIsolation
 from .oracle import ExactOutputOracle, OracleResult
 from .paths import validate_sha256
 
@@ -22,6 +22,7 @@ Arm = Literal["baseline", "candidate"]
 _BASELINE: Final = "baseline"
 _CANDIDATE: Final = "candidate"
 _REQUIRED_ISOLATION: Final = frozenset({"network_denial", "descendant_containment"})
+_PRODUCTION_ISOLATION_UNAVAILABLE: Final = "production_isolation_unavailable"
 
 
 def _arm(value: Any) -> Arm:
@@ -343,7 +344,7 @@ class MeasurementSample:
         if type(self.slot_index) is not int or self.slot_index < 0:
             raise ContractError("slot_index must be a non-negative integer", code=FailureCode.WRONG_TYPE)
         _arm(self.arm)
-        if self.record is not None and not isinstance(self.record, ExecutionRecord):
+        if self.record is not None and type(self.record) is not ExecutionRecord:
             raise ContractError("measurement record must be an ExecutionRecord or null", code=FailureCode.WRONG_TYPE)
         if self.oracle is not None and not isinstance(self.oracle, OracleResult):
             raise ContractError("measurement oracle must be an OracleResult or null", code=FailureCode.WRONG_TYPE)
@@ -492,17 +493,19 @@ def assemble_measurement_bundle(
     bundle_reasons: list[str] = []
     if not plan.bound:
         bundle_reasons.append("unbound_plan")
-    if plan.require_isolation and not all(
-        value is not None
-        for value in (
-            plan.isolation_provider_id,
-            plan.isolation_identity,
-            plan.isolation_verifier_id,
-            plan.isolation_verifier_identity,
-            plan.isolation_requirements,
-        )
-    ):
-        bundle_reasons.append("unbound_isolation_provenance")
+    if plan.require_isolation:
+        bundle_reasons.append(_PRODUCTION_ISOLATION_UNAVAILABLE)
+        if not all(
+            value is not None
+            for value in (
+                plan.isolation_provider_id,
+                plan.isolation_identity,
+                plan.isolation_verifier_id,
+                plan.isolation_verifier_identity,
+                plan.isolation_requirements,
+            )
+        ):
+            bundle_reasons.append("unbound_isolation_provenance")
     if duplicate_ids:
         bundle_reasons.append("duplicate_sample_ids:" + ",".join(sorted(set(duplicate_ids))))
     if unexpected:
@@ -535,6 +538,8 @@ def assemble_measurement_bundle(
                     if plan.require_isolation:
                         if sample.record.isolation is None:
                             reasons.append(f"isolation_unverified:{slot.sample_id}")
+                        elif type(sample.record.isolation) is not VerifiedIsolation:
+                            reasons.append(f"isolation_type_mismatch:{slot.sample_id}")
                         else:
                             if (
                                 sample.record.isolation.provider_id != plan.isolation_provider_id

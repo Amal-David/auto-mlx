@@ -31,6 +31,14 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             ExactOutputOracle(b"golden", expected_digest="0" * 64)
 
+    def test_descriptor_binds_expected_digest_and_size_without_observed_output(self) -> None:
+        oracle = ExactOutputOracle(b"golden\n", label="fixture")
+        descriptor = oracle.descriptor
+        self.assertEqual(descriptor.expected_digest, oracle.expected_digest)
+        self.assertEqual(descriptor.expected_size, len(oracle.expected))
+        self.assertEqual(descriptor.label, "fixture")
+        self.assertNotEqual(descriptor.expected_digest, hashlib.sha256(b"attacker").hexdigest())
+
     def test_matched_oracle_result_cannot_carry_failure_metadata(self) -> None:
         with self.assertRaises(ContractError):
             OracleResult(

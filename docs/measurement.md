@@ -1,6 +1,6 @@
 # Measurement contract
 
-There is no local MLX benchmark in this repository. No MLX speedup has been measured. The G1 evaluator library exists, but production evaluation may fail closed until real isolation and supervisor proof are available; its CLI orchestration is deferred.
+There is no local MLX benchmark in this repository. No MLX speedup has been measured. G0 evaluator execution is intentionally unavailable: every external provider launch is rejected before invocation until a concrete checked-in supervisor and authority exist. The evaluator still retains raw rejected observations for offline diagnosis; CLI orchestration is deferred.
 
 ## Required future record
 
@@ -19,4 +19,4 @@ The baseline and candidate must be paired under the same workload and runtime po
 
 **Architecture lesson:** MLX's lazy evaluation and compilation model can change where work is materialized and may motivate a hypothesis. This is not a result for Auto MLX.
 
-**Empirical evidence:** a reproducible receipt from the future evaluator with the metadata and correctness gates above. Until then, wording such as “faster,” “supported,” or “promoted” is not allowed.
+**Empirical evidence:** a reproducible receipt from a future supervised evaluator with the metadata and correctness gates above. Caller-created authorities, attestations, or production-eligibility flags are not authentication. Until then, wording such as “faster,” “supported,” or “promoted” is not allowed.

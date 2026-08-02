@@ -18,6 +18,7 @@ from auto_mlx.executor import (
     CleanupMode,
     ExecutionPlan,
     ExecutionPolicy,
+    ExecutionRecord,
     ExecutionStatus,
     IsolationAuthority,
     IsolationClaim,
@@ -34,7 +35,7 @@ class FixtureIsolationProvider(IsolationProvider):
     """Test double for a separately supplied real sandbox integration."""
 
     def __init__(self) -> None:
-        super().__init__("fixture-isolation", "1" * 64, supports_evaluator_owned_launch=True)
+        super().__init__("fixture-isolation", "1" * 64)
 
     def enforce(self, argv, *, cwd, env, stdin, stdout, stderr) -> IsolatedProcess:
         process = subprocess.Popen(
@@ -174,9 +175,10 @@ class ExecutorTests(unittest.TestCase):
             provider=self.provider,
             authority=self.authority,
         )
-        self.assertIs(record.status, ExecutionStatus.ARTIFACT_FAILURE)
-        self.assertEqual(record.failure.code.value, "identity_mismatch")  # type: ignore[union-attr]
+        self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
+        self.assertEqual(record.failure.code.value, "sandbox_unavailable")  # type: ignore[union-attr]
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_environment_is_allowlisted_and_working_directories_are_isolated(self) -> None:
         source = """import os
 from pathlib import Path
@@ -197,6 +199,7 @@ print('cwd=' + str(Path.cwd().name.startswith('.auto-mlx-')))
         self.assertEqual(record.observation_id, "sample")
         self.assertIsNotNone(record.isolation)
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_frozen_artifacts_are_verified_and_staged_bytes_are_rechecked(self) -> None:
         frozen = self.root / "input.bin"
         frozen.write_bytes(b"frozen-bytes")
@@ -237,6 +240,7 @@ print('cwd=' + str(Path.cwd().name.startswith('.auto-mlx-')))
         self.assertIs(tampered.status, ExecutionStatus.ARTIFACT_FAILURE)
         self.assertEqual(tampered.failure.code.value, "artifact_size_mismatch")  # type: ignore[union-attr]
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_namespace_swap_during_copy_cannot_change_staged_evidence(self) -> None:
         source_file = self.root / "swap.bin"
         source_file.write_bytes(b"original")
@@ -291,6 +295,7 @@ print('cwd=' + str(Path.cwd().name.startswith('.auto-mlx-')))
                 artifact_paths=(str(script), str(Path(sys.executable).resolve())),
             )
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_execution_uses_pinned_runner_bytes_after_source_mutation(self) -> None:
         script = self.root / "pinned.py"
         script.write_text("print('original')\n", encoding="utf-8")
@@ -324,6 +329,7 @@ print('cwd=' + str(Path.cwd().name.startswith('.auto-mlx-')))
         with self.assertRaises(ContractError):
             build_execution_plan(self.proposal, registry, "mutable", str(self.root))
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_timeout_cleanup_is_best_effort_and_does_not_certify_orphan_freedom(self) -> None:
         if os.name != "posix":
             self.skipTest("process-group assertion is POSIX-specific")
@@ -351,6 +357,7 @@ while True: time.sleep(.02)
         else:
             self.fail("timed-out child process survived fixture group cleanup")
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_output_flood_is_bounded_and_explicitly_failed(self) -> None:
         record = self._execute(self._plan("import sys; sys.stdout.write('x' * 1000000); sys.stdout.flush()\n"),
             ExecutionPolicy(timeout_seconds=1, max_stdout_bytes=64, max_stderr_bytes=64, max_output_bytes=64),
@@ -366,6 +373,31 @@ while True: time.sleep(.02)
         unavailable = self._execute(self._plan("print('must-not-run')\n"), self._policy(), provider=UnavailableProvider())
         self.assertIs(unavailable.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
 
+    def test_caller_created_eligible_attestation_cannot_make_a_record_promotable(self) -> None:
+        class EligibleAuthority(IsolationAuthority):
+            def __init__(self) -> None:
+                super().__init__("eligible-test", "f" * 64, production_eligible=True)
+
+            def verify(self, provider, process, claim: IsolationClaim):
+                return self._attest(provider, claim)
+
+        authority = EligibleAuthority()
+        isolation = authority._attest(self.provider, self.provider._claim("a" * 64))
+        record = ExecutionRecord(
+            candidate_id=self.proposal.candidate_id,
+            workload_hash=self.proposal.workload_hash,
+            runner_id="fixture",
+            runner_digest="4" * 64,
+            status=ExecutionStatus.SUCCESS,
+            parent_elapsed_ns=1,
+            returncode=0,
+            stdout=b"ok\n",
+            isolation=isolation,
+        )
+        self.assertFalse(authority.production_eligible)
+        self.assertFalse(isolation.production_eligible)
+        self.assertFalse(record.promotion_eligible)
+
     def test_provider_self_claim_without_out_of_band_authority_fails_closed(self) -> None:
         record = self._plan("print('must-not-run')\n").execute(
             self._policy(),
@@ -374,8 +406,19 @@ while True: time.sleep(.02)
             authority=None,
         )
         self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
-        self.assertIn("authority", record.failure.message)  # type: ignore[union-attr]
+        self.assertEqual(record.failure.code.value, "sandbox_unavailable")  # type: ignore[union-attr]
 
+    def test_keyboard_interrupt_is_not_swallowed_at_the_coordinator_boundary(self) -> None:
+        with patch("auto_mlx.executor._record_failure", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._plan("print('must-not-run')\n").execute(
+                    self._policy(),
+                    registry=self.registry,
+                    provider=self.provider,
+                    authority=self.authority,
+                )
+
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_unexpected_authority_failure_is_terminal_and_cleans_up(self) -> None:
         record = self._execute(
             self._plan("import time; print('started', flush=True); time.sleep(30)\n"),
@@ -387,6 +430,7 @@ while True: time.sleep(.02)
         self.assertTrue(record.cleanup.attempted)
         self.assertIsNotNone(record.failure)
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_authority_handshake_is_bounded(self) -> None:
         started = time.monotonic()
         record = self._execute(
@@ -448,11 +492,12 @@ while True: time.sleep(.02)
 
         executor_module._read_pipe = fail_read
         try:
-            record = self._execute(self._plan("print('must-fail')\n"), self._policy(), provider=self.provider)
+            capture = executor_module._BoundedCapture(64, 64, 64)
+            executor_module._read_pipe_worker(None, capture, 0)
         finally:
             executor_module._read_pipe = original
-        self.assertIs(record.status, ExecutionStatus.OUTPUT_FAILURE)
-        self.assertIsNotNone(record.failure)
+        self.assertTrue(capture.failure_event.is_set())
+        self.assertTrue(capture.errors)
 
     def test_system_exit_from_pipe_reader_is_recorded_as_output_failure(self) -> None:
         original = executor_module._read_pipe
@@ -462,11 +507,12 @@ while True: time.sleep(.02)
 
         executor_module._read_pipe = terminate_reader
         try:
-            record = self._execute(self._plan("print('must-fail')\n"), self._policy(), provider=self.provider)
+            capture = executor_module._BoundedCapture(64, 64, 64)
+            executor_module._read_pipe_worker(None, capture, 0)
         finally:
             executor_module._read_pipe = original
-        self.assertIs(record.status, ExecutionStatus.OUTPUT_FAILURE)
-        self.assertTrue(any("SystemExit" in error for error in record.failure.details["capture_errors"]))  # type: ignore[union-attr]
+        self.assertTrue(capture.failure_event.is_set())
+        self.assertTrue(any("SystemExit" in error for error in capture.errors))
 
     def test_cleanup_never_signals_the_evaluator_process_group(self) -> None:
         process = MagicMock()
@@ -494,6 +540,7 @@ while True: time.sleep(.02)
         self.assertEqual(record.failure.code.value, "sandbox_unavailable")  # type: ignore[union-attr]
         self.assertEqual(record.stdout, b"")
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_timing_symlink_or_removal_is_ignored_and_parent_timing_is_only_timing(self) -> None:
         source = """import os, pathlib
 path = pathlib.Path.cwd() / '.auto_mlx_child_timing_ns'
@@ -507,6 +554,7 @@ print('child-timing-env=' + str('AUTO_MLX_CHILD_TIMING_PATH' in os.environ))
         self.assertNotIn("child_elapsed_ns", record.to_dict())
         self.assertEqual(record.stdout, b"child-timing-env=False\n")
 
+    @unittest.skip("G0 execution is deferred until a checked-in supervisor exists")
     def test_exit_and_crash_are_distinct_records(self) -> None:
         exited = self._execute(self._plan("raise SystemExit(3)\n"), self._policy(), provider=self.provider)
         self.assertIs(exited.status, ExecutionStatus.EXIT_FAILURE)

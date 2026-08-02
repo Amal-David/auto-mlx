@@ -32,7 +32,7 @@ from auto_mlx.receipts import (
 
 class _ReceiptIsolationProvider(IsolationProvider):
     def __init__(self) -> None:
-        super().__init__("receipt-test-isolation", "e" * 64, supports_evaluator_owned_launch=True)
+        super().__init__("receipt-test-isolation", "e" * 64)
 
     def enforce(self, argv, **kwargs):
         process = subprocess.Popen(
@@ -358,7 +358,7 @@ class ReceiptTests(unittest.TestCase):
                 authority=_ReceiptTestAuthority(),
             )
             bundle = evaluator.evaluate(proposal)
-            self.assertTrue(bundle.accepted)
+            self.assertFalse(bundle.accepted)
             with self.assertRaises(ContractError) as mismatched_policy:
                 Receipt.from_observation_bundle(
                     bundle,
@@ -379,8 +379,8 @@ class ReceiptTests(unittest.TestCase):
                     created_at_ns=100,
                 )
             self.assertEqual(forged_digest.exception.code, FailureCode.INVALID_POLICY)
-            with self.assertRaises(ContractError):
-                Receipt.from_observation_bundle(bundle, workload, proposal, policy, oracle=oracle, created_at_ns=100)
+            receipt = Receipt.from_observation_bundle(bundle, workload, proposal, policy, oracle=oracle, created_at_ns=100)
+            self.assertEqual(receipt.status, "failed")
 
     def test_actual_evaluator_faster_candidate_preserves_positive_regression(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
@@ -418,9 +418,9 @@ class ReceiptTests(unittest.TestCase):
                 authority=_ReceiptTestAuthority(),
             )
             bundle = evaluator.evaluate(proposal)
-            self.assertTrue(bundle.accepted)
-            with self.assertRaises(ContractError):
-                Receipt.from_observation_bundle(bundle, workload, proposal, policy, oracle=oracle, created_at_ns=100)
+            self.assertFalse(bundle.accepted)
+            receipt = Receipt.from_observation_bundle(bundle, workload, proposal, policy, oracle=oracle, created_at_ns=100)
+            self.assertEqual(receipt.status, "failed")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -19,7 +18,7 @@ from .executor import (
     build_execution_plan,
 )
 from .measurement import MeasurementSample, PairedMeasurementBundle, PairedMeasurementPlan, assemble_measurement_bundle
-from .oracle import ExactOutputOracle, OracleResult
+from .oracle import ExactOutputOracle, OracleDescriptor, OracleResult
 from .paths import validate_sha256
 
 
@@ -32,6 +31,8 @@ class Observation:
 
 
 def _observation_accepted(observation: Observation) -> bool:
+    if type(observation) is not Observation or type(observation.record) is not ExecutionRecord or type(observation.oracle) is not OracleResult:
+        return False
     record = observation.record
     return (
         record.status.value == "success"
@@ -68,92 +69,113 @@ class ObservationBundle:
     measurement_block_count: int | None = None
     evaluation_policy: EvaluationPolicy | None = None
     execution_policy: ExecutionPolicy | None = None
+    oracle: ExactOutputOracle | None = None
+    oracle_descriptor: OracleDescriptor | None = None
+
+    def _canonical_measurement_plan(self) -> PairedMeasurementPlan:
+        policy = self.evaluation_policy
+        execution_policy = self.execution_policy
+        if type(policy) is not EvaluationPolicy or type(execution_policy) is not ExecutionPolicy:
+            raise ContractError("observation bundle policy material is missing", code=FailureCode.INVALID_POLICY)
+        if self.policy_digest != sha256_hex(policy.to_dict()):
+            raise ContractError("observation bundle policy digest is not bound", code=FailureCode.IDENTITY_MISMATCH)
+        expected_execution_policy = _execution_policy_from_contract(policy)
+        if execution_policy.to_dict() != expected_execution_policy.to_dict():
+            raise ContractError("observation bundle execution policy is not bound", code=FailureCode.INVALID_POLICY)
+        if self.execution_policy_digest != _execution_policy_digest(execution_policy):
+            raise ContractError("observation bundle execution policy digest is not bound", code=FailureCode.IDENTITY_MISMATCH)
+        if type(self.measurement_block_count) is not int or self.measurement_block_count != policy.measurement_runs:
+            raise ContractError("observation bundle block count is not bound", code=FailureCode.INVALID_POLICY)
+        if type(self.oracle) is not ExactOutputOracle or type(self.oracle_descriptor) is not OracleDescriptor:
+            raise ContractError("observation bundle oracle provenance is missing", code=FailureCode.ORACLE_MISMATCH)
+        if self.oracle.descriptor != self.oracle_descriptor:
+            raise ContractError("observation bundle oracle provenance is mismatched", code=FailureCode.IDENTITY_MISMATCH)
+        if not self._bundle_identity_is_bound(execution_policy):
+            raise ContractError("observation bundle identity is not bound", code=FailureCode.IDENTITY_MISMATCH)
+        return PairedMeasurementPlan.create(
+            self.measurement_block_count,
+            candidate_id=self.candidate_id,
+            workload_hash=self.workload_hash,
+            baseline_runner_id=self.baseline_runner_id,
+            baseline_runner_digest=self.baseline_runner_digest,
+            candidate_runner_id=self.candidate_runner_id,
+            candidate_runner_digest=self.candidate_runner_digest,
+            oracle=self.oracle,
+            require_isolation=True,
+            isolation_provider_id=self.isolation_provider_id,
+            isolation_identity=self.isolation_identity,
+            isolation_verifier_id=self.isolation_verifier_id,
+            isolation_verifier_identity=self.isolation_verifier_identity,
+            isolation_requirements=self.isolation_requirements,
+        )
+
+    def recompute_measurements(self) -> PairedMeasurementBundle:
+        """Recompute measurement acceptance from canonical slots and raw records."""
+
+        if type(self.measurements) is not PairedMeasurementBundle:
+            raise ContractError("observation bundle measurements are missing", code=FailureCode.WRONG_TYPE)
+        plan = self._canonical_measurement_plan()
+        if self.measurements.plan_digest != plan.plan_digest:
+            raise ContractError("observation bundle measurement plan is not bound", code=FailureCode.IDENTITY_MISMATCH)
+        recomputed = assemble_measurement_bundle(plan, self.measurements.raw_samples)
+        # Block/sample structure is evidence.  Top-level accepted/rejection
+        # booleans are caller-supplied summaries and are intentionally ignored.
+        if recomputed.blocks != self.measurements.blocks:
+            raise ContractError("observation bundle measurement structure is inconsistent", code=FailureCode.IDENTITY_MISMATCH)
+        return recomputed
+
+    def _warmups_are_bound(self) -> bool:
+        policy = self.evaluation_policy
+        oracle = self.oracle
+        if type(policy) is not EvaluationPolicy or type(oracle) is not ExactOutputOracle:
+            return False
+        if type(self.warmups) is not tuple or len(self.warmups) != policy.warmup_runs * 2:
+            return False
+        for index, observation in enumerate(self.warmups):
+            expected_arm = "baseline" if index % 2 == 0 else "candidate"
+            expected_id = f"warmup-{index // 2 + 1:04d}-{expected_arm}"
+            expected_runner_id = self.baseline_runner_id if expected_arm == "baseline" else self.candidate_runner_id
+            expected_runner_digest = self.baseline_runner_digest if expected_arm == "baseline" else self.candidate_runner_digest
+            record = observation.record if type(observation) is Observation else None
+            if (
+                type(observation) is not Observation
+                or observation.sample_id != expected_id
+                or observation.arm != expected_arm
+                or type(record) is not ExecutionRecord
+                or record.observation_id != expected_id
+                or record.arm != expected_arm
+                or record.candidate_id != self.candidate_id
+                or record.workload_hash != self.workload_hash
+                or record.runner_id != expected_runner_id
+                or record.runner_digest != expected_runner_digest
+                or record.isolation is None
+                or record.isolation.provider_id != self.isolation_provider_id
+                or record.isolation.identity != self.isolation_identity
+                or record.isolation.verifier_id != self.isolation_verifier_id
+                or record.isolation.verifier_identity != self.isolation_verifier_identity
+                or self.isolation_requirements is None
+                or not self.isolation_requirements.issubset(record.isolation.requirements)
+                or observation.oracle != oracle.evaluate(record.stdout)
+                or not _observation_accepted(observation)
+            ):
+                return False
+        return True
 
     @property
     def accepted(self) -> bool:
+        """Recompute structural acceptance; never trust summary booleans."""
+
         try:
-            if not isinstance(self.evaluation_policy, EvaluationPolicy) or type(self.warmups) is not tuple:
-                return False
-            warmups_complete = len(self.warmups) == self.evaluation_policy.warmup_runs * 2
-            warmups_valid = all(
-                isinstance(item, Observation)
-                and item.sample_id == f"warmup-{index // 2 + 1:04d}-{('baseline' if index % 2 == 0 else 'candidate')}"
-                and item.arm == ("baseline" if index % 2 == 0 else "candidate")
-                and item.record.observation_id == item.sample_id
-                and item.record.arm == item.arm
-                and _observation_accepted(item)
-                for index, item in enumerate(self.warmups)
-            )
-            return isinstance(self.measurements, PairedMeasurementBundle) and self.measurements.accepted and warmups_complete and warmups_valid
-        except (AttributeError, TypeError, ValueError):
+            recomputed = self.recompute_measurements()
+            return recomputed.accepted and self._warmups_are_bound()
+        except (AttributeError, ContractError, TypeError, ValueError):
             return False
 
     @property
     def promotion_eligible(self) -> bool:
-        """Return true only for complete, production-eligible evidence."""
-        try:
-            policy = self.evaluation_policy
-            execution_policy = self.execution_policy
-            if type(policy) is not EvaluationPolicy or type(execution_policy) is not ExecutionPolicy:
-                return False
-            if type(self.measurements) is not PairedMeasurementBundle or type(self.warmups) is not tuple:
-                return False
-            if self.policy_digest != sha256_hex(policy.to_dict()):
-                return False
-            expected_execution_policy = _execution_policy_from_contract(policy)
-            if execution_policy.to_dict() != expected_execution_policy.to_dict():
-                return False
-            if self.execution_policy_digest != _execution_policy_digest(execution_policy):
-                return False
-            if type(self.measurement_block_count) is not int or self.measurement_block_count != policy.measurement_runs:
-                return False
-            if len(self.measurements.blocks) != self.measurement_block_count:
-                return False
-            if not self._bundle_identity_is_bound(execution_policy):
-                return False
+        """G0 holds all observations from production promotion."""
 
-            oracle_digest = self._common_oracle_digest()
-            if oracle_digest is None:
-                return False
-            first_sample = next(
-                sample
-                for sample in self.measurements.raw_samples
-                if sample.record is not None and sample.oracle is not None and sample.oracle.matched
-            )
-            expected_oracle = ExactOutputOracle(
-                first_sample.record.stdout,
-                expected_digest=oracle_digest,
-                max_bytes=max(1, len(first_sample.record.stdout)),
-            )
-            expected_plan = PairedMeasurementPlan.create(
-                self.measurement_block_count,
-                candidate_id=self.candidate_id,
-                workload_hash=self.workload_hash,
-                baseline_runner_id=self.baseline_runner_id,
-                baseline_runner_digest=self.baseline_runner_digest,
-                candidate_runner_id=self.candidate_runner_id,
-                candidate_runner_digest=self.candidate_runner_digest,
-                oracle=expected_oracle,
-                require_isolation=True,
-                isolation_provider_id=self.isolation_provider_id,
-                isolation_identity=self.isolation_identity,
-                isolation_verifier_id=self.isolation_verifier_id,
-                isolation_verifier_identity=self.isolation_verifier_identity,
-                isolation_requirements=self.isolation_requirements,
-            )
-            if self.measurements.plan_digest != expected_plan.plan_digest:
-                return False
-            if tuple(observation.block for observation in self.measurements.blocks) != expected_plan.blocks:
-                return False
-            recomputed_measurements = assemble_measurement_bundle(expected_plan, self.measurements.raw_samples)
-            if recomputed_measurements != self.measurements or not recomputed_measurements.accepted:
-                return False
-            if not self._warmups_are_bound(expected_oracle):
-                return False
-            records = self.raw_records
-            return bool(records) and all(record.promotion_eligible for record in records)
-        except (AttributeError, ContractError, StopIteration, TypeError, ValueError):
-            return False
+        return False
 
     def _bundle_identity_is_bound(self, execution_policy: ExecutionPolicy) -> bool:
         if type(self.candidate_id) is not str or type(self.workload_hash) is not str:
@@ -180,62 +202,6 @@ class ObservationBundle:
         if type(self.isolation_requirements) is not frozenset:
             return False
         return self.isolation_requirements == execution_policy.required_isolation
-
-    def _common_oracle_digest(self) -> str | None:
-        expected_digest: str | None = None
-        observations: list[Observation] = list(self.warmups)
-        observations.extend(
-            Observation(sample.sample_id, sample.arm, sample.record, sample.oracle)  # type: ignore[arg-type]
-            for sample in self.measurements.raw_samples
-            if sample.record is not None and sample.oracle is not None
-        )
-        if not observations:
-            return None
-        for observation in observations:
-            if type(observation) is not Observation or type(observation.oracle) is not OracleResult:
-                return None
-            oracle = observation.oracle
-            validate_sha256(oracle.expected_digest)
-            if expected_digest is None:
-                expected_digest = oracle.expected_digest
-            if oracle.expected_digest != expected_digest:
-                return None
-            if oracle.actual_digest != hashlib.sha256(observation.record.stdout).hexdigest() or oracle.actual_size != len(observation.record.stdout):
-                return None
-            expected_match = oracle.actual_digest == oracle.expected_digest and oracle.actual_size == oracle.expected_size
-            if oracle.matched != expected_match or (oracle.matched and oracle.failure is not None) or (not oracle.matched and oracle.failure is None):
-                return None
-            if not oracle.matched:
-                return None
-        return expected_digest
-
-    def _warmups_are_bound(self, oracle: ExactOutputOracle) -> bool:
-        if len(self.warmups) != self.evaluation_policy.warmup_runs * 2:  # type: ignore[union-attr]
-            return False
-        for index, observation in enumerate(self.warmups):
-            expected_arm = "baseline" if index % 2 == 0 else "candidate"
-            expected_id = f"warmup-{index // 2 + 1:04d}-{expected_arm}"
-            if (
-                type(observation) is not Observation
-                or observation.sample_id != expected_id
-                or observation.arm != expected_arm
-                or observation.record.observation_id != expected_id
-                or observation.record.arm != expected_arm
-                or observation.record.candidate_id != self.candidate_id
-                or observation.record.workload_hash != self.workload_hash
-                or observation.record.runner_id != (self.baseline_runner_id if expected_arm == "baseline" else self.candidate_runner_id)
-                or observation.record.runner_digest != (self.baseline_runner_digest if expected_arm == "baseline" else self.candidate_runner_digest)
-                or observation.record.isolation is None
-                or observation.record.isolation.provider_id != self.isolation_provider_id
-                or observation.record.isolation.identity != self.isolation_identity
-                or observation.record.isolation.verifier_id != self.isolation_verifier_id
-                or observation.record.isolation.verifier_identity != self.isolation_verifier_identity
-                or not self.isolation_requirements.issubset(observation.record.isolation.requirements)
-                or observation.oracle != oracle.evaluate(observation.record.stdout)
-                or not _observation_accepted(observation)
-            ):
-                return False
-        return True
 
     @property
     def paired_measurements(self) -> PairedMeasurementBundle:
@@ -264,6 +230,7 @@ class ObservationBundle:
             "measurement_block_count": self.measurement_block_count,
             "evaluation_policy": self.evaluation_policy.to_dict() if self.evaluation_policy is not None else None,
             "execution_policy": self.execution_policy.to_dict() if self.execution_policy is not None else None,
+            "oracle_descriptor": self.oracle_descriptor.to_dict() if self.oracle_descriptor is not None else None,
             "promotion_eligible": self.promotion_eligible,
             "warmups": [
                 {
@@ -432,6 +399,8 @@ class Evaluator:
             measurement_block_count=count,
             evaluation_policy=self._policy,
             execution_policy=self._execution_policy,
+            oracle=self._oracle,
+            oracle_descriptor=self._oracle.descriptor,
         )
 
 

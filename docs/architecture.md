@@ -19,7 +19,7 @@ Artifacts are identified by a relative POSIX path, byte size, and SHA-256. Verif
 | Lane | Current status | Boundary |
 | --- | --- | --- |
 | G0 contracts | Implemented | Parse, validate, canonicalize, hash, and inspect local documents. |
-| G1 evaluator | Library implemented; production/CLI gated | `Evaluator` owns subprocess plans, timing, output limits, source-oracle comparison, and complete paired observations. Production evaluation may fail closed until real isolation and supervisor proof exist; CLI orchestration remains deferred. |
+| G1 evaluator | Library implemented; production/CLI gated | `Evaluator` owns plans, output/oracle evidence, and complete paired observations; G0 rejects every external provider launch before invocation and records `SANDBOX_UNAVAILABLE` until a checked-in supervisor and authority exist. CLI orchestration remains deferred. |
 | G2 receipts/promotion/dispatch | Libraries implemented; activation/CLI gated | Receipt validation/storage, promotion decisions, and exact-match dispatch with native fallback exist as libraries. Production activation remains gated on later evidence and activation proof; CLI orchestration remains deferred. |
 | Compiler search/custom Metal | Deferred | Research only until parity, measurement, fallback, and rollback gates pass. |
 

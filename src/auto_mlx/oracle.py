@@ -75,6 +75,34 @@ class OracleResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class OracleDescriptor:
+    """Structural identity for an evaluator-owned exact-output oracle.
+
+    The descriptor deliberately contains no expected bytes.  It is suitable
+    for binding observations to the evaluator's oracle without making the
+    serialized observation bundle carry the oracle payload.
+    """
+
+    expected_digest: str
+    expected_size: int
+    label: str
+
+    def __post_init__(self) -> None:
+        validate_sha256(self.expected_digest)
+        if type(self.expected_size) is not int or self.expected_size < 0:
+            raise ContractError("oracle descriptor size must be a non-negative integer", code=FailureCode.WRONG_TYPE)
+        if type(self.label) is not str or not self.label:
+            raise ContractError("oracle descriptor label must be a non-empty string", code=FailureCode.WRONG_TYPE)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "expected_digest": self.expected_digest,
+            "expected_size": self.expected_size,
+            "label": self.label,
+        }
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ExactOutputOracle:
     """Immutable byte-for-byte oracle owned by the evaluator."""
@@ -209,8 +237,19 @@ class ExactOutputOracle:
             failure=failure,
         )
 
+    @property
+    def descriptor(self) -> OracleDescriptor:
+        """Return the non-secret structural identity of this oracle."""
+
+        return OracleDescriptor(self.expected_digest, len(self.expected), self.label)
+
     compare = evaluate
     check = evaluate
 
 
-__all__: Final = ["DEFAULT_MAX_ORACLE_ARTIFACT_BYTES", "ExactOutputOracle", "OracleResult"]
+__all__: Final = [
+    "DEFAULT_MAX_ORACLE_ARTIFACT_BYTES",
+    "ExactOutputOracle",
+    "OracleDescriptor",
+    "OracleResult",
+]

@@ -407,7 +407,9 @@ class PairedMeasurementBundle:
 
     @property
     def promotion_eligible(self) -> bool:
-        return self.accepted and bool(self.raw_records) and all(record.promotion_eligible for record in self.raw_records)
+        """G0 retains measurements for diagnosis but never promotes them."""
+
+        return False
 
     def require_complete(self) -> "PairedMeasurementBundle":
         if not self.accepted:

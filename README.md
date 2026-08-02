@@ -34,7 +34,7 @@ Output creation is exclusive; choose a new path for a second run.
 
 ## Explicit non-capabilities
 
-The evaluator, receipt, promotion, and dispatch libraries are implemented and exported from the package root. The `evaluate`, `promote`, and `dispatch` command names remain explicit deferred CLI orchestration: they return `unavailable` and never imply success. Production evaluation or activation may still fail closed until real isolation, supervisor, evidence, and activation proof are available. Evaluation is a G1 lane; promotion and dispatch are later G2 evidence/activation work.
+The evaluator, receipt, promotion, and dispatch libraries are implemented and exported from the package root. The evaluator retains raw observations but G0 rejects every external provider launch before invocation and reports `SANDBOX_UNAVAILABLE` until a checked-in supervisor and authority exist. The `evaluate`, `promote`, and `dispatch` command names remain explicit deferred CLI orchestration: they return `unavailable` and never imply success. Promotion and dispatch remain later G2 evidence/activation work.
 
 No MLX speedup has been measured by this project. CLI orchestration, compiler search, and custom Metal kernels remain deferred. External MLX documentation and research are design inputs, not local benchmark evidence.
 

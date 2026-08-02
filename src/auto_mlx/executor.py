@@ -69,42 +69,6 @@ def _positive_int(value: Any, *, label: str) -> int:
     return value
 
 
-class _HandshakeTimeout(RuntimeError):
-    """A bounded provider/authority call did not return in time."""
-
-
-def _call_bounded(operation: Any, timeout_seconds: float) -> Any:
-    """Run a handshake in a daemon thread when the call cannot be cancelled.
-
-    Python cannot safely interrupt arbitrary provider code.  A daemon thread
-    still lets the evaluator fail closed at a bounded time; callers must
-    clean up any process handle they already own after an authority timeout.
-    """
-
-    result: list[Any] = []
-    error: list[BaseException] = []
-
-    def invoke() -> None:
-        try:
-            result.append(operation())
-        except BaseException as exc:  # preserve unexpected authority failures
-            error.append(exc)
-
-    thread = threading.Thread(target=invoke, daemon=True)
-    thread.start()
-    thread.join(timeout_seconds)
-    if thread.is_alive():
-        raise _HandshakeTimeout("bounded evaluator handshake timed out")
-    if error:
-        failure = error[0]
-        if isinstance(failure, Exception):
-            raise failure
-        raise RuntimeError(f"evaluator handshake raised {type(failure).__name__}")
-    if not result:
-        raise RuntimeError("evaluator handshake returned no result")
-    return result[0]
-
-
 def _freeze_environment(value: Mapping[str, str]) -> MappingProxyType:
     if not isinstance(value, Mapping):
         raise ContractError("extra_environment must be a mapping", code=FailureCode.WRONG_TYPE)
@@ -215,7 +179,10 @@ class VerifiedIsolation:
         object.__setattr__(self, "verifier_identity", verifier_identity)
         object.__setattr__(self, "requirements", frozenset(requirements))
         object.__setattr__(self, "attestation_digest", attestation_digest)
-        object.__setattr__(self, "production_eligible", production_eligible)
+        # G0 has no checked-in supervisor/authority.  Keep the field for wire
+        # compatibility, but never let caller-created evidence opt into
+        # production eligibility.
+        object.__setattr__(self, "production_eligible", False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,12 +194,14 @@ class IsolatedProcess:
 class IsolationAuthority(ABC):
     """Out-of-band evaluator authority; providers cannot issue evidence."""
 
-    def __init__(self, verifier_id: str, identity: str, *, production_eligible: bool) -> None:
+    def __init__(self, verifier_id: str, identity: str, *, production_eligible: bool = False) -> None:
         self._verifier_id = _non_empty_string(verifier_id, label="verifier_id")
         self._identity = validate_sha256(identity)
         if type(production_eligible) is not bool:
             raise ContractError("production_eligible must be a boolean", code=FailureCode.WRONG_TYPE)
-        self._production_eligible = production_eligible
+        # This is deliberately not caller-configurable in G0.  A Python
+        # object field is not authentication and cannot establish authority.
+        self._production_eligible = False
 
     @property
     def verifier_id(self) -> str:
@@ -244,7 +213,7 @@ class IsolationAuthority(ABC):
 
     @property
     def production_eligible(self) -> bool:
-        return self._production_eligible
+        return False
 
     @abstractmethod
     def verify(
@@ -271,21 +240,11 @@ class IsolationAuthority(ABC):
 
 
 class IsolationProvider(ABC):
-    """Evaluator-owned process launcher that returns only an untrusted claim.
+    """Deferred external launcher contract; G0 never invokes it."""
 
-    The default launch contract is deliberately unsupported.  A provider may
-    opt in only when its synchronous ``enforce`` implementation gives the
-    evaluator cleanup ownership before it can return.  The executor never
-    runs this API in a worker thread, because a timed-out worker could publish
-    a child after the evaluator had already failed closed.
-    """
-
-    def __init__(self, provider_id: str, identity: str, *, supports_evaluator_owned_launch: bool = False) -> None:
+    def __init__(self, provider_id: str, identity: str) -> None:
         self._provider_id = _non_empty_string(provider_id, label="provider_id")
         self._identity = validate_sha256(identity)
-        if type(supports_evaluator_owned_launch) is not bool:
-            raise ContractError("supports_evaluator_owned_launch must be a boolean", code=FailureCode.WRONG_TYPE)
-        self._supports_evaluator_owned_launch = supports_evaluator_owned_launch
 
     @property
     def provider_id(self) -> str:
@@ -294,10 +253,6 @@ class IsolationProvider(ABC):
     @property
     def identity(self) -> str:
         return self._identity
-
-    @property
-    def supports_evaluator_owned_launch(self) -> bool:
-        return self._supports_evaluator_owned_launch
 
     def _claim(self, attestation_digest: str, requirements: frozenset[str] = _REQUIRED_ISOLATION) -> IsolationClaim:
         return IsolationClaim(self.provider_id, self.identity, requirements, attestation_digest)
@@ -353,6 +308,8 @@ class ExecutionPolicy:
     require_descendant_containment: bool = True
     temp_root: str | None = None
     extra_environment: Mapping[str, str] = field(default_factory=dict)
+    # Retained for policy/wire compatibility.  G0 never invokes an external
+    # launcher, so this value is not presented as a bound on arbitrary code.
     launch_timeout_seconds: float = 5.0
     authority_timeout_seconds: float = 5.0
     reader_join_timeout_seconds: float = 1.0
@@ -847,19 +804,9 @@ class ExecutionRecord:
 
     @property
     def promotion_eligible(self) -> bool:
-        """Whether this record is safe to consume as promotable evidence."""
+        """G0 never produces production-eligible execution records."""
 
-        return (
-            self.succeeded
-            and self.parent_elapsed_ns > 0
-            and self.failure is None
-            and not self.stdout_truncated
-            and not self.stderr_truncated
-            and not self.output_truncated
-            and self.isolation is not None
-            and self.isolation.production_eligible
-            and self.cleanup.mode is not CleanupMode.FAILED
-        )
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1312,7 +1259,14 @@ def execute_plan(
     observation_id: str | None = None,
     arm: str | None = None,
 ) -> ExecutionRecord:
-    """Execute only through an evaluator-owned isolation provider."""
+    """Record that G0 execution is unavailable without a checked-in supervisor.
+
+    The provider and authority parameters remain accepted for compatibility
+    with the deferred evaluator API.  They are intentionally never inspected
+    or invoked: a caller-controlled Python object cannot become a security
+    boundary, and no timeout can safely bound an arbitrary call that may
+    create a process after the evaluator has failed.
+    """
 
     if not isinstance(plan, ExecutionPlan):
         raise ContractError("execute_plan requires an ExecutionPlan", code=FailureCode.WRONG_TYPE)
@@ -1323,342 +1277,21 @@ def execute_plan(
     if arm is not None and arm not in {"baseline", "candidate"}:
         raise ContractError("arm must be baseline, candidate, or null", code=FailureCode.WRONG_TYPE)
     started_ns = time.monotonic_ns()
-    started_monotonic = time.monotonic()
-    handshake_deadline = started_monotonic + policy.timeout_seconds
-    if not isinstance(provider, IsolationProvider):
-        return _record_failure(
-            plan,
-            ExecutionStatus.SANDBOX_UNAVAILABLE,
-            _failure(
-                FailureCode.SANDBOX_UNAVAILABLE,
-                "an evaluator-owned isolation provider is required; process groups are not sandbox proof",
-            ),
-            time.monotonic_ns() - started_ns,
-            observation_id=observation_id,
-            arm=arm,
-        )
-    if not isinstance(authority, IsolationAuthority):
-        return _record_failure(
-            plan,
-            ExecutionStatus.SANDBOX_UNAVAILABLE,
-            _failure(FailureCode.SANDBOX_UNAVAILABLE, "an evaluator-owned isolation authority is required; provider claims are not evidence"),
-            time.monotonic_ns() - started_ns,
-            observation_id=observation_id,
-            arm=arm,
-        )
-    if not _REQUIRED_ISOLATION.issubset(policy.required_isolation):
-        return _record_failure(
-            plan,
-            ExecutionStatus.SANDBOX_UNAVAILABLE,
-            _failure(FailureCode.SANDBOX_UNAVAILABLE, "evaluation policy must require network and descendant isolation"),
-            time.monotonic_ns() - started_ns,
-            observation_id=observation_id,
-            arm=arm,
-        )
-    if not provider.supports_evaluator_owned_launch:
-        return _record_failure(
-            plan,
-            ExecutionStatus.SANDBOX_UNAVAILABLE,
-            _failure(
-                FailureCode.SANDBOX_UNAVAILABLE,
-                "isolation provider launch contract does not provide evaluator-owned cleanup before invocation",
-            ),
-            time.monotonic_ns() - started_ns,
-            observation_id=observation_id,
-            arm=arm,
-        )
 
-    process: subprocess.Popen[bytes] | None = None
-    capture: _BoundedCapture | None = None
-    readers: list[threading.Thread] = []
-    isolation: VerifiedIsolation | None = None
-    cleanup = CleanupObservation(False, CleanupMode.NOT_NEEDED)
-    timed_out = False
-    output_failed = False
-    returncode: int | None = None
-    try:
-        try:
-            _verify_execution_plan(plan, registry)  # type: ignore[arg-type]
-        except AutoMLXError as exc:
-            return _record_failure(
-                plan,
-                ExecutionStatus.ARTIFACT_FAILURE,
-                Failure(exc.code, str(exc)),
-                time.monotonic_ns() - started_ns,
-                observation_id=observation_id,
-                arm=arm,
-            )
-        with tempfile.TemporaryDirectory(prefix=".auto-mlx-", dir=policy.temp_root) as temporary:
-            workdir = Path(temporary)
-            artifacts_path = workdir / _ARTIFACT_DIRECTORY
-            artifacts_path.mkdir(mode=0o700)
-            try:
-                runner_argv = _stage_runner_artifacts(plan, workdir / ".auto_mlx_runner")
-            except AutoMLXError as exc:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.ARTIFACT_FAILURE,
-                    Failure(exc.code, str(exc)),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                )
-            config_path = workdir / _CONFIG_FILE
-            config_path.write_bytes(plan.config_bytes)
-            os.chmod(config_path, 0o400)
-            try:
-                _copy_frozen_artifacts(plan, artifacts_path)
-            except AutoMLXError as exc:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.ARTIFACT_FAILURE,
-                    Failure(exc.code, str(exc)),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                )
-            environment = _prepare_environment(workdir, policy, config_path, artifacts_path)
-            try:
-                launched = provider.enforce(
-                    runner_argv,
-                    cwd=str(workdir),
-                    env=environment,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-            except Exception as exc:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.SANDBOX_UNAVAILABLE,
-                    _failure(
-                        FailureCode.TIMEOUT if isinstance(exc, _HandshakeTimeout) else FailureCode.SANDBOX_UNAVAILABLE,
-                        "isolation provider handshake did not complete safely",
-                        error=type(exc).__name__,
-                    ),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                )
-            if not isinstance(launched, IsolatedProcess) or not isinstance(launched.process, subprocess.Popen):
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.SANDBOX_UNAVAILABLE,
-                    _failure(FailureCode.SANDBOX_UNAVAILABLE, "isolation provider returned no verified process"),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                )
-            process = launched.process
-            if process.stdout is None or process.stderr is None:
-                cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.START_FAILURE,
-                    _failure(FailureCode.RUNTIME_FAILURE, "isolation provider did not attach bounded output pipes"),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                    isolation=isolation,
-                    cleanup=cleanup,
-                )
-            capture = _BoundedCapture(policy.max_stdout_bytes, policy.max_stderr_bytes, policy.max_output_bytes)
-            readers = [
-                threading.Thread(target=_read_pipe_worker, args=(process.stdout, capture, 0), daemon=True),
-                threading.Thread(target=_read_pipe_worker, args=(process.stderr, capture, 1), daemon=True),
-            ]
-            for reader in readers:
-                reader.start()
-
-            try:
-                authority_timeout = min(
-                    policy.authority_timeout_seconds,
-                    max(0.01, handshake_deadline - time.monotonic()),
-                )
-                isolation = _call_bounded(
-                    lambda: authority.verify(provider, process, launched.claim),
-                    authority_timeout,
-                )
-            except Exception as exc:
-                cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                reader_failure = _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
-                stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.SANDBOX_UNAVAILABLE,
-                    _failure(
-                        FailureCode.TIMEOUT if isinstance(exc, _HandshakeTimeout) else FailureCode.SANDBOX_UNAVAILABLE,
-                        "isolation authority could not verify provider enforcement",
-                        error=type(exc).__name__,
-                        capture_errors=list(capture.errors),
-                        reader_failure=reader_failure,
-                    ),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                    cleanup=cleanup,
-                    stdout=stdout,
-                    stderr=stderr,
-                    stdout_truncated=stdout_truncated,
-                    stderr_truncated=stderr_truncated,
-                    output_truncated=output_truncated,
-                )
-            if (
-                not isinstance(isolation, VerifiedIsolation)
-                or isolation.provider_id != provider.provider_id
-                or isolation.identity != provider.identity
-                or isolation.verifier_id != authority.verifier_id
-                or isolation.verifier_identity != authority.identity
-                or not policy.required_isolation.issubset(isolation.requirements)
-            ):
-                cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                reader_failure = _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
-                stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.SANDBOX_UNAVAILABLE,
-                    _failure(
-                        FailureCode.SANDBOX_UNAVAILABLE,
-                        "isolation authority returned mismatched evidence identity",
-                        capture_errors=list(capture.errors),
-                        reader_failure=reader_failure,
-                    ),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                    cleanup=cleanup,
-                    stdout=stdout,
-                    stderr=stderr,
-                    stdout_truncated=stdout_truncated,
-                    stderr_truncated=stderr_truncated,
-                    output_truncated=output_truncated,
-                )
-            deadline = time.monotonic() + policy.timeout_seconds
-            while process.poll() is None:
-                if capture.output_event.is_set() or capture.failure_event.is_set():
-                    output_failed = True
-                    cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                    break
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                    break
-                time.sleep(0.005)
-            if (capture.output_event.is_set() or capture.failure_event.is_set()) and not output_failed:
-                output_failed = True
-                cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-            returncode = process.poll()
-            if returncode is None:
-                try:
-                    returncode = process.wait(timeout=policy.kill_grace_seconds)
-                except subprocess.TimeoutExpired:
-                    cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                    returncode = process.poll()
-            reader_failure = _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
-            stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
-            elapsed_ns = max(1, time.monotonic_ns() - started_ns)
-            common = {
-                "observation_id": observation_id,
-                "arm": arm,
-                "isolation": isolation,
-                "cleanup": cleanup,
-                "returncode": returncode,
-                "stdout": stdout,
-                "stderr": stderr,
-                "stdout_truncated": stdout_truncated,
-                "stderr_truncated": stderr_truncated,
-                "output_truncated": output_truncated,
-            }
-            if output_failed or output_truncated or reader_failure:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.OUTPUT_FAILURE,
-                    _failure(
-                        FailureCode.OUTPUT_LIMIT if output_truncated else FailureCode.RUNTIME_FAILURE,
-                        "runner output capture did not complete safely",
-                        capture_errors=list(capture.errors),
-                        reader_failure=reader_failure,
-                    ),
-                    elapsed_ns,
-                    **common,
-                )
-            if timed_out:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.TIMEOUT,
-                    _failure(FailureCode.TIMEOUT, "runner exceeded the evaluator timeout", timeout_seconds=policy.timeout_seconds),
-                    elapsed_ns,
-                    **common,
-                )
-            if returncode is None or returncode < 0:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.CRASH,
-                    _failure(FailureCode.RUNTIME_FAILURE, "runner terminated by a signal", returncode=returncode),
-                    elapsed_ns,
-                    **common,
-                )
-            if returncode != 0:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.EXIT_FAILURE,
-                    _failure(FailureCode.RUNTIME_FAILURE, "runner exited unsuccessfully", returncode=returncode),
-                    elapsed_ns,
-                    **common,
-                )
-            if cleanup.mode is CleanupMode.FAILED:
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.START_FAILURE,
-                    _failure(FailureCode.RUNTIME_FAILURE, "runner cleanup was ambiguous"),
-                    elapsed_ns,
-                    **common,
-                )
-            return ExecutionRecord(
-                candidate_id=plan.candidate_id,
-                workload_hash=plan.workload_hash,
-                runner_id=plan.runner_id,
-                runner_digest=plan.runner_digest,
-                status=ExecutionStatus.SUCCESS,
-                parent_elapsed_ns=elapsed_ns,
-                observation_id=observation_id,
-                arm=arm,
-                returncode=returncode,
-                stdout=stdout,
-                stderr=stderr,
-                isolation=isolation,
-                cleanup=cleanup,
-            )
-    except Exception as exc:
-        if process is not None and process.poll() is None:
-            cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-        if process is not None and capture is not None:
-            _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
-            stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
-        else:
-            stdout = stderr = b""
-            stdout_truncated = stderr_truncated = output_truncated = False
-        return _record_failure(
-            plan,
-            ExecutionStatus.START_FAILURE,
-            _failure(
-                FailureCode.RUNTIME_FAILURE,
-                "executor failed closed after an unexpected error",
-                error=type(exc).__name__,
-                capture_errors=list(capture.errors) if capture is not None else [],
-            ),
-            time.monotonic_ns() - started_ns,
-            observation_id=observation_id,
-            arm=arm,
-            isolation=isolation,
-            cleanup=cleanup,
-            stdout=stdout,
-            stderr=stderr,
-            stdout_truncated=stdout_truncated,
-            stderr_truncated=stderr_truncated,
-            output_truncated=output_truncated,
-        )
-
+    # G0 has no concrete supervisor/authority implementation.  Fail closed
+    # before staging artifacts, calling a provider, calling an authority, or
+    # starting any background work.
+    return _record_failure(
+        plan,
+        ExecutionStatus.SANDBOX_UNAVAILABLE,
+        _failure(
+            FailureCode.SANDBOX_UNAVAILABLE,
+            "G0 execution is unavailable until a checked-in supervisor provides isolation authority",
+        ),
+        time.monotonic_ns() - started_ns,
+        observation_id=observation_id,
+        arm=arm,
+    )
 
 __all__: Final = [
     "CleanupMode",

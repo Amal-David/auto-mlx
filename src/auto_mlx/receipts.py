@@ -521,12 +521,34 @@ def _measurement_bundle_to_wire(measurements: Any) -> dict[str, Any]:
     }
 
 
-def _observation_bundle_to_wire(bundle: Any, policy: EvaluationPolicy, oracle: Any | None) -> dict[str, Any]:
+def _observation_bundle_to_wire(
+    bundle: Any,
+    policy: EvaluationPolicy,
+    oracle: Any | None,
+    *,
+    measurements: Any | None = None,
+) -> dict[str, Any]:
+    from .oracle import ExactOutputOracle, OracleDescriptor
+
     if oracle is None:
         raise ContractError(
             "an evaluator-owned exact oracle is required to adapt an observation bundle",
             code=FailureCode.ORACLE_MISMATCH,
         )
+    if not isinstance(oracle, ExactOutputOracle):
+        raise ContractError("observation bundle oracle must be an ExactOutputOracle", code=FailureCode.ORACLE_MISMATCH)
+    if getattr(bundle, "oracle", None) is not oracle:
+        raise ContractError(
+            "observation bundle must retain the evaluator constructor's original oracle",
+            code=FailureCode.IDENTITY_MISMATCH,
+        )
+    oracle_descriptor = getattr(bundle, "oracle_descriptor", None)
+    if type(oracle_descriptor) is not OracleDescriptor or oracle_descriptor != oracle.descriptor:
+        raise ContractError(
+            "observation bundle oracle is not bound to the evaluator oracle descriptor",
+            code=FailureCode.IDENTITY_MISMATCH,
+        )
+    measurements = bundle.measurements if measurements is None else measurements
     if type(bundle.isolation_provider_id) not in {str, type(None)}:
         raise ContractError("observation isolation provider identity is malformed", code=FailureCode.WRONG_TYPE)
     if type(bundle.isolation_identity) not in {str, type(None)}:
@@ -577,9 +599,9 @@ def _observation_bundle_to_wire(bundle: Any, policy: EvaluationPolicy, oracle: A
         "isolation_verifier_identity": isolation_verifier_identity,
         "isolation_requirements": sorted(isolation_requirements) if isolation_requirements is not None else None,
         "oracle": {
-            "label": oracle.label,
-            "expected_digest": oracle.expected_digest,
-            "expected_size": len(oracle.expected),
+            "label": oracle_descriptor.label,
+            "expected_digest": oracle_descriptor.expected_digest,
+            "expected_size": oracle_descriptor.expected_size,
             "expected_b64": _encode_bytes(oracle.expected),
         },
         "warmups": [
@@ -591,7 +613,7 @@ def _observation_bundle_to_wire(bundle: Any, policy: EvaluationPolicy, oracle: A
             }
             for observation in bundle.warmups
         ],
-        "measurements": _measurement_bundle_to_wire(bundle.measurements),
+        "measurements": _measurement_bundle_to_wire(measurements),
     }
 
 
@@ -666,8 +688,8 @@ def _validate_record_wire(value: Any, *, label: str) -> tuple[bytes, bytes, dict
         validate_sha256(isolation_data["verifier_identity"])
         validate_sha256(isolation_data["attestation_digest"])
         _boolean(isolation_data["production_eligible"], label=f"{label}.isolation.production_eligible")
-        if not isolation_data["production_eligible"]:
-            raise ContractError(f"{label}.isolation is not production eligible", code=FailureCode.SANDBOX_UNAVAILABLE)
+        if isolation_data["production_eligible"]:
+            raise ContractError(f"{label}.isolation cannot claim G0 production eligibility", code=FailureCode.SANDBOX_UNAVAILABLE)
         if type(isolation_data["requirements"]) is not list or any(type(item) is not str for item in isolation_data["requirements"]):
             raise ContractError(f"{label}.isolation.requirements must be a string array", code=FailureCode.WRONG_TYPE)
         if not {"network_denial", "descendant_containment"}.issubset(isolation_data["requirements"]):
@@ -873,8 +895,6 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             raise ContractError("measurement block is not ABBA or BAAB", code=FailureCode.INVALID_VALUE)
         _string(block_data["block_id"], label=f"block[{block_index}].block_id")
         _boolean(block_data["accepted"], label=f"block[{block_index}].accepted")
-        if not block_data["accepted"] or block_data["rejection_reasons"]:
-            all_success = False
         if type(block_data["rejection_reasons"]) is not list or any(type(item) is not str for item in block_data["rejection_reasons"]):
             raise ContractError("measurement block rejection reasons are invalid", code=FailureCode.WRONG_TYPE)
         samples = block_data["samples"]
@@ -961,10 +981,7 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             all_slots += 1
     expected_slots = policy.measurement_runs * 4
     compatible = (
-        measurements["accepted"]
-        and warmup_success
-        and not measurements["rejection_reasons"]
-        and not measurements["unexpected_sample_ids"]
+        warmup_success
         and all_success
         and all_slots == expected_slots
         and len(baseline_values) == policy.measurement_runs * 2
@@ -1029,7 +1046,7 @@ def _receipt_from_observation_bundle(
 ) -> Receipt:
     from .evaluator import ObservationBundle
 
-    if not isinstance(bundle, ObservationBundle):
+    if type(bundle) is not ObservationBundle:
         raise ContractError("receipt adapter requires the evaluator ObservationBundle", code=FailureCode.WRONG_TYPE)
     frozen_workload = _coerce_workload(workload)
     frozen_candidate = _coerce_candidate(candidate, frozen_workload)
@@ -1070,9 +1087,16 @@ def _receipt_from_observation_bundle(
         raise ContractError("evaluator bundle runtime is invalid", code=FailureCode.INVALID_RUNTIME)
     if not isinstance(oracle, ExactOutputOracle):
         raise ContractError("receipt adapter requires the evaluator ExactOutputOracle", code=FailureCode.ORACLE_MISMATCH)
-    evaluator_bundle = _observation_bundle_to_wire(bundle, frozen_policy, oracle)
+    recomputed_measurements = bundle.recompute_measurements()
+    accepted = recomputed_measurements.accepted and bundle.accepted
+    evaluator_bundle = _observation_bundle_to_wire(
+        bundle,
+        frozen_policy,
+        oracle,
+        measurements=recomputed_measurements,
+    )
     raw_samples: list[RawSample] = []
-    for block in bundle.measurements.blocks:
+    for block in recomputed_measurements.blocks:
         for sample in block.samples:
             record = sample.record
             stdout = b"" if record is None else record.stdout
@@ -1086,7 +1110,11 @@ def _receipt_from_observation_bundle(
                     0,
                 )
             )
-    failure = None if bundle.accepted else Failure(FailureCode.RUNTIME_FAILURE, "evaluator observation bundle was rejected", {"reasons": list(bundle.measurements.rejection_reasons)})
+    failure = None if accepted else Failure(
+        FailureCode.RUNTIME_FAILURE,
+        "evaluator observation bundle was rejected",
+        {"reasons": list(recomputed_measurements.rejection_reasons)},
+    )
     return Receipt(
         frozen_workload,
         frozen_candidate,
@@ -1097,7 +1125,7 @@ def _receipt_from_observation_bundle(
         created_at_ns=created_at_ns,
         failure=failure,
         evaluator_bundle=evaluator_bundle,
-        status="complete" if bundle.accepted else "failed",
+        status="complete" if accepted else "failed",
     )
 
 

@@ -19,7 +19,7 @@ from auto_mlx.oracle import ExactOutputOracle
 
 class FixtureIsolationProvider(IsolationProvider):
     def __init__(self) -> None:
-        super().__init__("evaluator-fixture-isolation", "6" * 64, supports_evaluator_owned_launch=True)
+        super().__init__("evaluator-fixture-isolation", "6" * 64)
 
     def enforce(self, argv, *, cwd, env, stdin, stdout, stderr) -> IsolatedProcess:
         process = subprocess.Popen(
@@ -99,12 +99,13 @@ class EvaluatorTests(unittest.TestCase):
     def test_evaluator_returns_only_complete_provenance_bound_observations(self) -> None:
         bundle = self._evaluator().evaluate(self.proposal)
         self.assertIsInstance(bundle, ObservationBundle)
-        self.assertTrue(bundle.accepted)
+        self.assertFalse(bundle.accepted)
         self.assertEqual(len(bundle.measurements.blocks), 2)
         self.assertEqual(len(bundle.measurements.raw_records), 8)
         self.assertEqual(len(bundle.warmups), 2)
         self.assertEqual(len(bundle.raw_records), 10)
-        self.assertTrue(all(sample.oracle.matched for sample in bundle.measurements.raw_samples))
+        self.assertTrue(all(record.status is ExecutionStatus.SANDBOX_UNAVAILABLE for record in bundle.raw_records))
+        self.assertEqual(bundle.oracle_descriptor.expected_digest, ExactOutputOracle(b"ok\n").expected_digest)
         self.assertEqual(bundle.isolation_provider_id, "evaluator-fixture-isolation")
         self.assertEqual(bundle.isolation_identity, "6" * 64)
         self.assertEqual(bundle.isolation_verifier_id, "evaluator-test-verifier")
@@ -126,6 +127,27 @@ class EvaluatorTests(unittest.TestCase):
         )
         self.assertFalse(failed.accepted)
         self.assertFalse(failed.promotion_eligible)
+
+    def test_acceptance_recomputes_measurements_and_oracle_binding(self) -> None:
+        bundle = self._evaluator().evaluate(self.proposal)
+        forged_summary = replace(
+            bundle,
+            measurements=replace(bundle.measurements, accepted=True, rejection_reasons=()),
+        )
+        self.assertFalse(forged_summary.accepted)
+        forged_oracle = replace(
+            bundle,
+            oracle_descriptor=ExactOutputOracle(b"attacker\n").descriptor,
+        )
+        self.assertFalse(forged_oracle.accepted)
+
+    def test_authority_eligibility_flag_is_ignored_and_oracle_is_retained(self) -> None:
+        authority = EligibleFixtureAuthority()
+        self.assertFalse(authority.production_eligible)
+        evaluator = self._evaluator()
+        bundle = evaluator.evaluate(self.proposal)
+        self.assertIs(bundle.oracle, evaluator._oracle)
+        self.assertEqual(bundle.to_dict()["oracle_descriptor"], bundle.oracle_descriptor.to_dict())
 
     def test_block_count_and_execution_policy_must_match_declared_policy(self) -> None:
         with self.assertRaises(ContractError):
@@ -179,7 +201,7 @@ class EvaluatorTests(unittest.TestCase):
         self.assertTrue(all(record.status is ExecutionStatus.SANDBOX_UNAVAILABLE for record in bundle.measurements.raw_records))
         self.assertTrue(any("isolation_unverified" in reason for reason in bundle.measurements.rejection_reasons))
 
-    def test_complete_production_eligible_evidence_is_marked_promotion_eligible(self) -> None:
+    def test_caller_created_eligible_authority_cannot_promote_g0_evidence(self) -> None:
         evaluator = Evaluator(
             self.registry,
             baseline_runner_id="baseline",
@@ -197,8 +219,8 @@ class EvaluatorTests(unittest.TestCase):
             authority=EligibleFixtureAuthority(),
         )
         bundle = evaluator.evaluate(self.proposal)
-        self.assertTrue(bundle.accepted)
-        self.assertTrue(bundle.promotion_eligible)
+        self.assertFalse(bundle.accepted)
+        self.assertFalse(bundle.promotion_eligible)
 
     def test_promotion_eligibility_recomputes_reconstructed_evidence_bindings(self) -> None:
         evaluator = Evaluator(
@@ -218,7 +240,7 @@ class EvaluatorTests(unittest.TestCase):
             authority=EligibleFixtureAuthority(),
         )
         bundle = evaluator.evaluate(self.proposal)
-        self.assertTrue(bundle.promotion_eligible)
+        self.assertFalse(bundle.promotion_eligible)
 
         first_warmup = bundle.warmups[0]
         bad_warmup_identity = replace(

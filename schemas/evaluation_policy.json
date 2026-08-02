@@ -6,9 +6,9 @@
   "additionalProperties": false,
   "required": ["warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes"],
   "properties": {
-    "warmup_runs": {"type": "integer", "minimum": 0},
-    "measurement_runs": {"type": "integer", "minimum": 1},
+    "warmup_runs": {"type": "integer", "minimum": 0, "maximum": 100},
+    "measurement_runs": {"type": "integer", "minimum": 1, "maximum": 100},
     "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 3600},
-    "max_output_bytes": {"type": "integer", "minimum": 1}
+    "max_output_bytes": {"type": "integer", "minimum": 1, "maximum": 8388608}
   }
 }

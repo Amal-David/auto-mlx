@@ -9,8 +9,11 @@
     "provider_id": {"type": "string", "minLength": 1},
     "configs": {
       "type": "array",
+      "maxItems": 4096,
+      "uniqueItems": true,
       "items": {
         "type": "object",
+        "maxProperties": 64,
         "not": {"required": ["candidate_id"]},
         "additionalProperties": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}
       }

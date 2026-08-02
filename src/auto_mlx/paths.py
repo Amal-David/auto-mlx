@@ -42,6 +42,10 @@ def validate_relative_posix_path(value: str) -> str:
 
     if type(value) is not str or not value:
         raise UnsafePathError("artifact path must be a non-empty string")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise UnsafePathError("artifact path must not contain control characters")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise UnsafePathError("artifact path must not contain unpaired surrogates")
     if "\x00" in value:
         raise UnsafePathError("artifact path must not contain NUL")
     if "\\" in value:
@@ -60,7 +64,7 @@ def _open_flags(*, directory: bool) -> int:
     if not _NOFOLLOW_AVAILABLE or not _OPEN_SUPPORTS_DIR_FD:
         raise ArtifactIntegrityError(
             "descriptor-relative no-follow artifact access is unavailable",
-            code=FailureCode.ARTIFACT_SYMLINK,
+            code=FailureCode.ARTIFACT_SECURITY_UNAVAILABLE,
         )
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if directory:
@@ -75,7 +79,24 @@ def _open_error(exc: OSError, *, path: str) -> ArtifactIntegrityError:
         return ArtifactIntegrityError(f"artifact path contains a symlink: {path}", code=FailureCode.ARTIFACT_SYMLINK)
     if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
         return ArtifactIntegrityError(f"artifact path is not a regular file: {path}", code=FailureCode.ARTIFACT_NOT_REGULAR)
-    return ArtifactIntegrityError(f"cannot open artifact safely: {exc}")
+    if exc.errno in {errno.EACCES, errno.EPERM}:
+        return ArtifactIntegrityError(f"cannot access artifact safely: {exc}", code=FailureCode.ARTIFACT_ACCESS)
+    return ArtifactIntegrityError(f"cannot open artifact safely: {exc}", code=FailureCode.ARTIFACT_IO_ERROR)
+
+
+def _read_error(exc: OSError, *, path: str) -> ArtifactIntegrityError:
+    if exc.errno in {errno.EACCES, errno.EPERM}:
+        return ArtifactIntegrityError(f"cannot access artifact: {path}: {exc}", code=FailureCode.ARTIFACT_ACCESS)
+    return ArtifactIntegrityError(f"cannot read artifact: {path}: {exc}", code=FailureCode.ARTIFACT_IO_ERROR)
+
+
+def _close_descriptor(descriptor: int) -> None:
+    """Close a descriptor during cleanup without masking the active failure."""
+
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
 
 
 def _open_root_directory(root: str | os.PathLike[str]) -> int:
@@ -103,7 +124,11 @@ def _open_root_directory(root: str | os.PathLike[str]) -> int:
         descriptor = os.open(anchor, flags)
         for component in parts[1:]:
             child = os.open(component, flags, dir_fd=descriptor)
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                _close_descriptor(child)
+                raise
             descriptor = child
         root_stat = os.fstat(descriptor)
         if not stat.S_ISDIR(root_stat.st_mode):
@@ -115,11 +140,11 @@ def _open_root_directory(root: str | os.PathLike[str]) -> int:
         return descriptor
     except ArtifactIntegrityError:
         if descriptor is not None:
-            os.close(descriptor)
+            _close_descriptor(descriptor)
         raise
     except OSError as exc:
         if descriptor is not None:
-            os.close(descriptor)
+            _close_descriptor(descriptor)
         raise _open_error(exc, path=str(root_path)) from exc
 
 
@@ -143,19 +168,21 @@ def _open_verified_file(root: str | os.PathLike[str], relative_path: str) -> int
                 # the subsequent security decision is still made by openat
                 # with O_NOFOLLOW, never by this metadata probe.
                 if exc.errno == errno.ENOTDIR:
-                    entry = os.stat(component, dir_fd=descriptors[-1], follow_symlinks=False)
+                    try:
+                        entry = os.stat(component, dir_fd=descriptors[-1], follow_symlinks=False)
+                    except OSError as stat_exc:
+                        raise _open_error(stat_exc, path=safe) from exc
                     if stat.S_ISLNK(entry.st_mode):
                         raise ArtifactIntegrityError(
                             f"artifact path contains a symlink: {safe}", code=FailureCode.ARTIFACT_SYMLINK
                         ) from exc
                 raise
+            descriptors.append(child)
             child_stat = os.fstat(child)
             if not stat.S_ISDIR(child_stat.st_mode):
-                os.close(child)
                 raise ArtifactIntegrityError(
                     f"artifact parent is not a directory: {safe}", code=FailureCode.ARTIFACT_NOT_REGULAR
                 )
-            descriptors.append(child)
         final_descriptor = os.open(
             components[-1], _open_flags(directory=False), dir_fd=descriptors[-1]
         )
@@ -174,9 +201,9 @@ def _open_verified_file(root: str | os.PathLike[str], relative_path: str) -> int
         raise _open_error(exc, path=safe) from exc
     finally:
         if final_descriptor is not None and not success:
-            os.close(final_descriptor)
+            _close_descriptor(final_descriptor)
         for descriptor in reversed(descriptors):
-            os.close(descriptor)
+            _close_descriptor(descriptor)
 
 
 def file_identity(
@@ -190,6 +217,7 @@ def file_identity(
 
     descriptor = _open_verified_file(root, relative_path)
     digest = hashlib.sha256()
+    close_error: OSError | None = None
     try:
         if expected_size is not None:
             validate_non_negative_int(expected_size, label="expected_size")
@@ -200,6 +228,15 @@ def file_identity(
                 code=FailureCode.ARTIFACT_SIZE_MISMATCH,
             )
         limit = max_bytes if expected_size is None else expected_size
+        try:
+            initial_stat = os.fstat(descriptor)
+        except OSError as exc:
+            raise _read_error(exc, path=relative_path) from exc
+        if initial_stat.st_size > limit:
+            raise ArtifactIntegrityError(
+                "artifact exceeds its declared/configured size bound",
+                code=FailureCode.ARTIFACT_SIZE_MISMATCH,
+            )
         size = 0
         remaining = limit
         while remaining:
@@ -209,15 +246,24 @@ def file_identity(
             size += len(chunk)
             digest.update(chunk)
             remaining -= len(chunk)
-        if os.read(descriptor, 1):
+        try:
+            final_stat = os.fstat(descriptor)
+        except OSError as exc:
+            raise _read_error(exc, path=relative_path) from exc
+        if final_stat.st_size > limit:
             raise ArtifactIntegrityError(
                 "artifact exceeds its declared/configured size bound",
                 code=FailureCode.ARTIFACT_SIZE_MISMATCH,
             )
     except OSError as exc:
-        raise ArtifactIntegrityError(f"cannot read artifact: {exc}") from exc
+        raise _read_error(exc, path=relative_path) from exc
     finally:
-        os.close(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            close_error = exc
+    if close_error is not None:
+        raise _read_error(close_error, path=relative_path) from close_error
     return size, digest.hexdigest()
 
 
@@ -229,7 +275,10 @@ def verify_artifact(root: str | os.PathLike[str], artifact: Any) -> None:
         expected_size = artifact.size_bytes
         expected_digest = artifact.sha256
     except AttributeError as exc:
-        raise ArtifactIntegrityError("artifact must expose path, sha256, and size_bytes") from exc
+        raise ArtifactIntegrityError(
+            "artifact must expose path, sha256, and size_bytes",
+            code=FailureCode.WRONG_TYPE,
+        ) from exc
     validate_relative_posix_path(path)
     validate_sha256(expected_digest)
     validate_non_negative_int(expected_size, label="size_bytes")

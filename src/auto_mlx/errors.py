@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Final
 
 
 class FailureCode(str, Enum):
@@ -15,6 +17,8 @@ class FailureCode(str, Enum):
     INVALID_JSON = "invalid_json"
     DUPLICATE_KEY = "duplicate_key"
     UNKNOWN_FIELD = "unknown_field"
+    INVALID_UNICODE = "invalid_unicode"
+    JSON_TOO_DEEP = "json_too_deep"
     FLOAT_NOT_ALLOWED = "float_not_allowed"
     NON_FINITE_NUMBER = "non_finite_number"
     WRONG_TYPE = "wrong_type"
@@ -26,6 +30,9 @@ class FailureCode(str, Enum):
     ARTIFACT_NOT_REGULAR = "artifact_not_regular"
     ARTIFACT_SIZE_MISMATCH = "artifact_size_mismatch"
     ARTIFACT_DIGEST_MISMATCH = "artifact_digest_mismatch"
+    ARTIFACT_ACCESS = "artifact_access"
+    ARTIFACT_IO_ERROR = "artifact_io_error"
+    ARTIFACT_SECURITY_UNAVAILABLE = "artifact_security_unavailable"
     INVALID_KNOB = "invalid_knob"
     CONFIG_MISMATCH = "config_mismatch"
     INVALID_POLICY = "invalid_policy"
@@ -42,16 +49,54 @@ class FailureCode(str, Enum):
     INPUT_TOO_LARGE = "input_too_large"
 
 
-def _freeze_detail(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze_detail(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze_detail(item) for item in value)
-    if isinstance(value, (set, frozenset)):
-        return frozenset(_freeze_detail(item) for item in value)
-    if isinstance(value, bytearray):
-        return bytes(value)
+MAX_JSON_DEPTH: Final = 64
+
+
+def _contains_surrogate(value: str) -> bool:
+    return any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+
+
+def _validate_message(value: Any) -> str:
+    """Validate an error message without routing failures through AutoMLXError."""
+
+    if type(value) is not str:
+        raise TypeError("message must be a string")
+    if not value:
+        raise ValueError("message must be a non-empty string")
+    if _contains_surrogate(value):
+        raise ValueError("message must not contain unpaired surrogates")
     return value
+
+
+def _freeze_detail(value: Any, *, path: str = "$", depth: int = 0) -> Any:
+    if depth > MAX_JSON_DEPTH:
+        raise TypeError(f"failure details exceed the maximum JSON nesting depth at {path}")
+    value_type = type(value)
+    if value is None or value_type is bool or value_type is int:
+        return value
+    if value_type is str:
+        if _contains_surrogate(value):
+            raise TypeError(f"failure details contain an unpaired surrogate at {path}")
+        return value
+    if value_type is float:
+        if not math.isfinite(value):
+            raise TypeError(f"failure details contain a non-finite JSON number at {path}")
+        return value
+    if isinstance(value, Mapping):
+        frozen: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"failure detail object keys must be strings at {path}")
+            if _contains_surrogate(key):
+                raise TypeError(f"failure details contain an unpaired surrogate at {path}.{key}")
+            frozen[key] = _freeze_detail(item, path=f"{path}.{key}", depth=depth + 1)
+        return MappingProxyType(frozen)
+    if value_type in {list, tuple}:
+        return tuple(
+            _freeze_detail(item, path=f"{path}[{index}]", depth=depth + 1)
+            for index, item in enumerate(value)
+        )
+    raise TypeError(f"failure details contain a non-JSON value at {path}: {type(value).__name__}")
 
 
 def _thaw_detail(value: Any) -> Any:
@@ -75,11 +120,15 @@ class Failure:
     def __post_init__(self) -> None:
         if not isinstance(self.code, FailureCode):
             raise TypeError("code must be a FailureCode")
-        if type(self.message) is not str or not self.message:
-            raise ValueError("message must be a non-empty string")
+        _validate_message(self.message)
         if not isinstance(self.details, Mapping):
             raise TypeError("details must be a mapping")
-        object.__setattr__(self, "details", _freeze_detail(self.details))
+        frozen = _freeze_detail(self.details)
+        try:
+            json.dumps(_thaw_detail(frozen), ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
+            raise TypeError("details must be JSON-serializable contract data") from exc
+        object.__setattr__(self, "details", frozen)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,9 +144,13 @@ class AutoMLXError(Exception):
     code = FailureCode.INVALID_VALUE
 
     def __init__(self, message: str, *, code: FailureCode | None = None) -> None:
-        super().__init__(message)
-        self.code = code or type(self).code
-        self.message = message
+        validated_message = _validate_message(message)
+        selected_code = type(self).code if code is None else code
+        if not isinstance(selected_code, FailureCode):
+            raise TypeError("code must be a FailureCode")
+        super().__init__(validated_message)
+        self.code = selected_code
+        self.message = validated_message
 
     def as_failure(self) -> Failure:
         return Failure(self.code, self.message)

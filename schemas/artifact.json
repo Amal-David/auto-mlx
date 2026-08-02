@@ -9,8 +9,9 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*\\\\)(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))[^\\u0000]+$",
-      "description": "A non-empty relative POSIX path with no drive prefix, empty, dot, or dotdot components."
+      "pattern": "^(?!/)(?![A-Za-z]:)(?!.*[\\\\\\u0000-\\u001f\\u007f])(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*\\/$)[^/]+(?:/[^/]+)*$",
+      "not": {"pattern": "[\\uD800-\\uDFFF]"},
+      "description": "A non-empty relative POSIX path with no control characters, drive prefix, empty, dot, or dotdot components."
     },
     "sha256": {
       "type": "string",

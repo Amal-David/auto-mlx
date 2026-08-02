@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import math
 import sys
 import tomllib
 from dataclasses import FrozenInstanceError
@@ -9,8 +11,9 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_mlx import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, sha256_hex
-from auto_mlx.errors import ContractError, Failure, FailureCode, UnknownFieldError, UnsafePathError
+from auto_mlx import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json, sha256_hex, validate_config
+from auto_mlx.errors import AutoMLXError, ContractError, Failure, FailureCode, UnknownFieldError, UnsafePathError
+from auto_mlx.contracts import MAX_CONFIG_ENTRIES, MAX_JSON_DEPTH, MAX_MEASUREMENT_RUNS, MAX_POLICY_OUTPUT_BYTES, MAX_WARMUP_RUNS
 
 
 class ContractTests(unittest.TestCase):
@@ -55,6 +58,25 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             Knob("candidate_id", "enum", values=("attacker-choice",))
 
+    def test_enum_values_validate_unicode_before_acceptance_and_serialization(self) -> None:
+        knob = Knob("mode", "enum", values=("café", "compiled"))
+        self.assertTrue(knob.accepts("café"))
+        self.assertFalse(knob.accepts("missing"))
+        self.assertFalse(knob.accepts("bad\ud800"))
+        self.assertEqual(Knob.from_json(knob.to_json()), knob)
+        self.assertIn('"values":["café","compiled"]', knob.to_json())
+
+        for values in (("bad\ud800",), ["bad\udfff"]):
+            with self.subTest(values=repr(values)), self.assertRaises(ContractError) as context:
+                Knob("bad", "enum", values=values)
+            self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+
+        with self.assertRaises(ContractError) as context:
+            Knob.from_dict(
+                {"name": "bad", "type": "enum", "values": ["bad\ud800"], "minimum": None, "maximum": None}
+            )
+        self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+
     def test_malformed_knob_and_sequence_shapes_never_escape_as_raw_type_errors(self) -> None:
         for malformed_type in (None, 1, [], {}):
             with self.subTest(malformed_type=malformed_type), self.assertRaises(ContractError):
@@ -72,6 +94,32 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             failure.details["nested"]["items"][0]["value"] = 2  # type: ignore[index]
         self.assertEqual(failure.to_dict()["details"], {"nested": {"items": [{"value": 1}]}})
+
+    def test_error_codes_and_failure_details_are_validated_at_construction(self) -> None:
+        with self.assertRaises(TypeError):
+            AutoMLXError("bad code", code="invalid")  # type: ignore[arg-type]
+        for details in ({"bad": {1, 2}}, {"bad": object()}, {"bad": math.nan}, {"bad": "\ud800"}):
+            with self.subTest(details=repr(details)), self.assertRaises(TypeError):
+                Failure(FailureCode.INVALID_VALUE, "bad", details)
+
+    def test_error_messages_are_canonical_strings_before_serialization(self) -> None:
+        message = "bad café"
+        failure = Failure(FailureCode.INVALID_VALUE, message)
+        error = AutoMLXError(message, code=FailureCode.INVALID_VALUE)
+        expected = '{"code":"invalid_value","details":{},"message":"bad café"}'
+        self.assertEqual(canonical_json(failure.to_dict()), expected)
+        self.assertEqual(canonical_json(error.as_failure().to_dict()), expected)
+
+        for invalid in (None, 1, object()):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(TypeError):
+                Failure(FailureCode.INVALID_VALUE, invalid)  # type: ignore[arg-type]
+            with self.subTest(api="AutoMLXError", invalid=repr(invalid)), self.assertRaises(TypeError):
+                AutoMLXError(invalid)  # type: ignore[arg-type]
+        for invalid in ("", "bad\ud800"):
+            with self.subTest(invalid=repr(invalid)), self.assertRaises(ValueError):
+                Failure(FailureCode.INVALID_VALUE, invalid)
+            with self.subTest(api="AutoMLXError", invalid=repr(invalid)), self.assertRaises(ValueError):
+                AutoMLXError(invalid)
 
     def test_error_subclasses_keep_stable_failure_codes(self) -> None:
         unknown = UnknownFieldError("extra")
@@ -135,3 +183,40 @@ class ContractTests(unittest.TestCase):
         runtime = RuntimeIdentity("python", "3.11.0", "Darwin", "arm64")
         self.assertEqual(RuntimeIdentity.from_dict(runtime.to_dict()), runtime)
         self.assertEqual(FrozenWorkload.from_dict(self.workload.to_dict()), self.workload)
+
+    def test_surrogates_and_excessive_parameter_nesting_fail_during_contract_construction(self) -> None:
+        with self.assertRaises(ContractError) as context:
+            FrozenWorkload("toy", parameters={"bad": "\ud800"})
+        self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+
+        nested: object = "leaf"
+        for _ in range(MAX_JSON_DEPTH + 2):
+            nested = [nested]
+        with self.assertRaises(ContractError) as context:
+            FrozenWorkload("toy", parameters={"nested": nested})
+        self.assertEqual(context.exception.code, FailureCode.JSON_TOO_DEEP)
+
+    def test_frozen_workload_schema_documents_the_loader_depth_gate(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "frozen_workload.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertIn("MAX_JSON_DEPTH=64", schema["$comment"])
+
+        nested: object = "leaf"
+        for _ in range(MAX_JSON_DEPTH + 1):
+            nested = [nested]
+        with self.assertRaises(ContractError) as context:
+            FrozenWorkload("toy", parameters={"nested": nested})
+        self.assertEqual(context.exception.code, FailureCode.JSON_TOO_DEEP)
+
+    def test_policy_and_config_bounds_are_explicit_and_stable(self) -> None:
+        for kwargs in (
+            {"warmup_runs": MAX_WARMUP_RUNS + 1},
+            {"measurement_runs": MAX_MEASUREMENT_RUNS + 1},
+            {"max_output_bytes": MAX_POLICY_OUTPUT_BYTES + 1},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ContractError) as context:
+                EvaluationPolicy(**kwargs)
+            self.assertEqual(context.exception.code, FailureCode.INVALID_POLICY)
+        with self.assertRaises(ContractError) as context:
+            validate_config(self.workload, {f"extra{i}": i for i in range(MAX_CONFIG_ENTRIES + 1)})
+        self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)

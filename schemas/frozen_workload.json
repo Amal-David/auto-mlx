@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://auto-mlx.invalid/schemas/frozen_workload.json",
   "title": "FrozenWorkload",
+  "$comment": "The recursive json_value definition is intentionally open-ended for standalone JSON Schema. The supported loader is authoritative for the finite depth bound: strict_json_loads and FrozenWorkload enforce MAX_JSON_DEPTH=64 before accepting a workload.",
   "type": "object",
   "additionalProperties": false,
   "required": ["name", "artifacts", "knobs", "parameters"],

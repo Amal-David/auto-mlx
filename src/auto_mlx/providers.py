@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Final, Protocol, runtime_checkable
 
 from .canonical import canonical_json, strict_json_loads
 from .contracts import CandidateProposal, FrozenWorkload, validate_config, _freeze_config
 from .errors import ContractError, FailureCode, UnknownFieldError
+
+
+MAX_PROVIDER_CONFIGS: Final = 4096
 
 
 @runtime_checkable
@@ -25,20 +29,36 @@ class DeclarativeProvider:
     """A provider backed solely by immutable scalar configuration maps."""
 
     provider_id: str
-    configs: tuple[dict[str, object], ...] = field(default_factory=tuple)
+    configs: tuple[Mapping[str, object], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if type(self.provider_id) is not str or not self.provider_id:
             raise ContractError("provider_id must be a non-empty string", code=FailureCode.PROVIDER_ERROR)
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in self.provider_id):
+            raise ContractError("provider_id must not contain unpaired surrogates", code=FailureCode.INVALID_UNICODE)
         if type(self.configs) not in {list, tuple}:
             raise ContractError("provider.configs must be an array", code=FailureCode.PROVIDER_ERROR)
+        if len(self.configs) > MAX_PROVIDER_CONFIGS:
+            raise ContractError(
+                f"provider.configs cannot contain more than {MAX_PROVIDER_CONFIGS} entries",
+                code=FailureCode.PROVIDER_ERROR,
+            )
         frozen_configs = []
-        for index, config in enumerate(self.configs):
-            frozen_configs.append(_freeze_config(config))
+        seen: set[str] = set()
+        for config in self.configs:
+            frozen = _freeze_config(config)
+            identity = canonical_json(frozen)
+            if identity in seen:
+                raise ContractError(
+                    "provider.configs contains duplicate normalized configurations",
+                    code=FailureCode.CONFIG_MISMATCH,
+                )
+            seen.add(identity)
+            frozen_configs.append(frozen)
         object.__setattr__(self, "configs", tuple(frozen_configs))
 
     @property
-    def candidate_configs(self) -> tuple[dict[str, object], ...]:
+    def candidate_configs(self) -> tuple[Mapping[str, object], ...]:
         return self.configs
 
     def propose(self, workload: FrozenWorkload) -> tuple[CandidateProposal, ...]:
@@ -82,4 +102,4 @@ class DeclarativeProvider:
         return cls.from_dict(strict_json_loads(value))
 
 
-__all__: Final = ["CandidateProvider", "DeclarativeProvider"]
+__all__: Final = ["CandidateProvider", "DeclarativeProvider", "MAX_PROVIDER_CONFIGS"]

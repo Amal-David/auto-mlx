@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 import unittest
@@ -7,6 +8,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import CandidateProvider, DeclarativeProvider, FrozenWorkload, Knob
+from auto_mlx.providers import MAX_PROVIDER_CONFIGS
 from auto_mlx.errors import ContractError, FailureCode, UnknownFieldError
 
 
@@ -55,3 +57,37 @@ class ProviderTests(unittest.TestCase):
         for configs in (None, {"mode": "a"}, "not-an-array"):
             with self.subTest(configs=configs), self.assertRaises(ContractError):
                 DeclarativeProvider("bad", configs)  # type: ignore[arg-type]
+
+    def test_duplicate_normalized_configs_are_rejected_deterministically(self) -> None:
+        with self.assertRaises(ContractError) as context:
+            DeclarativeProvider(
+                "grid",
+                (
+                    {"mode": "a", "threads": 1},
+                    {"threads": 1, "mode": "a"},
+                ),
+            )
+        self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)
+
+    def test_provider_schema_rejects_duplicate_configurations(self) -> None:
+        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "declarative_provider.json"
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertTrue(schema["properties"]["configs"]["uniqueItems"])
+        self.assertEqual(
+            schema["properties"]["configs"]["items"]["additionalProperties"]["oneOf"],
+            [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}],
+        )
+
+        with self.assertRaises(ContractError) as context:
+            DeclarativeProvider.from_dict(
+                {
+                    "provider_id": "grid",
+                    "configs": [{"mode": "a", "threads": 1}, {"threads": 1, "mode": "a"}],
+                }
+            )
+        self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)
+
+    def test_provider_config_count_is_bounded_before_materialization(self) -> None:
+        with self.assertRaises(ContractError) as context:
+            DeclarativeProvider("grid", ({"mode": "a", "threads": 1},) * (MAX_PROVIDER_CONFIGS + 1))
+        self.assertEqual(context.exception.code, FailureCode.PROVIDER_ERROR)

@@ -10,6 +10,7 @@
     "workload_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "config": {
       "type": "object",
+      "maxProperties": 64,
       "not": {"required": ["candidate_id"]},
       "additionalProperties": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}
     },

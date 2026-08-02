@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final, Mapping
 
-from .canonical import canonical_json, sha256_hex, strict_json_loads
+from .canonical import MAX_JSON_DEPTH, canonical_json, sha256_hex, strict_json_loads
 from .errors import ContractError, FailureCode, UnknownFieldError
 from .paths import validate_non_negative_int, validate_relative_posix_path, validate_sha256
 
@@ -16,6 +16,10 @@ from .paths import validate_non_negative_int, validate_relative_posix_path, vali
 ConfigValue = str | int | bool
 JSONValue = None | str | int | bool | list["JSONValue"] | dict[str, "JSONValue"]
 _RESERVED_CONFIG_NAMES = frozenset({"candidate_id"})
+MAX_CONFIG_ENTRIES: Final = 64
+MAX_WARMUP_RUNS: Final = 100
+MAX_MEASUREMENT_RUNS: Final = 100
+MAX_POLICY_OUTPUT_BYTES: Final = 8 * 1024 * 1024
 
 
 def _object(value: Any, *, label: str) -> dict[str, Any]:
@@ -42,13 +46,28 @@ def _exact_fields(value: dict[str, Any], expected: set[str], *, label: str) -> N
 def _string(value: Any, *, label: str, non_empty: bool = True) -> str:
     if type(value) is not str or (non_empty and not value):
         raise ContractError(f"{label} must be a {'non-empty ' if non_empty else ''}string", code=FailureCode.WRONG_TYPE)
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ContractError(
+            f"{label} must not contain unpaired surrogates",
+            code=FailureCode.INVALID_UNICODE,
+        )
     return value
 
 
-def _integer(value: Any, *, label: str, minimum: int | None = None) -> int:
-    if type(value) is not int or (minimum is not None and value < minimum):
-        suffix = f" >= {minimum}" if minimum is not None else ""
-        raise ContractError(f"{label} must be an integer{suffix}", code=FailureCode.WRONG_TYPE)
+def _integer(
+    value: Any,
+    *,
+    label: str,
+    minimum: int | None = None,
+    maximum: int | None = None,
+    bound_code: FailureCode = FailureCode.WRONG_TYPE,
+) -> int:
+    if type(value) is not int:
+        raise ContractError(f"{label} must be an integer", code=FailureCode.WRONG_TYPE)
+    if minimum is not None and value < minimum:
+        raise ContractError(f"{label} must be >= {minimum}", code=bound_code)
+    if maximum is not None and value > maximum:
+        raise ContractError(f"{label} must be <= {maximum}", code=bound_code)
     return value
 
 
@@ -64,9 +83,21 @@ def _sequence(value: Any, *, label: str) -> tuple[Any, ...]:
     return tuple(value)
 
 
-def _freeze_json(value: Any, *, path: str = "$") -> Any:
+def _freeze_json(value: Any, *, path: str = "$", depth: int = 0) -> Any:
+    if depth > MAX_JSON_DEPTH:
+        raise ContractError(
+            f"JSON exceeds the maximum nesting depth of {MAX_JSON_DEPTH} at {path}",
+            code=FailureCode.JSON_TOO_DEEP,
+        )
     value_type = type(value)
-    if value is None or value_type is str or value_type is int or value_type is bool:
+    if value is None or value_type is int or value_type is bool:
+        return value
+    if value_type is str:
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+            raise ContractError(
+                f"JSON contains an unpaired UTF-16 surrogate at {path}",
+                code=FailureCode.INVALID_UNICODE,
+            )
         return value
     if value_type is float:
         raise ContractError(f"floating-point value at {path} is not allowed", code=FailureCode.FLOAT_NOT_ALLOWED)
@@ -75,10 +106,18 @@ def _freeze_json(value: Any, *, path: str = "$") -> Any:
         for key, item in value.items():
             if type(key) is not str:
                 raise ContractError(f"object key at {path} must be a string", code=FailureCode.WRONG_TYPE)
-            frozen[key] = _freeze_json(item, path=f"{path}.{key}")
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+                raise ContractError(
+                    f"JSON contains an unpaired UTF-16 surrogate at {path}.{key}",
+                    code=FailureCode.INVALID_UNICODE,
+                )
+            frozen[key] = _freeze_json(item, path=f"{path}.{key}", depth=depth + 1)
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):
-        return tuple(_freeze_json(item, path=f"{path}[{index}]") for index, item in enumerate(value))
+        return tuple(
+            _freeze_json(item, path=f"{path}[{index}]", depth=depth + 1)
+            for index, item in enumerate(value)
+        )
     raise ContractError(f"unsupported value at {path}: {type(value).__name__}", code=FailureCode.WRONG_TYPE)
 
 
@@ -93,16 +132,31 @@ def _thaw_json(value: Any) -> Any:
 def _freeze_config(value: Any) -> MappingProxyType:
     if not isinstance(value, Mapping):
         raise ContractError("config must be an object", code=FailureCode.WRONG_TYPE)
+    if len(value) > MAX_CONFIG_ENTRIES:
+        raise ContractError(
+            f"config has more than {MAX_CONFIG_ENTRIES} entries",
+            code=FailureCode.CONFIG_MISMATCH,
+        )
     result: dict[str, ConfigValue] = {}
     for key, item in value.items():
         if type(key) is not str:
             raise ContractError("config keys must be strings", code=FailureCode.WRONG_TYPE)
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+            raise ContractError(
+                f"config key {key!r} contains an unpaired UTF-16 surrogate",
+                code=FailureCode.INVALID_UNICODE,
+            )
         if key in _RESERVED_CONFIG_NAMES:
             raise ContractError("candidate_id is evaluator-derived and cannot be supplied", code=FailureCode.CONFIG_MISMATCH)
         if type(item) not in {str, int, bool}:
             raise ContractError(
                 f"config value for {key!r} must be a string, integer, or boolean",
                 code=FailureCode.WRONG_TYPE,
+            )
+        if type(item) is str and any(0xD800 <= ord(character) <= 0xDFFF for character in item):
+            raise ContractError(
+                f"config value for {key!r} contains an unpaired UTF-16 surrogate",
+                code=FailureCode.INVALID_UNICODE,
             )
         result[key] = item
     return MappingProxyType(result)
@@ -200,6 +254,11 @@ class Knob:
         if self.type == "enum":
             if not values or any(type(item) is not str or not item for item in values):
                 raise ContractError("enum knobs need non-empty string values", code=FailureCode.INVALID_KNOB)
+            if any(any(0xD800 <= ord(character) <= 0xDFFF for character in item) for item in values):
+                raise ContractError(
+                    "enum knob values must not contain unpaired surrogates",
+                    code=FailureCode.INVALID_UNICODE,
+                )
             if len(set(values)) != len(values):
                 raise ContractError("enum knob values must be unique", code=FailureCode.INVALID_KNOB)
             if self.minimum is not None or self.maximum is not None:
@@ -207,8 +266,8 @@ class Knob:
         elif self.type == "integer":
             if values:
                 raise ContractError("integer knobs cannot define enum values", code=FailureCode.INVALID_KNOB)
-            _integer(self.minimum, label="knob.minimum")
-            _integer(self.maximum, label="knob.maximum")
+            _integer(self.minimum, label="knob.minimum", bound_code=FailureCode.INVALID_KNOB)
+            _integer(self.maximum, label="knob.maximum", bound_code=FailureCode.INVALID_KNOB)
             if self.minimum > self.maximum:
                 raise ContractError("knob.minimum cannot exceed knob.maximum", code=FailureCode.INVALID_KNOB)
         else:
@@ -455,12 +514,22 @@ class EvaluationPolicy:
     max_output_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
-        _integer(self.warmup_runs, label="warmup_runs", minimum=0)
-        _integer(self.measurement_runs, label="measurement_runs", minimum=1)
-        _integer(self.timeout_seconds, label="timeout_seconds", minimum=1)
-        if self.timeout_seconds > 3600:
-            raise ContractError("timeout_seconds must not exceed 3600", code=FailureCode.INVALID_POLICY)
-        _integer(self.max_output_bytes, label="max_output_bytes", minimum=1)
+        _integer(self.warmup_runs, label="warmup_runs", minimum=0, maximum=MAX_WARMUP_RUNS, bound_code=FailureCode.INVALID_POLICY)
+        _integer(
+            self.measurement_runs,
+            label="measurement_runs",
+            minimum=1,
+            maximum=MAX_MEASUREMENT_RUNS,
+            bound_code=FailureCode.INVALID_POLICY,
+        )
+        _integer(self.timeout_seconds, label="timeout_seconds", minimum=1, maximum=3600, bound_code=FailureCode.INVALID_POLICY)
+        _integer(
+            self.max_output_bytes,
+            label="max_output_bytes",
+            minimum=1,
+            maximum=MAX_POLICY_OUTPUT_BYTES,
+            bound_code=FailureCode.INVALID_POLICY,
+        )
 
     @property
     def runs(self) -> int:
@@ -564,6 +633,11 @@ __all__: Final = [
     "FrozenWorkload",
     "JSONValue",
     "Knob",
+    "MAX_CONFIG_ENTRIES",
+    "MAX_JSON_DEPTH",
+    "MAX_MEASUREMENT_RUNS",
+    "MAX_POLICY_OUTPUT_BYTES",
+    "MAX_WARMUP_RUNS",
     "RuntimeIdentity",
     "canonical_contract",
     "validate_config",

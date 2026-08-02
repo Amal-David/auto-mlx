@@ -74,6 +74,10 @@ class PackagingTests(unittest.TestCase):
                 Path(name).name for name in names if "/schemas/" in name and name.endswith(".json")
             }
             self.assertEqual(wheel_schema_names, SCHEMA_NAMES)
+            self.assertTrue(any(name.endswith(".data/data/examples/workload.json") for name in names))
+            self.assertTrue(any(name.endswith(".data/data/examples/provider.json") for name in names))
+            self.assertTrue(any(name.endswith(".data/data/examples/README.md") for name in names))
+            self.assertTrue(any(name.endswith(".data/data/docs/cli.md") for name in names))
 
         with tarfile.open(sdists[0], "r:gz") as archive:
             names = set(archive.getnames())

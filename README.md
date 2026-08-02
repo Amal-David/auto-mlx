@@ -36,8 +36,10 @@ PYTHONPATH=src python3 -m auto_mlx validate provider --input examples/provider.j
 PYTHONPATH=src python3 -m auto_mlx validate workload examples/workload.json --output /tmp/auto-mlx-workload.json
 ```
 
-Output creation is private, atomic, durable, and exclusive; choose a new path for a second run. Existing output
-paths and other filesystem/output failures return exit code 5 and never replace the existing file.
+Output creation is private and exclusive, but it is not atomic: the final destination is created directly through a
+descriptor and may be visible while it is being written. The CLI reports success only after syncing the file and its
+containing directory. If anything fails after creation, the destination remains (and may be incomplete or have
+unconfirmed durability); choose a new path after inspecting it. Existing output paths are never replaced.
 
 ## Explicit non-capabilities
 

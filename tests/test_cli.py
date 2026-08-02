@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import auto_mlx
+import auto_mlx.cli as cli
 from auto_mlx import CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json
 from auto_mlx.cli import EXIT_CONTRACT, EXIT_IO, EXIT_UNAVAILABLE, EXIT_USAGE, MAX_JSON_INPUT_BYTES, main
 from auto_mlx.errors import Failure, FailureCode
@@ -172,7 +173,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertEqual(json.loads(stdout)["document"], {"value": 1})
 
-    def test_non_regular_input_is_rejected_without_opening_it(self) -> None:
+    def test_non_regular_input_is_rejected_before_any_read(self) -> None:
         if not hasattr(os, "mkfifo"):
             self.skipTest("FIFO creation is not available")
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -182,6 +183,42 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status, EXIT_IO)
         self.assertEqual(stdout, "")
         self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
+
+    def test_symlink_input_is_rejected_by_open_without_following_it(self) -> None:
+        if not hasattr(os, "symlink") or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("symlink-safe input primitives are not available")
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            target = self._write(directory, "target.json", {"value": 1})
+            link = directory / "input.json"
+            link.symlink_to(target.name)
+            status, stdout, stderr = self._run("validate", "document", str(link))
+        self.assertEqual(status, EXIT_IO)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
+
+    def test_input_is_read_from_the_open_descriptor_after_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            path = self._write(directory, "input.json", {"value": 1})
+            original_open = os.open
+            opened = False
+
+            def open_and_swap(value: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+                nonlocal opened
+                descriptor = original_open(value, flags, mode, **kwargs)
+                if not opened and Path(value) == path:
+                    replacement = path.with_name("replacement.json")
+                    path.rename(replacement)
+                    path.write_text('{"value":2}', encoding="utf-8")
+                    opened = True
+                return descriptor
+
+            with mock.patch("auto_mlx.cli.os.open", side_effect=open_and_swap):
+                status, stdout, stderr = self._run("validate", "document", str(path))
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["document"], {"value": 1})
 
     def test_ambiguous_long_options_are_rejected(self) -> None:
         status, stdout, stderr = self._run("validate", "document", "--inp", "-")
@@ -273,12 +310,22 @@ class CLITests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertTrue(json.loads(stdout)["ok"])
 
+    def test_source_tree_version_does_not_prefer_stale_installed_metadata(self) -> None:
+        with mock.patch("auto_mlx.cli.distribution_version", return_value="99.99.99"):
+            status, stdout, stderr = self._run("--version")
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.strip(), "auto-mlx 0.1.0")
+
     def test_ci_runs_from_standalone_repository_root(self) -> None:
         root = Path(__file__).resolve().parents[1]
         workflow = (root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertNotIn("working-directory: auto-mlx", workflow)
         self.assertIn("run: python -m py_compile src/auto_mlx/*.py tests/*.py", workflow)
         self.assertIn("run: python -m unittest discover -s tests -p 'test_*.py' -v", workflow)
+        self.assertIn("os: [ubuntu-latest, macos-latest]", workflow)
+        self.assertIn('python-version: ["3.11", "3.14"]', workflow)
+        self.assertIn("--workdir", workflow)
 
     def test_stable_lane_apis_are_exported_from_package_root(self) -> None:
         from auto_mlx.dispatch import DispatchResult, dispatch
@@ -315,7 +362,7 @@ class CLITests(unittest.TestCase):
         self.assertEqual(json.loads(second[2])["error"]["code"], "io_error")
         self.assertIn("refusing to overwrite", second[2])
 
-    def test_output_is_private_atomic_and_durable(self) -> None:
+    def test_output_is_private_create_only_and_synced(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             source = self._write(directory, "workload.json", self.workload.to_dict())
@@ -326,23 +373,113 @@ class CLITests(unittest.TestCase):
             self.assertEqual(json.loads(stdout)["output"], str(output))
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
             self.assertEqual(output.read_text(encoding="utf-8"), canonical_json(self.workload.to_dict()))
-            self.assertEqual(list(directory.glob(".canonical.json.*")), [])
 
-    def test_output_write_failure_cleans_up_temporary_file(self) -> None:
+    def test_output_write_failure_reports_created_destination_without_temp_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)
             source = self._write(directory, "workload.json", self.workload.to_dict())
             output = directory / "canonical.json"
-            def fail_first_fsync(descriptor: int) -> None:
+            def fail_file_fsync(descriptor: int) -> None:
                 raise OSError("simulated fsync failure")
 
-            with mock.patch("auto_mlx.cli.os.fsync", side_effect=fail_first_fsync):
+            with mock.patch("auto_mlx.cli.os.fsync", side_effect=fail_file_fsync):
                 status, stdout, stderr = self._run("validate", "workload", str(source), "--output", str(output))
             self.assertEqual(status, EXIT_IO)
             self.assertEqual(stdout, "")
-            self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
-            self.assertFalse(output.exists())
-            self.assertEqual(list(directory.glob(".canonical.json.*")), [])
+            diagnostic = json.loads(stderr)
+            self.assertEqual(diagnostic["error"]["code"], "io_error")
+            self.assertIn("contents were not durably synced", diagnostic["error"]["message"])
+            self.assertTrue(output.exists())
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+
+    def test_directory_fsync_failure_is_distinct_and_leaves_output_present(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = self._write(directory, "workload.json", self.workload.to_dict())
+            output = directory / "canonical.json"
+            original_fsync = os.fsync
+            calls = 0
+
+            def fail_directory_fsync(descriptor: int) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("simulated directory fsync failure")
+                original_fsync(descriptor)
+
+            with mock.patch("auto_mlx.cli.os.fsync", side_effect=fail_directory_fsync):
+                status, stdout, stderr = self._run("validate", "workload", str(source), "--output", str(output))
+            self.assertEqual(status, EXIT_IO)
+            self.assertEqual(stdout, "")
+            message = json.loads(stderr)["error"]["message"]
+            self.assertIn("directory durability is unconfirmed", message)
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.read_text(encoding="utf-8"), canonical_json(self.workload.to_dict()))
+            self.assertEqual(list(directory.glob(".*")), [])
+
+    def test_fchmod_failure_closes_output_descriptor_and_reports_created_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = self._write(directory, "workload.json", self.workload.to_dict())
+            output = directory / "canonical.json"
+            fchmod_descriptor: int | None = None
+
+            def fail_fchmod(descriptor: int, mode: int) -> None:
+                nonlocal fchmod_descriptor
+                fchmod_descriptor = descriptor
+                raise OSError("simulated fchmod failure")
+
+            with mock.patch("auto_mlx.cli.os.fchmod", side_effect=fail_fchmod), mock.patch(
+                "auto_mlx.cli.os.close", wraps=os.close
+            ) as close:
+                status, stdout, stderr = self._run("validate", "workload", str(source), "--output", str(output))
+            self.assertEqual(status, EXIT_IO)
+            self.assertEqual(stdout, "")
+            self.assertIn("private permissions could not be confirmed", json.loads(stderr)["error"]["message"])
+            self.assertIsNotNone(fchmod_descriptor)
+            close.assert_any_call(fchmod_descriptor)
+            self.assertTrue(output.exists())
+
+    def test_output_destination_symlink_is_not_followed_or_replaced(self) -> None:
+        if not hasattr(os, "symlink") or not hasattr(os, "O_NOFOLLOW"):
+            self.skipTest("symlink-safe output primitives are not available")
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = self._write(directory, "workload.json", self.workload.to_dict())
+            target = directory / "target.json"
+            target.write_text("keep", encoding="utf-8")
+            output = directory / "canonical.json"
+            output.symlink_to(target.name)
+            status, stdout, stderr = self._run("validate", "workload", str(source), "--output", str(output))
+            self.assertEqual(status, EXIT_IO)
+            self.assertEqual(stdout, "")
+            self.assertIn("refusing to overwrite", json.loads(stderr)["error"]["message"])
+            self.assertTrue(output.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), "keep")
+
+    def test_output_uses_opened_parent_descriptor_if_parent_path_is_swapped(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory)
+            parent = root / "parent"
+            moved = root / "moved"
+            parent.mkdir()
+            output = parent / "canonical.json"
+            original_open = os.open
+            swapped = False
+
+            def open_and_swap(path: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+                nonlocal swapped
+                descriptor = original_open(path, flags, mode, **kwargs)
+                if not swapped and kwargs.get("dir_fd") is None and Path(path) == parent:
+                    parent.rename(moved)
+                    parent.mkdir()
+                    swapped = True
+                return descriptor
+
+            with mock.patch("auto_mlx.cli.os.open", side_effect=open_and_swap):
+                cli._create_only(str(output), b'{"value":1}')
+            self.assertTrue((moved / "canonical.json").is_file())
+            self.assertFalse((parent / "canonical.json").exists())
 
     def test_missing_output_parent_is_an_io_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:

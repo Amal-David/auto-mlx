@@ -13,7 +13,6 @@ from importlib.metadata import PackageNotFoundError, version as distribution_ver
 import os
 import stat
 import sys
-import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any, Final
@@ -97,18 +96,21 @@ def _kind_arguments(parser: argparse.ArgumentParser, *, command: str) -> None:
 
 
 def _package_version() -> str:
+    # When running from a checkout (including an editable install), prefer the
+    # adjacent project metadata so a stale installed distribution cannot mask
+    # the source tree being exercised.
+    project_file = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    try:
+        with project_file.open("rb") as handle:
+            return str(tomllib.load(handle)["project"]["version"])
+    except FileNotFoundError:
+        pass
+    except (KeyError, OSError, TypeError, ValueError):
+        return "unknown"
     try:
         return distribution_version("auto-mlx")
     except PackageNotFoundError:
-        # Source-tree tests and ``PYTHONPATH=src`` development use do not have
-        # installed distribution metadata. Keep the version in pyproject.toml
-        # as the only source of truth in that case.
-        project_file = Path(__file__).resolve().parents[2] / "pyproject.toml"
-        try:
-            with project_file.open("rb") as handle:
-                return str(tomllib.load(handle)["project"]["version"])
-        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
-            return "unknown"
+        return "unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -220,25 +222,53 @@ def _read_bounded(stream: Any, *, source: str, text_stream: bool = False) -> byt
     return b"".join(chunks)
 
 
+def _read_bounded_descriptor(descriptor: int, *, source: str) -> bytes:
+    """Read bounded input from the already-open descriptor."""
+
+    chunks: list[bytes] = []
+    total = 0
+    while total <= MAX_JSON_INPUT_BYTES:
+        chunk = os.read(descriptor, MAX_JSON_INPUT_BYTES - total + 1)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_JSON_INPUT_BYTES:
+            raise _input_limit_error(source)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _read_json(path_value: str) -> Any:
     if path_value == "-":
         stream = getattr(sys.stdin, "buffer", sys.stdin)
         raw = _read_bounded(stream, source="stdin", text_stream=stream is sys.stdin)
     else:
         path = Path(path_value)
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise CLIIOError(f"cannot safely open input {path}: O_NOFOLLOW is unavailable")
+        descriptor: int | None = None
         try:
-            info = path.stat()
-        except (OSError, ValueError) as exc:
-            raise CLIIOError(f"cannot inspect input {path}: {exc}") from exc
-        if not stat.S_ISREG(info.st_mode):
-            raise CLIIOError(f"input path is not a regular file: {path}")
-        if info.st_size > MAX_JSON_INPUT_BYTES:
-            raise _input_limit_error(str(path))
-        try:
-            with path.open("rb") as stream:
-                raw = _read_bounded(stream, source=str(path))
+            flags = os.O_RDONLY | nofollow
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            descriptor = os.open(path, flags)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise CLIIOError(f"input path is not a regular file: {path}")
+            if info.st_size > MAX_JSON_INPUT_BYTES:
+                raise _input_limit_error(str(path))
+            raw = _read_bounded_descriptor(descriptor, source=str(path))
         except (OSError, ValueError) as exc:
             raise CLIIOError(f"cannot read input {path}: {exc}") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    raise CLIIOError(f"cannot close input {path}: {exc}") from exc
     return strict_json_loads(raw)
 
 
@@ -333,55 +363,117 @@ def _identity_fields(kind: str, value: Any, document: Any) -> dict[str, Any]:
     return {"document_id": sha256_hex(value)}
 
 
+def _write_descriptor(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("output descriptor made no progress")
+        view = view[written:]
+
+
 def _create_only(path_value: str, payload: bytes) -> None:
-    """Publish a private file atomically, durably, and without replacement."""
+    """Create and sync a private output without replacement or temp paths.
+
+    The final directory entry is created directly through the opened parent
+    descriptor. This proves exclusivity and descriptor stability, but not
+    atomic visibility: readers may observe a partial file before success.
+    """
 
     path = Path(path_value)
+    name = path.name
     parent = path.parent
-    directory_flags = os.O_RDONLY
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise CLIIOError(f"cannot safely publish output {path}: O_NOFOLLOW is unavailable")
+    if not name or name in {".", ".."}:
+        raise CLIIOError(f"cannot publish output {path}: destination name is empty")
+    if not hasattr(os, "fchmod"):
+        raise CLIIOError(f"cannot safely publish output {path}: fchmod is unavailable")
+    if not hasattr(os, "fsync"):
+        raise CLIIOError(f"cannot safely publish output {path}: fsync is unavailable")
+
+    directory_descriptor: int | None = None
+    output_descriptor: int | None = None
+    created = False
+    operation_error: CLIIOError | None = None
+    close_error: OSError | None = None
+    directory_flags = os.O_RDONLY | nofollow
     if hasattr(os, "O_DIRECTORY"):
         directory_flags |= os.O_DIRECTORY
-    temporary_path: str | None = None
-    try:
-        directory_descriptor = os.open(parent, directory_flags)
-    except (OSError, ValueError) as exc:
-        raise CLIIOError(f"cannot open output directory {parent}: {exc}") from exc
-    try:
-        # Refuse early if the filesystem cannot durably sync the containing
-        # directory. Publication below relies on the same descriptor.
-        os.fsync(directory_descriptor)
-        descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
 
-        # A hard link is the portable POSIX create-without-replace primitive:
-        # unlike os.replace(), it cannot overwrite an existing destination.
+    try:
         try:
-            os.link(temporary_path, path, follow_symlinks=False)
-        except TypeError:  # pragma: no cover - for older platform bindings
-            os.link(temporary_path, path)
-        os.fsync(directory_descriptor)
-        os.unlink(temporary_path)
-        temporary_path = None
-        os.fsync(directory_descriptor)
-    except FileExistsError as exc:
-        raise CLIIOError(f"refusing to overwrite existing output: {path}") from exc
-    except (OSError, ValueError) as exc:
-        raise CLIIOError(f"cannot publish output {path}: {exc}") from exc
+            directory_descriptor = os.open(parent, directory_flags)
+            directory_info = os.fstat(directory_descriptor)
+            if not stat.S_ISDIR(directory_info.st_mode):
+                raise CLIIOError(f"output parent is not a directory: {parent}")
+        except CLIIOError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(f"cannot open output directory {parent}: {exc}") from exc
+
+        output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+        if hasattr(os, "O_CLOEXEC"):
+            output_flags |= os.O_CLOEXEC
+        try:
+            output_descriptor = os.open(name, output_flags, 0o600, dir_fd=directory_descriptor)
+        except FileExistsError as exc:
+            raise CLIIOError(f"refusing to overwrite existing output: {path}") from exc
+        except (NotImplementedError, TypeError) as exc:
+            raise CLIIOError(
+                f"cannot safely publish output {path}: descriptor-relative create is unavailable"
+            ) from exc
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(f"cannot create output {path}: {exc}") from exc
+        created = True
+
+        try:
+            os.fchmod(output_descriptor, 0o600)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(
+                f"output was created but its private permissions could not be confirmed: {path}: {exc}"
+            ) from exc
+        try:
+            _write_descriptor(output_descriptor, payload)
+            os.fsync(output_descriptor)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(
+                f"output was created but its contents were not durably synced; destination may be incomplete: "
+                f"{path}: {exc}"
+            ) from exc
+        try:
+            os.fsync(directory_descriptor)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(
+                f"output was created and contains the payload, but directory durability is unconfirmed; "
+                f"the destination remains and retrying the same path will be refused: {path}: {exc}"
+            ) from exc
+    except CLIIOError as exc:
+        operation_error = exc
     finally:
-        if temporary_path is not None:
+        if output_descriptor is not None:
             try:
-                os.unlink(temporary_path)
-            except OSError:
-                pass
-        try:
-            os.close(directory_descriptor)
-        except OSError:
-            pass
+                os.close(output_descriptor)
+            except OSError as exc:
+                close_error = exc
+        if directory_descriptor is not None:
+            try:
+                os.close(directory_descriptor)
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+
+    if close_error is not None:
+        if operation_error is not None:
+            raise CLIIOError(
+                f"{operation_error}; descriptor close also failed after output creation={created}: {close_error}"
+            ) from operation_error
+        raise CLIIOError(f"output was created but descriptor close failed: {path}: {close_error}") from close_error
+    if operation_error is not None:
+        raise operation_error
 
 
 def _run_document_command(args: argparse.Namespace) -> dict[str, Any]:

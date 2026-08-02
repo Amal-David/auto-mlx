@@ -13,9 +13,21 @@ auto-mlx inspect KIND --input FILE
 
 `validate` returns the canonical document and its SHA-256. `inspect` returns only identity fields: workload/candidate/runtime/provider/receipt IDs where the contract defines them, or `document_id` for a generic document. Receipt inspection parses the checked-in receipt contract and independently recomputes its stored fields. Evaluator, receipt, promotion, and dispatch libraries exist, but production evaluation/activation remains fail-closed without the required proof.
 
-`--artifact-root` verifies every artifact declared by a workload against local bytes. `--output` writes a canonical document through a same-directory temporary file, flushes and syncs the file and containing directory, then publishes it with an atomic create-without-replace operation. The final file is private (`0600` where supported), and temporary files are cleaned up after failures. An existing destination is not overwritten.
+`--artifact-root` verifies every artifact declared by a workload against local bytes. `--output` opens the parent
+directory once, creates the final destination directly with create-only/no-follow flags, writes through that open file
+descriptor, syncs the file, and then syncs the same directory descriptor. The final file is private (`0600`); hosts
+without the required permission primitive fail closed. An existing destination is never overwritten. This is exclusive and descriptor-stable, but not
+atomically visible: a reader can observe a partial file before the command succeeds.
 
-Each JSON file or stdin document is bounded to 4 MiB (`4,194,304` bytes) before parsing or accumulation. Larger input returns exit code 3 with the stable `input_too_large` diagnostic and no JSON result on stdout.
+Success means that both file and directory sync calls returned successfully. Path-based input and output require the
+host's no-follow and descriptor-relative filesystem primitives; unsupported hosts fail closed. If a failure occurs
+after the destination is created, the CLI leaves that destination in place because portable primitives do not provide
+a conditional unlink by open-file identity. It returns exit code 5 and states whether contents, private permissions,
+or directory durability were not confirmed. The same path will not be retryable until the caller inspects or removes it.
+The descriptor keeps this process's writes on the created inode across pathname swaps, but another actor with write access
+to the parent directory can still unlink or replace the name after creation; callers must control that directory.
+
+Each JSON file or stdin document is bounded to 4 MiB (`4,194,304` bytes) before parsing or accumulation. Larger input returns exit code 3 with the stable `input_too_large` diagnostic and no JSON result on stdout. Path-based inputs are opened once with no-follow flags, checked with `fstat` on that descriptor, and read only from that descriptor; they must be regular files. `-` remains the portable stdin spelling.
 
 Filesystem and output failures return exit code 5 with an `io_error` diagnostic. File inputs must be regular files; `-` remains the supported stdin spelling. Successful commands write one canonical JSON object to stdout and no diagnostics. Broken stdout pipes are handled as output failures without a traceback.
 

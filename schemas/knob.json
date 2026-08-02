@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mlx.invalid/schemas/knob.json",
+  "title": "Knob",
+  "type": "object",
+  "additionalProperties": false,
+  "not": {"properties": {"name": {"const": "candidate_id"}}},
+  "required": ["name", "type", "values", "minimum", "maximum"],
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "type": {"enum": ["enum", "integer", "bool"]},
+    "values": {"type": "array", "uniqueItems": true},
+    "minimum": {"type": ["integer", "null"]},
+    "maximum": {"type": ["integer", "null"]}
+  },
+  "description": "Python additionally enforces unique values and minimum <= maximum for integer knobs.",
+  "allOf": [
+    {
+      "if": {"properties": {"type": {"const": "enum"}}},
+      "then": {
+        "properties": {
+          "values": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+          "minimum": {"type": "null"},
+          "maximum": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "integer"}}},
+      "then": {
+        "properties": {
+          "values": {"maxItems": 0},
+          "minimum": {"type": "integer"},
+          "maximum": {"type": "integer"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"type": {"const": "bool"}}},
+      "then": {
+        "properties": {
+          "values": {"maxItems": 0},
+          "minimum": {"type": "null"},
+          "maximum": {"type": "null"}
+        }
+      }
+    }
+  ]
+}

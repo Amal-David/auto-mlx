@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from auto_mlx import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity
+from auto_mlx.dispatch import CANDIDATE_MODE, NATIVE_MODE, dispatch
+from auto_mlx.promotion import activate, rollback
+from auto_mlx.receipts import ContentAddressedStore, RawSample, Receipt, receipt_attestation, validate_receipt
+
+
+class DispatchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workload = FrozenWorkload("dispatch-test", knobs=(Knob("mode", "enum", values=("eager", "slow")),))
+        self.candidate = CandidateProposal("grid", self.workload, {"mode": "eager"})
+        self.policy = EvaluationPolicy(warmup_runs=0, measurement_runs=2)
+        self.runtime = RuntimeIdentity("python", "3.11.0", "Darwin", "arm64")
+        self.receipt = Receipt(
+            self.workload,
+            self.candidate,
+            self.policy,
+            self.runtime,
+            (
+                RawSample(0, 100, 120, "ok", "ok", 0),
+                RawSample(1, 110, 130, "ok", "ok", 0),
+            ),
+            created_at_ns=100,
+        )
+        self.key = b"supervisor-key-for-tests"
+
+    def active_store(self) -> tuple[ContentAddressedStore, str, str]:
+        raw_root = tempfile.TemporaryDirectory()
+        self.addCleanup(raw_root.cleanup)
+        store = ContentAddressedStore(raw_root.name)
+        store.put_receipt(self.receipt)
+        tag = receipt_attestation(self.receipt, self.key)
+        validation = validate_receipt(self.receipt, artifact_root=raw_root.name, attestation=tag, attestation_key=self.key)
+        decision = activate(store, validation, artifact_root=raw_root.name, attestation_key=self.key, now_ns=110)
+        return store, decision.decision_id, raw_root.name
+
+    def test_dispatch_requires_exact_workload_candidate_policy_runtime_and_artifacts(self) -> None:
+        store, _, artifact_root = self.active_store()
+        result = dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100)
+        self.assertEqual(result.mode, CANDIDATE_MODE)
+        self.assertEqual(result.candidate_id, self.candidate.candidate_id)
+
+        altered_workload = FrozenWorkload("dispatch-test-v2", knobs=self.workload.knobs)
+        altered_candidate = CandidateProposal("grid", altered_workload, {"mode": "eager"})
+        self.assertEqual(
+            dispatch(store, altered_workload, altered_candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100).mode,
+            NATIVE_MODE,
+        )
+        altered_policy = EvaluationPolicy(warmup_runs=0, measurement_runs=1)
+        self.assertEqual(
+            dispatch(store, self.workload, self.candidate, altered_policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100).mode,
+            NATIVE_MODE,
+        )
+        altered_runtime = RuntimeIdentity("python", "3.12.0", "Darwin", "arm64")
+        self.assertEqual(
+            dispatch(store, self.workload, self.candidate, self.policy, altered_runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100).mode,
+            NATIVE_MODE,
+        )
+        mismatched_artifact = Artifact("not-in-workload.bin", "0" * 64, 0)
+        self.assertEqual(
+            dispatch(
+                store,
+                self.workload,
+                self.candidate,
+                self.policy,
+                self.runtime,
+                artifacts=(mismatched_artifact,),
+                artifact_root=artifact_root,
+                attestation_key=self.key,
+                now_ns=120,
+                max_age_ns=100,
+            ).mode,
+            NATIVE_MODE,
+        )
+
+    def test_missing_stale_and_tampered_state_always_falls_back(self) -> None:
+        store, decision_id, artifact_root = self.active_store()
+        self.assertEqual(
+            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=1_000, max_age_ns=10).mode,
+            NATIVE_MODE,
+        )
+
+        receipt_path = Path(store.root) / "receipts" / f"{self.receipt.receipt_id}.json"
+        tampered = self.receipt.to_dict()
+        tampered["raw_samples"][0]["duration_ns"] = 999
+        receipt_path.write_text(__import__("json").dumps(tampered), encoding="utf-8")
+        self.assertEqual(
+            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100).mode,
+            NATIVE_MODE,
+        )
+
+        rollback(store, now_ns=130)
+        self.assertEqual(
+            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, now_ns=140, max_age_ns=100).mode,
+            NATIVE_MODE,
+        )
+        self.assertTrue(decision_id)
+
+    def test_missing_pointer_is_native_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = ContentAddressedStore(raw_root)
+            result = dispatch(store, self.workload, self.candidate, self.policy, self.runtime)
+            self.assertEqual(result.mode, NATIVE_MODE)
+
+    def test_dispatch_wire_identity_is_closed(self) -> None:
+        store, _, artifact_root = self.active_store()
+        result = dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100)
+        self.assertEqual(type(result.from_dict(result.to_dict())).__name__, "DispatchResult")
+        with self.assertRaises(Exception):
+            result.from_dict({**result.to_dict(), "surprise": True})
+
+    def test_missing_artifact_root_and_wrong_key_fall_back(self) -> None:
+        store, _, artifact_root = self.active_store()
+        self.assertEqual(dispatch(store, self.workload, self.candidate, self.policy, self.runtime, now_ns=120).mode, NATIVE_MODE)
+        self.assertEqual(
+            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=b"wrong", now_ns=120).mode,
+            NATIVE_MODE,
+        )
+
+    def test_pointer_flip_during_receipt_load_falls_back_native(self) -> None:
+        store, _, artifact_root = self.active_store()
+        real_get_receipt = store.get_receipt
+
+        def flip_pointer(receipt_id: str):
+            store.set_current_decision("native_fallback")
+            return real_get_receipt(receipt_id)
+
+        with patch.object(store, "get_receipt", side_effect=flip_pointer):
+            result = dispatch(
+                store,
+                self.workload,
+                self.candidate,
+                self.policy,
+                self.runtime,
+                artifact_root=artifact_root,
+                attestation_key=self.key,
+                now_ns=120,
+                max_age_ns=100,
+            )
+        self.assertEqual(result.mode, NATIVE_MODE)
+        self.assertEqual(store.current_decision_id(), "native_fallback")
+
+
+if __name__ == "__main__":
+    unittest.main()

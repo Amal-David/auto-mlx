@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mlx.invalid/schemas/candidate_proposal.json",
+  "title": "CandidateProposal",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["provider_id", "workload_hash", "config", "candidate_id"],
+  "properties": {
+    "provider_id": {"type": "string", "minLength": 1},
+    "workload_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "config": {
+      "type": "object",
+      "not": {"required": ["candidate_id"]},
+      "additionalProperties": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}
+    },
+    "candidate_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Derived from provider_id, workload_hash, and config; never caller-selected."
+    }
+  }
+}

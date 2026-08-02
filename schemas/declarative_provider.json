@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mlx.invalid/schemas/declarative_provider.json",
+  "title": "DeclarativeProvider",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["provider_id", "configs"],
+  "properties": {
+    "provider_id": {"type": "string", "minLength": 1},
+    "configs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "not": {"required": ["candidate_id"]},
+        "additionalProperties": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}
+      }
+    }
+  },
+  "description": "Declarative scalar maps only; candidate IDs are derived by CandidateProposal."
+}

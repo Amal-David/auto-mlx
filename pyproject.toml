@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-mlx"
+version = "0.1.0"
+description = "Evidence-gated, declarative MLX tuning contracts"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+auto-mlx = "auto_mlx.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"schemas" = ["schemas/*.json"]
+
+[tool.unittest]
+testpaths = ["tests"]

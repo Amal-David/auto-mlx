@@ -1,0 +1,13 @@
+{
+  "provider_id": "declarative-example",
+  "configs": [
+    {
+      "mode": "eager",
+      "tile": 16
+    },
+    {
+      "mode": "compiled",
+      "tile": 32
+    }
+  ]
+}

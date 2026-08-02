@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://auto-mlx.invalid/schemas/frozen_workload.json",
+  "title": "FrozenWorkload",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "artifacts", "knobs", "parameters"],
+  "properties": {
+    "name": {"type": "string", "minLength": 1},
+    "artifacts": {
+      "type": "array",
+      "items": {"$ref": "artifact.json"},
+      "description": "Python rejects duplicate artifact.path values."
+    },
+    "knobs": {
+      "type": "array",
+      "items": {"$ref": "knob.json"},
+      "description": "Python rejects duplicate knob.name values."
+    },
+    "parameters": {"$ref": "#/$defs/json_value_object"}
+  },
+  "$defs": {
+    "json_value": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string"},
+        {"type": "integer"},
+        {"type": "boolean"},
+        {"type": "array", "items": {"$ref": "#/$defs/json_value"}},
+        {"type": "object", "additionalProperties": {"$ref": "#/$defs/json_value"}}
+      ]
+    },
+    "json_value_object": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/json_value"}
+    }
+  }
+}

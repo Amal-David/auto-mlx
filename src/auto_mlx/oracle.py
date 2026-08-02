@@ -51,6 +51,10 @@ class OracleResult:
                 raise ContractError(f"{name} must be a non-negative integer", code=FailureCode.WRONG_TYPE)
         if self.failure is not None and not isinstance(self.failure, Failure):
             raise ContractError("oracle failure must be a Failure or null", code=FailureCode.WRONG_TYPE)
+        if self.matched and self.failure is not None:
+            raise ContractError("a matched oracle result cannot carry failure metadata", code=FailureCode.ORACLE_MISMATCH)
+        if not self.matched and self.failure is None:
+            raise ContractError("a mismatched oracle result must carry failure metadata", code=FailureCode.ORACLE_MISMATCH)
 
     @property
     def passed(self) -> bool:

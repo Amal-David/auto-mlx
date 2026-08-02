@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from auto_mlx.errors import ContractError
+from auto_mlx.errors import ContractError, Failure, FailureCode
 from auto_mlx.executor import ExecutionRecord, ExecutionStatus, IsolationAuthority, IsolationClaim, IsolationProvider
 from auto_mlx.measurement import (
     MeasurementRejected,
@@ -111,6 +112,7 @@ class MeasurementTests(unittest.TestCase):
         ]
         bundle = assemble_measurement_bundle(self.plan, samples)
         self.assertTrue(bundle.accepted)
+        self.assertFalse(bundle.promotion_eligible)
         self.assertEqual(len(bundle.raw_samples), 8)
         self.assertEqual(len(bundle.raw_records), 8)
         self.assertEqual(bundle.blocks[0].dispersion_inputs.ordered_parent_elapsed_ns, (100, 101, 102, 103))
@@ -210,6 +212,39 @@ class MeasurementTests(unittest.TestCase):
                 stdout=b"ok\n",
                 isolation=self.authority._attest(self.provider, self.provider._claim("a" * 64)),
             )
+
+    def test_zero_duration_truncation_and_failure_metadata_reject_assembly(self) -> None:
+        for mutation, expected_reason in (
+            ({"parent_elapsed_ns": 0}, "zero_duration"),
+            ({"output_truncated": True}, "truncated_output"),
+            ({"failure": Failure(FailureCode.RUNTIME_FAILURE, "capture failed")}, "record_failure_metadata"),
+        ):
+            with self.subTest(expected_reason=expected_reason):
+                target = self.plan.blocks[0].slots[0]
+                altered_record = replace(self._sample(target).record, **mutation)
+                samples = [
+                    MeasurementSample(
+                        item.sample_id,
+                        item.block_id,
+                        item.slot_index,
+                        item.arm,
+                        altered_record if item.sample_id == target.sample_id else self._sample(item).record,
+                        self.oracle.evaluate(b"ok\n"),
+                    )
+                    for block in self.plan.blocks
+                    for item in block.slots
+                ]
+                bundle = assemble_measurement_bundle(self.plan, samples)
+                self.assertFalse(bundle.accepted)
+                self.assertTrue(any(expected_reason in reason for reason in bundle.rejection_reasons))
+
+    def test_forged_plan_digest_is_not_bound(self) -> None:
+        forged = self.plan
+        object.__setattr__(forged, "plan_digest", "f" * 64)
+        self.assertFalse(forged.bound)
+        bundle = assemble_measurement_bundle(forged, [self._sample(slot) for block in forged.blocks for slot in block.slots])
+        self.assertFalse(bundle.accepted)
+        self.assertIn("unbound_plan", bundle.rejection_reasons)
 
     def test_unbound_and_cherry_picked_plans_are_rejected(self) -> None:
         unbound = PairedMeasurementPlan.create(1)

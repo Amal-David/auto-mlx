@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -64,6 +65,32 @@ class UnavailableProvider(IsolationProvider):
 
     def enforce(self, argv, **kwargs) -> IsolatedProcess:
         raise AutoMLXError("test provider cannot enforce containment", code=executor_module.FailureCode.SANDBOX_UNAVAILABLE)
+
+
+class ExplodingAuthority(IsolationAuthority):
+    def __init__(self) -> None:
+        super().__init__("exploding-verifier", "a" * 64, production_eligible=False)
+
+    def verify(self, provider, process, claim: IsolationClaim):
+        raise TypeError("unexpected authority failure")
+
+
+class SlowAuthority(IsolationAuthority):
+    def __init__(self) -> None:
+        super().__init__("slow-verifier", "b" * 64, production_eligible=False)
+
+    def verify(self, provider, process, claim: IsolationClaim):
+        time.sleep(0.2)
+        return self._attest(provider, claim)
+
+
+class SlowProvider(IsolationProvider):
+    def __init__(self) -> None:
+        super().__init__("slow-provider", "c" * 64)
+
+    def enforce(self, argv, **kwargs) -> IsolatedProcess:
+        time.sleep(0.2)
+        raise RuntimeError("provider did not complete")
 
 
 class ExecutorTests(unittest.TestCase):
@@ -327,6 +354,69 @@ while True: time.sleep(.02)
         )
         self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
         self.assertIn("authority", record.failure.message)  # type: ignore[union-attr]
+
+    def test_unexpected_authority_failure_is_terminal_and_cleans_up(self) -> None:
+        record = self._execute(
+            self._plan("import time; print('started', flush=True); time.sleep(30)\n"),
+            self._policy(kill_grace_seconds=0.05, reader_join_timeout_seconds=0.05),
+            provider=self.provider,
+            authority=ExplodingAuthority(),
+        )
+        self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
+        self.assertTrue(record.cleanup.attempted)
+        self.assertIsNotNone(record.failure)
+
+    def test_authority_handshake_is_bounded(self) -> None:
+        started = time.monotonic()
+        record = self._execute(
+            self._plan("import time; time.sleep(30)\n"),
+            self._policy(
+                authority_timeout_seconds=0.05,
+                kill_grace_seconds=0.05,
+                reader_join_timeout_seconds=0.05,
+            ),
+            provider=self.provider,
+            authority=SlowAuthority(),
+        )
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
+        self.assertTrue(record.cleanup.attempted)
+
+    def test_provider_handshake_is_bounded(self) -> None:
+        started = time.monotonic()
+        record = self._execute(
+            self._plan("print('must-not-run')\n"),
+            self._policy(launch_timeout_seconds=0.05),
+            provider=SlowProvider(),
+        )
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
+
+    def test_pipe_read_failure_cannot_become_success(self) -> None:
+        original = executor_module._read_pipe
+
+        def fail_read(pipe, capture, stream_index):
+            capture.record_error(stream_index, OSError("synthetic pipe failure"))
+
+        executor_module._read_pipe = fail_read
+        try:
+            record = self._execute(self._plan("print('must-fail')\n"), self._policy(), provider=self.provider)
+        finally:
+            executor_module._read_pipe = original
+        self.assertIs(record.status, ExecutionStatus.OUTPUT_FAILURE)
+        self.assertIsNotNone(record.failure)
+
+    def test_cleanup_never_signals_the_evaluator_process_group(self) -> None:
+        process = MagicMock()
+        process.pid = 123
+        process.poll.side_effect = lambda: 0 if process.terminate.called else None
+        with patch("auto_mlx.executor.os.getpgrp", return_value=77), patch(
+            "auto_mlx.executor.os.getpgid", return_value=77
+        ), patch("auto_mlx.executor.os.killpg") as killpg:
+            cleanup = executor_module._terminate_process_group(process, 0.01)
+        killpg.assert_not_called()
+        process.terminate.assert_called_once_with()
+        self.assertIs(cleanup.mode, CleanupMode.FAILED)
 
     def test_disabling_any_required_isolation_control_fails_closed_before_launch(self) -> None:
         record = self._execute(self._plan("print('must-not-run')\n"),

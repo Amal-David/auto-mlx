@@ -10,8 +10,8 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import Artifact
-from auto_mlx.errors import ArtifactIntegrityError, ContractError
-from auto_mlx.oracle import DEFAULT_MAX_ORACLE_ARTIFACT_BYTES, ExactOutputOracle
+from auto_mlx.errors import ArtifactIntegrityError, ContractError, Failure, FailureCode
+from auto_mlx.oracle import DEFAULT_MAX_ORACLE_ARTIFACT_BYTES, ExactOutputOracle, OracleResult
 
 
 class OracleTests(unittest.TestCase):
@@ -30,6 +30,17 @@ class OracleTests(unittest.TestCase):
     def test_expected_digest_must_bind_the_expected_bytes(self) -> None:
         with self.assertRaises(ContractError):
             ExactOutputOracle(b"golden", expected_digest="0" * 64)
+
+    def test_matched_oracle_result_cannot_carry_failure_metadata(self) -> None:
+        with self.assertRaises(ContractError):
+            OracleResult(
+                matched=True,
+                expected_digest="0" * 64,
+                actual_digest="0" * 64,
+                expected_size=1,
+                actual_size=1,
+                failure=Failure(FailureCode.ORACLE_MISMATCH, "forged"),
+            )
 
     def test_oracle_size_limit_is_strict_and_applies_to_expected_and_actual_bytes(self) -> None:
         self.assertLess(DEFAULT_MAX_ORACLE_ARTIFACT_BYTES, 1 << 30)

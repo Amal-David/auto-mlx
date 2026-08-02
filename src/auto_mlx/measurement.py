@@ -55,6 +55,60 @@ class PairedBlock:
             raise ContractError("paired block slots must match its sequence", code=FailureCode.INVALID_VALUE)
 
 
+def _measurement_plan_digest(
+    blocks: tuple[PairedBlock, ...],
+    *,
+    candidate_id: str | None,
+    workload_hash: str | None,
+    baseline_runner_id: str | None,
+    baseline_runner_digest: str | None,
+    candidate_runner_id: str | None,
+    candidate_runner_digest: str | None,
+    oracle: ExactOutputOracle | None,
+    require_isolation: bool,
+    isolation_provider_id: str | None,
+    isolation_identity: str | None,
+    isolation_verifier_id: str | None,
+    isolation_verifier_identity: str | None,
+    isolation_requirements: frozenset[str] | None,
+) -> str:
+    return sha256_hex(
+        {
+            "block_count": len(blocks),
+            "blocks": [
+                {
+                    "block_id": block.block_id,
+                    "block_index": block.block_index,
+                    "sequence": list(block.sequence),
+                    "slots": [
+                        {
+                            "sample_id": slot.sample_id,
+                            "block_id": slot.block_id,
+                            "slot_index": slot.slot_index,
+                            "arm": slot.arm,
+                        }
+                        for slot in block.slots
+                    ],
+                }
+                for block in blocks
+            ],
+            "candidate_id": candidate_id,
+            "workload_hash": workload_hash,
+            "baseline_runner_id": baseline_runner_id,
+            "baseline_runner_digest": baseline_runner_digest,
+            "candidate_runner_id": candidate_runner_id,
+            "candidate_runner_digest": candidate_runner_digest,
+            "oracle_digest": oracle.expected_digest if oracle else None,
+            "require_isolation": require_isolation,
+            "isolation_provider_id": isolation_provider_id,
+            "isolation_identity": isolation_identity,
+            "isolation_verifier_id": isolation_verifier_id,
+            "isolation_verifier_identity": isolation_verifier_identity,
+            "isolation_requirements": sorted(isolation_requirements) if isolation_requirements is not None else None,
+        }
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PairedMeasurementPlan:
     blocks: tuple[PairedBlock, ...]
@@ -72,6 +126,47 @@ class PairedMeasurementPlan:
     isolation_verifier_id: str | None = None
     isolation_verifier_identity: str | None = None
     isolation_requirements: frozenset[str] | None = None
+
+    def __post_init__(self) -> None:
+        validate_sha256(self.plan_digest)
+        if type(self.blocks) is not tuple or not self.blocks:
+            raise ContractError("measurement plan blocks must be a non-empty tuple", code=FailureCode.INVALID_POLICY)
+        for index, block in enumerate(self.blocks):
+            expected_sequence = (
+                (_BASELINE, _CANDIDATE, _CANDIDATE, _BASELINE)
+                if index % 2 == 0
+                else (_CANDIDATE, _BASELINE, _BASELINE, _CANDIDATE)
+            )
+            expected_block_id = f"block-{index + 1:04d}"
+            if (
+                not isinstance(block, PairedBlock)
+                or block.block_index != index
+                or block.block_id != expected_block_id
+                or block.sequence != expected_sequence
+                or tuple(slot.block_id for slot in block.slots) != (expected_block_id,) * 4
+                or tuple(slot.slot_index for slot in block.slots) != (0, 1, 2, 3)
+                or tuple(slot.sample_id for slot in block.slots)
+                != tuple(f"{expected_block_id}-slot-{slot_index + 1}" for slot_index in range(4))
+            ):
+                raise ContractError("measurement plan sequence or slot identity is not canonical", code=FailureCode.IDENTITY_MISMATCH)
+        expected_digest = _measurement_plan_digest(
+            self.blocks,
+            candidate_id=self.candidate_id,
+            workload_hash=self.workload_hash,
+            baseline_runner_id=self.baseline_runner_id,
+            baseline_runner_digest=self.baseline_runner_digest,
+            candidate_runner_id=self.candidate_runner_id,
+            candidate_runner_digest=self.candidate_runner_digest,
+            oracle=self.oracle,
+            require_isolation=self.require_isolation,
+            isolation_provider_id=self.isolation_provider_id,
+            isolation_identity=self.isolation_identity,
+            isolation_verifier_id=self.isolation_verifier_id,
+            isolation_verifier_identity=self.isolation_verifier_identity,
+            isolation_requirements=self.isolation_requirements,
+        )
+        if self.plan_digest != expected_digest:
+            raise ContractError("measurement plan digest does not match its immutable fields", code=FailureCode.IDENTITY_MISMATCH)
 
     @classmethod
     def create(
@@ -157,23 +252,21 @@ class PairedMeasurementPlan:
                 for slot_index, arm in enumerate(sequence)
             )
             blocks.append(PairedBlock(block_id, index, sequence, slots))
-        digest = sha256_hex(
-            {
-                "blocks": [{"block_id": block.block_id, "sequence": list(block.sequence)} for block in blocks],
-                "candidate_id": candidate_id,
-                "workload_hash": workload_hash,
-                "baseline_runner_id": baseline_runner_id,
-                "baseline_runner_digest": baseline_runner_digest,
-                "candidate_runner_id": candidate_runner_id,
-                "candidate_runner_digest": candidate_runner_digest,
-                "oracle_digest": oracle.expected_digest if oracle else None,
-                "require_isolation": require_isolation,
-                "isolation_provider_id": isolation_provider_id,
-                "isolation_identity": isolation_identity,
-                "isolation_verifier_id": isolation_verifier_id,
-                "isolation_verifier_identity": isolation_verifier_identity,
-                "isolation_requirements": sorted(isolation_requirements) if isolation_requirements is not None else None,
-            }
+        digest = _measurement_plan_digest(
+            tuple(blocks),
+            candidate_id=candidate_id,
+            workload_hash=workload_hash,
+            baseline_runner_id=baseline_runner_id,
+            baseline_runner_digest=baseline_runner_digest,
+            candidate_runner_id=candidate_runner_id,
+            candidate_runner_digest=candidate_runner_digest,
+            oracle=oracle,
+            require_isolation=require_isolation,
+            isolation_provider_id=isolation_provider_id,
+            isolation_identity=isolation_identity,
+            isolation_verifier_id=isolation_verifier_id,
+            isolation_verifier_identity=isolation_verifier_identity,
+            isolation_requirements=isolation_requirements,
         )
         return cls(
             blocks=tuple(blocks),
@@ -203,6 +296,10 @@ class PairedMeasurementPlan:
 
     @property
     def bound(self) -> bool:
+        try:
+            self.__post_init__()
+        except (ContractError, TypeError, ValueError):
+            return False
         identity_bound = all(
             value is not None
             for value in (
@@ -308,6 +405,10 @@ class PairedMeasurementBundle:
     def raw_records(self) -> tuple[ExecutionRecord, ...]:
         return tuple(sample.record for sample in self.raw_samples if sample.record is not None)
 
+    @property
+    def promotion_eligible(self) -> bool:
+        return self.accepted and bool(self.raw_records) and all(record.promotion_eligible for record in self.raw_records)
+
     def require_complete(self) -> "PairedMeasurementBundle":
         if not self.accepted:
             raise MeasurementRejected("paired measurement bundle rejected: " + "; ".join(self.rejection_reasons))
@@ -317,6 +418,7 @@ class PairedMeasurementBundle:
         return {
             "plan_digest": self.plan_digest,
             "accepted": self.accepted,
+            "promotion_eligible": self.promotion_eligible,
             "rejection_reasons": list(self.rejection_reasons),
             "unexpected_sample_ids": list(self.unexpected_sample_ids),
             "blocks": [
@@ -446,12 +548,24 @@ def assemble_measurement_bundle(
                                 reasons.append(f"isolation_requirements_mismatch:{slot.sample_id}")
                     if sample.record.status is not ExecutionStatus.SUCCESS:
                         reasons.append(f"execution_failure:{slot.sample_id}:{sample.record.status.value}")
+                    if sample.record.parent_elapsed_ns <= 0:
+                        reasons.append(f"zero_duration:{slot.sample_id}")
+                    if (
+                        sample.record.stdout_truncated
+                        or sample.record.stderr_truncated
+                        or sample.record.output_truncated
+                    ):
+                        reasons.append(f"truncated_output:{slot.sample_id}")
+                    if sample.record.failure is not None:
+                        reasons.append(f"record_failure_metadata:{slot.sample_id}")
                     if plan.oracle is not None:
                         recomputed = plan.oracle.evaluate(sample.record.stdout)
                         if sample.oracle is None:
                             reasons.append(f"missing_oracle_metadata:{slot.sample_id}")
                         elif sample.oracle != recomputed:
                             reasons.append(f"forged_oracle_metadata:{slot.sample_id}")
+                        if sample.oracle is not None and sample.oracle.matched and sample.oracle.failure is not None:
+                            reasons.append(f"oracle_failure_metadata:{slot.sample_id}")
                         if not recomputed.matched:
                             reasons.append(f"oracle_mismatch:{slot.sample_id}")
                     else:

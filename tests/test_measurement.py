@@ -113,12 +113,33 @@ class MeasurementTests(unittest.TestCase):
         bundle = assemble_measurement_bundle(self.plan, samples)
         self.assertFalse(bundle.accepted)
         self.assertIn("production_isolation_unavailable", bundle.rejection_reasons)
+        self.assertTrue(all(not block.accepted for block in bundle.blocks))
+        self.assertTrue(all("production_isolation_unavailable" in block.rejection_reasons for block in bundle.blocks))
         self.assertFalse(bundle.promotion_eligible)
         self.assertEqual(len(bundle.raw_samples), 8)
         self.assertEqual(len(bundle.raw_records), 8)
         self.assertEqual(bundle.blocks[0].dispersion_inputs.ordered_parent_elapsed_ns, (100, 101, 102, 103))
         self.assertEqual(bundle.blocks[0].baseline_drift_ns, 3)
         self.assertEqual(bundle.blocks[1].dispersion_inputs.candidate_elapsed_ns, (110, 113))
+
+    def test_forged_isolation_cannot_accept_required_measurement_blocks(self) -> None:
+        samples = [
+            self._sample(slot)
+            for block in self.plan.blocks
+            for slot in block.slots
+        ]
+        for sample in samples:
+            assert sample.record is not None and sample.record.isolation is not None
+            object.__setattr__(sample.record.isolation, "production_eligible", True)
+
+        bundle = assemble_measurement_bundle(self.plan, samples)
+
+        self.assertFalse(bundle.accepted)
+        self.assertEqual(bundle.rejection_reasons, ("production_isolation_unavailable",))
+        self.assertEqual(
+            [(block.accepted, block.rejection_reasons) for block in bundle.blocks],
+            [(False, ("production_isolation_unavailable",))] * len(self.plan.blocks),
+        )
 
     def test_missing_slot_is_rejected_and_retained_as_placeholder(self) -> None:
         samples = [self._sample(slot) for slot in self.plan.blocks[0].slots]

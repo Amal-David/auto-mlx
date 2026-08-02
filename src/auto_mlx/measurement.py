@@ -514,7 +514,7 @@ def assemble_measurement_bundle(
     observations: list[BlockObservation] = []
     for block in plan.blocks:
         block_samples: list[MeasurementSample] = []
-        reasons: list[str] = []
+        reasons: list[str] = [_PRODUCTION_ISOLATION_UNAVAILABLE] if plan.require_isolation else []
         for slot in block.slots:
             sample = sample_map.get(slot.sample_id)
             if sample is None:

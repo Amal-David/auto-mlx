@@ -9,7 +9,7 @@ Auto MLX is a small, standalone G0 contract layer for evidence-gated MLX tuning.
 - Immutable workload, artifact, knob, provider, policy, runtime, and candidate proposal contracts.
 - Descriptor-relative, no-follow artifact verification with size and SHA-256 checks where the host exposes the required primitives.
 - A standard-library-only CLI that validates documents and inspects IDs. It imports no MLX.
-- Create-new output files: `--output` refuses to overwrite an existing path.
+- Descriptor-stable, create-only output publication: `--output` stages privately, hard-links atomically, and refuses to overwrite an existing path.
 
 ## Install and validate
 
@@ -33,13 +33,14 @@ The checked-in example is intentionally declarative and offline:
 
 ```bash
 PYTHONPATH=src python3 -m auto_mlx validate provider --input examples/provider.json
-PYTHONPATH=src python3 -m auto_mlx validate workload examples/workload.json --output /tmp/auto-mlx-workload.json
+PYTHONPATH=src python3 -m auto_mlx validate workload examples/workload.json --output ./auto-mlx-workload.json
 ```
 
-Output creation is private and exclusive, but it is not atomic: the final destination is created directly through a
-descriptor and may be visible while it is being written. The CLI reports success only after syncing the file and its
-containing directory. If anything fails after creation, the destination remains (and may be incomplete or have
-unconfirmed durability); choose a new path after inspecting it. Existing output paths are never replaced.
+Output creation uses a private unpredictable staging name and a descriptor-relative no-follow hard link. The final
+destination is absent or a complete `0600` payload; it is never visible while being written and existing output paths
+are never replaced. Ordinary pre-publication failures leave no final name. Post-publication failures attempt an
+identity-checked rollback and explicitly report any remaining destination, private staging name, or uncertain durability.
+Hosts without the required POSIX descriptor and hard-link primitives fail closed.
 
 ## Explicit non-capabilities
 

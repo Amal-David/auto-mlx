@@ -9,8 +9,10 @@ activation boundaries are proven.
 from __future__ import annotations
 
 import argparse
+import errno
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 import os
+import secrets
 import stat
 import sys
 import tomllib
@@ -38,6 +40,13 @@ EXIT_UNAVAILABLE: Final = 4
 EXIT_IO: Final = 5
 EXIT_INTERNAL: Final = 70
 MAX_JSON_INPUT_BYTES: Final = 4 * 1024 * 1024
+
+_OPEN_SUPPORTS_DIR_FD: Final = os.open in getattr(os, "supports_dir_fd", ())
+_STAT_SUPPORTS_DIR_FD: Final = os.stat in getattr(os, "supports_dir_fd", ())
+_STAT_SUPPORTS_NOFOLLOW: Final = os.stat in getattr(os, "supports_follow_symlinks", ())
+_LINK_SUPPORTS_DIR_FD: Final = os.link in getattr(os, "supports_dir_fd", ())
+_LINK_SUPPORTS_NOFOLLOW: Final = os.link in getattr(os, "supports_follow_symlinks", ())
+_UNLINK_SUPPORTS_DIR_FD: Final = os.unlink in getattr(os, "supports_dir_fd", ())
 
 _CONTRACT_KINDS: Final = (
     "artifact",
@@ -238,37 +247,163 @@ def _read_bounded_descriptor(descriptor: int, *, source: str) -> bytes:
     return b"".join(chunks)
 
 
+def _require_walk_primitives(path: str) -> None:
+    if not callable(getattr(os, "open", None)) or not _OPEN_SUPPORTS_DIR_FD:
+        raise CLIIOError(f"cannot safely access path {path}: descriptor-relative open is unavailable")
+    if not callable(getattr(os, "fstat", None)):
+        raise CLIIOError(f"cannot safely access path {path}: fstat is unavailable")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise CLIIOError(f"cannot safely access path {path}: no-follow directory opens are unavailable")
+
+
+def _path_components(path_value: str, *, label: str) -> tuple[Path, str, tuple[str, ...]]:
+    if type(path_value) is not str or not path_value:
+        raise CLIIOError(f"{label} path must be a non-empty string")
+    try:
+        path = Path(path_value)
+    except (TypeError, ValueError) as exc:
+        raise CLIIOError(f"cannot parse {label} path {path_value!r}: {exc}") from exc
+    parts = path.parts
+    anchor = path.anchor or "."
+    components = parts[1:] if path.anchor else parts
+    if not components:
+        raise CLIIOError(f"{label} path has no final name: {path_value!r}")
+    return path, anchor, tuple(components)
+
+
+def _walk_error(
+    path: Path, component: str, exc: OSError | ValueError | NotImplementedError, *, descriptor: int | None = None
+) -> CLIIOError:
+    if not isinstance(exc, OSError):
+        return CLIIOError(f"cannot open {path} parent component {component!r}: {exc}")
+    if exc.errno == errno.ELOOP:
+        return CLIIOError(f"{path} contains a symlink ancestor at {component!r}")
+    if (
+        exc.errno == errno.ENOTDIR
+        and descriptor is not None
+        and _STAT_SUPPORTS_DIR_FD
+        and _STAT_SUPPORTS_NOFOLLOW
+    ):
+        try:
+            entry = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+        except OSError:
+            entry = None
+        if entry is not None and stat.S_ISLNK(entry.st_mode):
+            return CLIIOError(f"{path} contains a symlink ancestor at {component!r}")
+    if exc.errno == errno.ENOENT:
+        return CLIIOError(f"{path} has a missing parent component: {component!r}")
+    if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
+        return CLIIOError(f"{path} has a non-directory parent component: {component!r}")
+    return CLIIOError(f"cannot open {path} parent component {component!r}: {exc}")
+
+
+def _open_parent_directory(path_value: str, *, label: str) -> tuple[int, str, Path]:
+    """Open every parent component from a stable anchor without following links."""
+
+    path, anchor, components = _path_components(path_value, label=label)
+    _require_walk_primitives(str(path))
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(anchor, flags)
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise CLIIOError(f"{label} anchor is not a directory: {anchor}")
+        for component in components[:-1]:
+            child: int | None = None
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+                child_stat = os.fstat(child)
+                if not stat.S_ISDIR(child_stat.st_mode):
+                    raise CLIIOError(f"{path} has a non-directory parent component: {component!r}")
+            except CLIIOError:
+                if child is not None:
+                    try:
+                        os.close(child)
+                    except OSError:
+                        pass
+                raise
+            except (OSError, ValueError, NotImplementedError) as exc:
+                if child is not None:
+                    try:
+                        os.close(child)
+                    except OSError:
+                        pass
+                raise _walk_error(path, component, exc, descriptor=descriptor) from exc
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                try:
+                    os.close(child)
+                except OSError:
+                    pass
+                raise CLIIOError(f"cannot close {label} parent descriptor for {path}: {exc}") from exc
+            descriptor = child
+        if descriptor is None:  # pragma: no cover - _path_components guarantees a component
+            raise CLIIOError(f"cannot open {label} parent for {path}")
+        return descriptor, components[-1], path
+    except CLIIOError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except (OSError, ValueError, NotImplementedError) as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise _walk_error(path, anchor, exc) from exc
+
+
 def _read_json(path_value: str) -> Any:
     if path_value == "-":
         stream = getattr(sys.stdin, "buffer", sys.stdin)
         raw = _read_bounded(stream, source="stdin", text_stream=stream is sys.stdin)
     else:
-        path = Path(path_value)
-        nofollow = getattr(os, "O_NOFOLLOW", None)
-        if nofollow is None:
-            raise CLIIOError(f"cannot safely open input {path}: O_NOFOLLOW is unavailable")
+        parent_descriptor, name, path = _open_parent_directory(path_value, label="input")
         descriptor: int | None = None
+        operation_error: CLIIOError | None = None
+        close_error: OSError | None = None
         try:
-            flags = os.O_RDONLY | nofollow
+            if not callable(getattr(os, "read", None)) or getattr(os, "O_NONBLOCK", None) is None:
+                raise CLIIOError(f"cannot safely open input {path}: non-blocking descriptor reads are unavailable")
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
-            if hasattr(os, "O_NONBLOCK"):
-                flags |= os.O_NONBLOCK
-            descriptor = os.open(path, flags)
+            descriptor = os.open(name, flags, dir_fd=parent_descriptor)
             info = os.fstat(descriptor)
             if not stat.S_ISREG(info.st_mode):
                 raise CLIIOError(f"input path is not a regular file: {path}")
             if info.st_size > MAX_JSON_INPUT_BYTES:
                 raise _input_limit_error(str(path))
             raw = _read_bounded_descriptor(descriptor, source=str(path))
-        except (OSError, ValueError) as exc:
-            raise CLIIOError(f"cannot read input {path}: {exc}") from exc
+        except CLIIOError as exc:
+            operation_error = exc
+        except (OSError, ValueError, NotImplementedError) as exc:
+            operation_error = CLIIOError(f"cannot read input {path}: {exc}")
         finally:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError as exc:
-                    raise CLIIOError(f"cannot close input {path}: {exc}") from exc
+                    close_error = exc
+            try:
+                os.close(parent_descriptor)
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+        if close_error is not None:
+            if operation_error is not None:
+                raise CLIIOError(f"{operation_error}; input descriptor close failed: {path}: {close_error}") from operation_error
+            raise CLIIOError(f"cannot close input descriptor for {path}: {close_error}") from close_error
+        if operation_error is not None:
+            raise operation_error
     return strict_json_loads(raw)
 
 
@@ -372,107 +507,253 @@ def _write_descriptor(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _create_only(path_value: str, payload: bytes) -> None:
-    """Create and sync a private output without replacement or temp paths.
-
-    The final directory entry is created directly through the opened parent
-    descriptor. This proves exclusivity and descriptor stability, but not
-    atomic visibility: readers may observe a partial file before success.
-    """
-
-    path = Path(path_value)
-    name = path.name
-    parent = path.parent
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise CLIIOError(f"cannot safely publish output {path}: O_NOFOLLOW is unavailable")
-    if not name or name in {".", ".."}:
-        raise CLIIOError(f"cannot publish output {path}: destination name is empty")
-    if not hasattr(os, "fchmod"):
+def _require_publication_primitives(path: str) -> None:
+    _require_walk_primitives(path)
+    if not _STAT_SUPPORTS_DIR_FD or not _STAT_SUPPORTS_NOFOLLOW:
+        raise CLIIOError(f"cannot safely publish output {path}: descriptor-relative no-follow stat is unavailable")
+    if not _LINK_SUPPORTS_DIR_FD or not _LINK_SUPPORTS_NOFOLLOW or not callable(getattr(os, "link", None)):
+        raise CLIIOError(f"cannot safely publish output {path}: no-follow hard-link publication is unavailable")
+    if not _UNLINK_SUPPORTS_DIR_FD or not callable(getattr(os, "unlink", None)):
+        raise CLIIOError(f"cannot safely publish output {path}: descriptor-relative unlink is unavailable")
+    if not callable(getattr(os, "fchmod", None)):
         raise CLIIOError(f"cannot safely publish output {path}: fchmod is unavailable")
-    if not hasattr(os, "fsync"):
+    if not callable(getattr(os, "fsync", None)):
         raise CLIIOError(f"cannot safely publish output {path}: fsync is unavailable")
+    if not callable(getattr(os, "write", None)) or not callable(getattr(os, "fstat", None)):
+        raise CLIIOError(f"cannot safely publish output {path}: descriptor writes are unavailable")
 
-    directory_descriptor: int | None = None
-    output_descriptor: int | None = None
-    created = False
+
+def _identity_from_stat(value: os.stat_result, *, path: str) -> tuple[int, int]:
+    try:
+        return value.st_dev, value.st_ino
+    except AttributeError as exc:
+        raise CLIIOError(f"cannot safely publish output {path}: device/inode metadata is unavailable") from exc
+
+
+def _descriptor_identity(descriptor: int, *, path: str) -> tuple[int, int]:
+    try:
+        return _identity_from_stat(os.fstat(descriptor), path=path)
+    except (OSError, ValueError, NotImplementedError) as exc:
+        raise CLIIOError(f"cannot inspect open output descriptor for {path}: {exc}") from exc
+
+
+def _name_identity(descriptor: int, name: str, *, path: str) -> tuple[int, int]:
+    try:
+        return _identity_from_stat(os.stat(name, dir_fd=descriptor, follow_symlinks=False), path=path)
+    except (OSError, ValueError, NotImplementedError) as exc:
+        raise CLIIOError(f"cannot inspect output name {path}: {exc}") from exc
+
+
+def _unlink_if_identity(
+    directory_descriptor: int,
+    name: str,
+    identity: tuple[int, int],
+    *,
+    path: str,
+) -> tuple[bool, str]:
+    """Remove a name only after re-checking that it is still our inode."""
+
+    last_error: OSError | None = None
+    for _ in range(2):
+        try:
+            current = _name_identity(directory_descriptor, name, path=path)
+        except CLIIOError as exc:
+            if isinstance(exc.__cause__, FileNotFoundError):
+                return True, "already absent"
+            last_error = exc.__cause__ if isinstance(exc.__cause__, OSError) else OSError(str(exc))
+            continue
+        if current != identity:
+            return False, "identity changed; the name was left untouched"
+        try:
+            os.unlink(name, dir_fd=directory_descriptor)
+            return True, "removed"
+        except FileNotFoundError:
+            return True, "already absent"
+        except (OSError, NotImplementedError) as exc:
+            last_error = exc
+    return False, f"could not remove the identity-matched name: {last_error}"
+
+
+def _output_trailing_separator(path_value: str) -> bool:
+    separators = {os.sep}
+    if os.altsep is not None:
+        separators.add(os.altsep)
+    return any(path_value.endswith(separator) for separator in separators)
+
+
+def _create_only(path_value: str, payload: bytes) -> None:
+    """Publish a complete private staged inode without replacing a name."""
+
+    if type(path_value) is not str or not path_value:
+        raise CLIIOError("output path must be a non-empty string")
+    if _output_trailing_separator(path_value):
+        raise CLIIOError(f"output path must name a file and must not end in a separator: {path_value!r}")
+    path, _, components = _path_components(path_value, label="output")
+    name = components[-1]
+    if name in {".", ".."}:
+        raise CLIIOError(f"output path has an invalid final name: {path_value!r}")
+    _require_publication_primitives(str(path))
+    directory_descriptor, _, _ = _open_parent_directory(path_value, label="output")
+    staged_descriptor: int | None = None
+    temporary_name: str | None = None
+    staged_identity: tuple[int, int] | None = None
+    published = False
+    rollback_required = False
     operation_error: CLIIOError | None = None
-    close_error: OSError | None = None
-    directory_flags = os.O_RDONLY | nofollow
-    if hasattr(os, "O_DIRECTORY"):
-        directory_flags |= os.O_DIRECTORY
-    if hasattr(os, "O_CLOEXEC"):
-        directory_flags |= os.O_CLOEXEC
+    close_errors: list[OSError] = []
+    cleanup_messages: list[str] = []
 
     try:
-        try:
-            directory_descriptor = os.open(parent, directory_flags)
-            directory_info = os.fstat(directory_descriptor)
-            if not stat.S_ISDIR(directory_info.st_mode):
-                raise CLIIOError(f"output parent is not a directory: {parent}")
-        except CLIIOError:
-            raise
-        except (OSError, ValueError) as exc:
-            raise CLIIOError(f"cannot open output directory {parent}: {exc}") from exc
-
-        output_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow
+        open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
-            output_flags |= os.O_CLOEXEC
+            open_flags |= os.O_CLOEXEC
+        for _ in range(32):
+            temporary_name = f".{name}.auto-mlx-{secrets.token_hex(16)}"
+            try:
+                staged_descriptor = os.open(
+                    temporary_name,
+                    open_flags,
+                    0o600,
+                    dir_fd=directory_descriptor,
+                )
+                break
+            except FileExistsError:
+                temporary_name = None
+        if staged_descriptor is None or temporary_name is None:
+            raise CLIIOError(f"could not create an unpredictable private staging file in {path.parent}")
+
+        staged_identity = _descriptor_identity(staged_descriptor, path=str(path))
+        if not stat.S_ISREG(os.fstat(staged_descriptor).st_mode):
+            raise CLIIOError(f"private staging file is not regular: {path}")
         try:
-            output_descriptor = os.open(name, output_flags, 0o600, dir_fd=directory_descriptor)
+            _write_descriptor(staged_descriptor, payload)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(f"staged output contents were not written; no final was published: {path}: {exc}") from exc
+        try:
+            os.fchmod(staged_descriptor, 0o600)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(
+                f"staged output private permissions were not confirmed; no final was published: {path}: {exc}"
+            ) from exc
+        if stat.S_IMODE(os.fstat(staged_descriptor).st_mode) != 0o600:
+            raise CLIIOError(f"private staging permissions could not be confirmed: {path}")
+        try:
+            os.fsync(staged_descriptor)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(
+                f"staged output contents were not durably synced; no final was published: {path}: {exc}"
+            ) from exc
+        if _name_identity(directory_descriptor, temporary_name, path=str(path)) != staged_identity:
+            raise CLIIOError(f"private staging name changed before publication: {path}")
+
+        try:
+            os.link(
+                temporary_name,
+                name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            published = True
         except FileExistsError as exc:
             raise CLIIOError(f"refusing to overwrite existing output: {path}") from exc
-        except (NotImplementedError, TypeError) as exc:
-            raise CLIIOError(
-                f"cannot safely publish output {path}: descriptor-relative create is unavailable"
-            ) from exc
-        except (OSError, ValueError) as exc:
-            raise CLIIOError(f"cannot create output {path}: {exc}") from exc
-        created = True
+        except (NotImplementedError, OSError, TypeError, ValueError) as exc:
+            # A syscall can fail after creating the link. Only treat it as a
+            # publication when the destination now names this open inode.
+            try:
+                destination_identity = _name_identity(directory_descriptor, name, path=str(path))
+            except CLIIOError as identity_error:
+                raise CLIIOError(
+                    f"cannot publish output {path}: {exc}; destination identity could not be checked: {identity_error}"
+                ) from exc
+            if destination_identity == staged_identity:
+                published = True
+            else:
+                raise CLIIOError(f"cannot publish output {path}: {exc}") from exc
+        if not published:
+            raise CLIIOError(f"cannot publish output {path}: destination was not created")
 
-        try:
-            os.fchmod(output_descriptor, 0o600)
-        except (OSError, ValueError) as exc:
-            raise CLIIOError(
-                f"output was created but its private permissions could not be confirmed: {path}: {exc}"
-            ) from exc
-        try:
-            _write_descriptor(output_descriptor, payload)
-            os.fsync(output_descriptor)
-        except (OSError, ValueError) as exc:
-            raise CLIIOError(
-                f"output was created but its contents were not durably synced; destination may be incomplete: "
-                f"{path}: {exc}"
-            ) from exc
+        rollback_required = True
+        if _name_identity(directory_descriptor, name, path=str(path)) != staged_identity:
+            raise CLIIOError(f"published output identity did not match the staged descriptor: {path}")
+        if _name_identity(directory_descriptor, name, path=str(path)) != staged_identity:
+            raise CLIIOError(f"published output identity changed during verification: {path}")
         try:
             os.fsync(directory_descriptor)
         except (OSError, ValueError) as exc:
             raise CLIIOError(
-                f"output was created and contains the payload, but directory durability is unconfirmed; "
-                f"the destination remains and retrying the same path will be refused: {path}: {exc}"
+                f"post-link directory durability is uncertain; attempting rollback: {path}: {exc}"
             ) from exc
+
+        try:
+            removed, detail = _unlink_if_identity(
+                directory_descriptor,
+                temporary_name,
+                staged_identity,
+                path=str(path),
+            )
+        except CLIIOError as exc:
+            raise CLIIOError(f"private staging cleanup could not be checked: {path}: {exc}") from exc
+        if not removed:
+            raise CLIIOError(f"private staging cleanup failed for {path}: {detail}")
+        cleanup_messages.append(f"private staging {detail}")
+        temporary_name = None
+        try:
+            os.fsync(directory_descriptor)
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(
+                f"private staging removal durability is uncertain; attempting rollback: {path}: {exc}"
+            ) from exc
+        rollback_required = False
     except CLIIOError as exc:
         operation_error = exc
+    except (OSError, TypeError, ValueError, NotImplementedError) as exc:
+        operation_error = CLIIOError(f"cannot publish output {path}: {exc}")
     finally:
-        if output_descriptor is not None:
+        if operation_error is not None and published and rollback_required and staged_identity is not None:
+            removed, detail = _unlink_if_identity(
+                directory_descriptor,
+                name,
+                staged_identity,
+                path=str(path),
+            )
+            cleanup_messages.append(f"destination rollback: {detail}")
+            if removed:
+                try:
+                    os.fsync(directory_descriptor)
+                except OSError as exc:
+                    cleanup_messages.append(f"destination rollback durability is uncertain: {exc}")
+        if temporary_name is not None and staged_identity is not None:
+            removed, detail = _unlink_if_identity(
+                directory_descriptor,
+                temporary_name,
+                staged_identity,
+                path=str(path),
+            )
+            cleanup_messages.append(f"private staging cleanup: {detail}")
+            if removed:
+                temporary_name = None
+        if staged_descriptor is not None:
             try:
-                os.close(output_descriptor)
+                os.close(staged_descriptor)
             except OSError as exc:
-                close_error = exc
-        if directory_descriptor is not None:
-            try:
-                os.close(directory_descriptor)
-            except OSError as exc:
-                if close_error is None:
-                    close_error = exc
+                close_errors.append(exc)
+        try:
+            os.close(directory_descriptor)
+        except OSError as exc:
+            close_errors.append(exc)
 
-    if close_error is not None:
-        if operation_error is not None:
-            raise CLIIOError(
-                f"{operation_error}; descriptor close also failed after output creation={created}: {close_error}"
-            ) from operation_error
-        raise CLIIOError(f"output was created but descriptor close failed: {path}: {close_error}") from close_error
+    if close_errors:
+        close_detail = "; ".join(str(error) for error in close_errors)
+        if operation_error is None:
+            operation_error = CLIIOError(
+                f"output was published, but descriptor close failed; inspect {path}: {close_detail}"
+            )
+        else:
+            operation_error = CLIIOError(f"{operation_error}; descriptor close failed: {close_detail}")
     if operation_error is not None:
+        if cleanup_messages:
+            operation_error = CLIIOError(f"{operation_error} ({'; '.join(cleanup_messages)})")
         raise operation_error
 
 
@@ -548,6 +829,9 @@ def main(argv: list[str] | None = None) -> int:
         _write_diagnostic(_diagnostic(exc.code.value, exc.message))
         return _exit_for_error(exc)
     except OSError as exc:
+        _write_diagnostic(_diagnostic("io_error", str(exc)))
+        return EXIT_IO
+    except NotImplementedError as exc:
         _write_diagnostic(_diagnostic("io_error", str(exc)))
         return EXIT_IO
     except (RecursionError, UnicodeError) as exc:

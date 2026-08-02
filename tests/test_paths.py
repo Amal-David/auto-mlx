@@ -20,6 +20,18 @@ import auto_mlx.paths as paths_module
 
 
 class SafePathTests(unittest.TestCase):
+    def test_artifact_root_dot_is_opened_from_the_stable_cwd_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                (root / "model.bin").write_bytes(b"cwd-root")
+                digest = hashlib.sha256(b"cwd-root").hexdigest()
+                self.assertEqual(file_identity(".", "model.bin"), (8, digest))
+            finally:
+                os.chdir(previous)
+
     def test_relative_posix_paths_reject_traversal_and_cross_platform_escapes(self) -> None:
         for raw in (
             "",
@@ -60,7 +72,7 @@ class SafePathTests(unittest.TestCase):
         original_payload = b"trusted bytes"
         attacker_payload = b"attacker bytes"
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             parent = root / "parent"
             parent.mkdir()
             (parent / "model.bin").write_bytes(original_payload)
@@ -93,7 +105,7 @@ class SafePathTests(unittest.TestCase):
     def test_digest_and_size_bind_the_artifact_bytes(self) -> None:
         payload = b"frozen model bytes\n"
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             path = root / "nested" / "model.bin"
             path.parent.mkdir()
             path.write_bytes(payload)
@@ -110,7 +122,7 @@ class SafePathTests(unittest.TestCase):
 
     def test_file_identity_rejects_bytes_beyond_declared_size_during_read(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             (root / "model.bin").write_bytes(b"a" + b"x" * (2 * 1024 * 1024))
             with self.assertRaises(ArtifactIntegrityError) as context:
                 file_identity(root, "model.bin", expected_size=1)
@@ -118,7 +130,7 @@ class SafePathTests(unittest.TestCase):
 
     def test_symlink_and_non_regular_artifacts_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             (root / "real").write_bytes(b"x")
             (root / "alias").symlink_to(root / "real")
             with self.assertRaises(ArtifactIntegrityError) as context:
@@ -137,7 +149,7 @@ class SafePathTests(unittest.TestCase):
         if not hasattr(os, "mkfifo"):
             self.skipTest("FIFO creation is unavailable")
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             fifo = root / "pipe"
             os.mkfifo(fifo)
             environment = os.environ.copy()
@@ -189,7 +201,7 @@ class SafePathTests(unittest.TestCase):
 
     def test_open_and_read_failures_do_not_look_like_digest_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             (root / "model.bin").write_bytes(b"x")
             with patch.object(paths_module.os, "open", side_effect=OSError(errno.EACCES, "denied")):
                 with self.assertRaises(ArtifactIntegrityError) as context:
@@ -214,7 +226,7 @@ class SafePathTests(unittest.TestCase):
 
     def test_parent_descriptor_is_closed_when_child_metadata_fails(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
-            root = Path(raw_root)
+            root = Path(raw_root).resolve()
             (root / "nested").mkdir()
             (root / "nested" / "model.bin").write_bytes(b"x")
             real_open = paths_module.os.open
@@ -251,3 +263,16 @@ class SafePathTests(unittest.TestCase):
             self.assertEqual(context.exception.code, FailureCode.ARTIFACT_IO_ERROR)
             self.assertGreaterEqual(fstat_calls, 2)
             self.assertIn(opened[-1], closed)
+
+    def test_artifact_root_symlink_ancestors_are_rejected(self) -> None:
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlink creation is not available")
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            real_root = root / "real"
+            real_root.mkdir()
+            (real_root / "model.bin").write_bytes(b"bytes")
+            (root / "alias").symlink_to(real_root, target_is_directory=True)
+            with self.assertRaises(ArtifactIntegrityError) as context:
+                file_identity(root / "alias", "model.bin")
+            self.assertEqual(context.exception.code, FailureCode.ARTIFACT_SYMLINK)

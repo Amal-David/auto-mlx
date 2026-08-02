@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from auto_mlx.receipts import (
 
 class _ReceiptIsolationProvider(IsolationProvider):
     def __init__(self) -> None:
-        super().__init__("receipt-test-isolation", "e" * 64)
+        super().__init__("receipt-test-isolation", "e" * 64, supports_evaluator_owned_launch=True)
 
     def enforce(self, argv, **kwargs):
         process = subprocess.Popen(
@@ -358,6 +359,26 @@ class ReceiptTests(unittest.TestCase):
             )
             bundle = evaluator.evaluate(proposal)
             self.assertTrue(bundle.accepted)
+            with self.assertRaises(ContractError) as mismatched_policy:
+                Receipt.from_observation_bundle(
+                    bundle,
+                    workload,
+                    proposal,
+                    EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=2, max_output_bytes=4095),
+                    oracle=oracle,
+                    created_at_ns=100,
+                )
+            self.assertEqual(mismatched_policy.exception.code, FailureCode.INVALID_POLICY)
+            with self.assertRaises(ContractError) as forged_digest:
+                Receipt.from_observation_bundle(
+                    replace(bundle, policy_digest="0" * 64),
+                    workload,
+                    proposal,
+                    policy,
+                    oracle=oracle,
+                    created_at_ns=100,
+                )
+            self.assertEqual(forged_digest.exception.code, FailureCode.INVALID_POLICY)
             with self.assertRaises(ContractError):
                 Receipt.from_observation_bundle(bundle, workload, proposal, policy, oracle=oracle, created_at_ns=100)
 

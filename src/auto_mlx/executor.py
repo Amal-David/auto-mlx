@@ -271,11 +271,21 @@ class IsolationAuthority(ABC):
 
 
 class IsolationProvider(ABC):
-    """Evaluator-owned process launcher that returns only an untrusted claim."""
+    """Evaluator-owned process launcher that returns only an untrusted claim.
 
-    def __init__(self, provider_id: str, identity: str) -> None:
+    The default launch contract is deliberately unsupported.  A provider may
+    opt in only when its synchronous ``enforce`` implementation gives the
+    evaluator cleanup ownership before it can return.  The executor never
+    runs this API in a worker thread, because a timed-out worker could publish
+    a child after the evaluator had already failed closed.
+    """
+
+    def __init__(self, provider_id: str, identity: str, *, supports_evaluator_owned_launch: bool = False) -> None:
         self._provider_id = _non_empty_string(provider_id, label="provider_id")
         self._identity = validate_sha256(identity)
+        if type(supports_evaluator_owned_launch) is not bool:
+            raise ContractError("supports_evaluator_owned_launch must be a boolean", code=FailureCode.WRONG_TYPE)
+        self._supports_evaluator_owned_launch = supports_evaluator_owned_launch
 
     @property
     def provider_id(self) -> str:
@@ -284,6 +294,10 @@ class IsolationProvider(ABC):
     @property
     def identity(self) -> str:
         return self._identity
+
+    @property
+    def supports_evaluator_owned_launch(self) -> bool:
+        return self._supports_evaluator_owned_launch
 
     def _claim(self, attestation_digest: str, requirements: frozenset[str] = _REQUIRED_ISOLATION) -> IsolationClaim:
         return IsolationClaim(self.provider_id, self.identity, requirements, attestation_digest)
@@ -896,6 +910,7 @@ class _BoundedCapture:
         self._combined_truncated = False
         self._total = 0
         self._errors: list[str] = []
+        self._reader_states: list[str | None] = [None, None]
         self._lock = threading.Lock()
         self.output_event = threading.Event()
         self.failure_event = threading.Event()
@@ -915,8 +930,22 @@ class _BoundedCapture:
 
     def record_error(self, stream_index: int, error: BaseException) -> None:
         with self._lock:
+            if 0 <= stream_index < len(self._reader_states) and self._reader_states[stream_index] == "error":
+                return
             self._errors.append(f"stream-{stream_index}:{type(error).__name__}")
+            if 0 <= stream_index < len(self._reader_states):
+                self._reader_states[stream_index] = "error"
             self.failure_event.set()
+
+    def record_completion(self, stream_index: int) -> None:
+        with self._lock:
+            if 0 <= stream_index < len(self._reader_states) and self._reader_states[stream_index] is None:
+                self._reader_states[stream_index] = "complete"
+
+    @property
+    def reader_states(self) -> tuple[str | None, ...]:
+        with self._lock:
+            return tuple(self._reader_states)
 
     @property
     def errors(self) -> tuple[str, ...]:
@@ -941,8 +970,23 @@ def _read_pipe(pipe: Any, capture: _BoundedCapture, stream_index: int) -> None:
             if not chunk:
                 return
             capture.append(stream_index, chunk)
-    except Exception as exc:
+    except BaseException as exc:
         capture.record_error(stream_index, exc)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+
+
+def _read_pipe_worker(pipe: Any, capture: _BoundedCapture, stream_index: int) -> None:
+    """Account for termination even if the reader target itself is replaced."""
+
+    try:
+        _read_pipe(pipe, capture, stream_index)
+    except BaseException as exc:
+        capture.record_error(stream_index, exc)
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+    finally:
+        capture.record_completion(stream_index)
 
 
 def _finish_capture(
@@ -983,6 +1027,11 @@ def _finish_capture(
     if any(reader.is_alive() for reader in readers):
         capture.record_error(-1, RuntimeError("pipe reader did not terminate"))
         reader_failure = True
+    for stream_index, state in enumerate(capture.reader_states):
+        if state != "complete":
+            if state is None:
+                capture.record_error(stream_index, RuntimeError("pipe reader terminated without completion accounting"))
+            reader_failure = True
     return reader_failure or bool(capture.errors)
 
 
@@ -1306,6 +1355,18 @@ def execute_plan(
             observation_id=observation_id,
             arm=arm,
         )
+    if not provider.supports_evaluator_owned_launch:
+        return _record_failure(
+            plan,
+            ExecutionStatus.SANDBOX_UNAVAILABLE,
+            _failure(
+                FailureCode.SANDBOX_UNAVAILABLE,
+                "isolation provider launch contract does not provide evaluator-owned cleanup before invocation",
+            ),
+            time.monotonic_ns() - started_ns,
+            observation_id=observation_id,
+            arm=arm,
+        )
 
     process: subprocess.Popen[bytes] | None = None
     capture: _BoundedCapture | None = None
@@ -1358,20 +1419,13 @@ def execute_plan(
                 )
             environment = _prepare_environment(workdir, policy, config_path, artifacts_path)
             try:
-                launch_timeout = min(
-                    policy.launch_timeout_seconds,
-                    max(0.01, handshake_deadline - time.monotonic()),
-                )
-                launched = _call_bounded(
-                    lambda: provider.enforce(
-                        runner_argv,
-                        cwd=str(workdir),
-                        env=environment,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                    ),
-                    launch_timeout,
+                launched = provider.enforce(
+                    runner_argv,
+                    cwd=str(workdir),
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                 )
             except Exception as exc:
                 return _record_failure(
@@ -1410,8 +1464,8 @@ def execute_plan(
                 )
             capture = _BoundedCapture(policy.max_stdout_bytes, policy.max_stderr_bytes, policy.max_output_bytes)
             readers = [
-                threading.Thread(target=_read_pipe, args=(process.stdout, capture, 0), daemon=True),
-                threading.Thread(target=_read_pipe, args=(process.stderr, capture, 1), daemon=True),
+                threading.Thread(target=_read_pipe_worker, args=(process.stdout, capture, 0), daemon=True),
+                threading.Thread(target=_read_pipe_worker, args=(process.stderr, capture, 1), daemon=True),
             ]
             for reader in readers:
                 reader.start()

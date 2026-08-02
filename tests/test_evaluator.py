@@ -19,7 +19,7 @@ from auto_mlx.oracle import ExactOutputOracle
 
 class FixtureIsolationProvider(IsolationProvider):
     def __init__(self) -> None:
-        super().__init__("evaluator-fixture-isolation", "6" * 64)
+        super().__init__("evaluator-fixture-isolation", "6" * 64, supports_evaluator_owned_launch=True)
 
     def enforce(self, argv, *, cwd, env, stdin, stdout, stderr) -> IsolatedProcess:
         process = subprocess.Popen(
@@ -199,6 +199,66 @@ class EvaluatorTests(unittest.TestCase):
         bundle = evaluator.evaluate(self.proposal)
         self.assertTrue(bundle.accepted)
         self.assertTrue(bundle.promotion_eligible)
+
+    def test_promotion_eligibility_recomputes_reconstructed_evidence_bindings(self) -> None:
+        evaluator = Evaluator(
+            self.registry,
+            baseline_runner_id="baseline",
+            candidate_runner_id="candidate",
+            oracle=ExactOutputOracle(b"ok\n"),
+            artifact_root=str(self.root),
+            policy=EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=2, max_output_bytes=4096),
+            execution_policy=ExecutionPolicy(
+                timeout_seconds=2,
+                max_stdout_bytes=4096,
+                max_stderr_bytes=4096,
+                max_output_bytes=4096,
+            ),
+            provider=self.provider,
+            authority=EligibleFixtureAuthority(),
+        )
+        bundle = evaluator.evaluate(self.proposal)
+        self.assertTrue(bundle.promotion_eligible)
+
+        first_warmup = bundle.warmups[0]
+        bad_warmup_identity = replace(
+            bundle,
+            warmups=(replace(first_warmup, sample_id="forged-warmup"),) + bundle.warmups[1:],
+        )
+        bad_warmup_record = replace(
+            first_warmup.record,
+            observation_id="forged-warmup",
+        )
+        bad_warmup_provenance = replace(
+            bundle,
+            warmups=(replace(first_warmup, record=bad_warmup_record),) + bundle.warmups[1:],
+        )
+        bad_warmup_oracle = replace(
+            bundle,
+            warmups=(replace(first_warmup, oracle=replace(first_warmup.oracle, expected_digest="0" * 64)),) + bundle.warmups[1:],
+        )
+        bad_measurements = replace(bundle, measurements=replace(bundle.measurements, plan_digest="0" * 64))
+        bad_count = replace(bundle, measurement_block_count=bundle.measurement_block_count + 1)  # type: ignore[operator]
+        bad_policy = replace(bundle, evaluation_policy=None)
+        bad_candidate = replace(bundle, candidate_id="f" * 64)
+        bad_workload = replace(bundle, workload_hash="e" * 64)
+        bad_runner = replace(bundle, baseline_runner_digest="d" * 64)
+        bad_execution_digest = replace(bundle, execution_policy_digest="c" * 64)
+
+        for name, forged in (
+            ("warmup identity", bad_warmup_identity),
+            ("warmup provenance", bad_warmup_provenance),
+            ("warmup oracle", bad_warmup_oracle),
+            ("measurement plan digest", bad_measurements),
+            ("measurement count", bad_count),
+            ("missing evaluation policy", bad_policy),
+            ("candidate identity", bad_candidate),
+            ("workload identity", bad_workload),
+            ("runner identity", bad_runner),
+            ("execution policy digest", bad_execution_digest),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(forged.promotion_eligible)
 
 
 if __name__ == "__main__":

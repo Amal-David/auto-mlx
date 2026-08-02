@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -33,7 +34,7 @@ class FixtureIsolationProvider(IsolationProvider):
     """Test double for a separately supplied real sandbox integration."""
 
     def __init__(self) -> None:
-        super().__init__("fixture-isolation", "1" * 64)
+        super().__init__("fixture-isolation", "1" * 64, supports_evaluator_owned_launch=True)
 
     def enforce(self, argv, *, cwd, env, stdin, stdout, stderr) -> IsolatedProcess:
         process = subprocess.Popen(
@@ -87,10 +88,30 @@ class SlowAuthority(IsolationAuthority):
 class SlowProvider(IsolationProvider):
     def __init__(self) -> None:
         super().__init__("slow-provider", "c" * 64)
+        self.invoked = False
 
     def enforce(self, argv, **kwargs) -> IsolatedProcess:
+        self.invoked = True
         time.sleep(0.2)
         raise RuntimeError("provider did not complete")
+
+
+class LeakingProvider(IsolationProvider):
+    def __init__(self, pid_file: Path) -> None:
+        super().__init__("leaking-provider", "d" * 64)
+        self.pid_file = pid_file
+        self.invoked = False
+        self.child_pid: int | None = None
+        self.child_process: subprocess.Popen[bytes] | None = None
+
+    def enforce(self, argv, **kwargs) -> IsolatedProcess:
+        self.invoked = True
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.child_process = child
+        self.child_pid = child.pid
+        self.pid_file.write_text(str(child.pid), encoding="utf-8")
+        time.sleep(0.2)
+        return IsolatedProcess(child, self._claim("e" * 64))
 
 
 class ExecutorTests(unittest.TestCase):
@@ -383,14 +404,41 @@ while True: time.sleep(.02)
         self.assertTrue(record.cleanup.attempted)
 
     def test_provider_handshake_is_bounded(self) -> None:
+        provider = SlowProvider()
         started = time.monotonic()
         record = self._execute(
             self._plan("print('must-not-run')\n"),
             self._policy(launch_timeout_seconds=0.05),
-            provider=SlowProvider(),
+            provider=provider,
         )
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
+        self.assertFalse(provider.invoked)
+
+    def test_unsupported_provider_is_rejected_before_a_child_leak_can_occur(self) -> None:
+        pid_file = self.root / "leaked-child.pid"
+        provider = LeakingProvider(pid_file)
+        before = {thread.ident for thread in threading.enumerate()}
+        try:
+            record = self._execute(
+                self._plan("print('must-not-run')\n"),
+                self._policy(launch_timeout_seconds=0.05),
+                provider=provider,
+            )
+            time.sleep(0.25)
+            self.assertIs(record.status, ExecutionStatus.SANDBOX_UNAVAILABLE)
+            self.assertEqual(record.failure.code.value, "sandbox_unavailable")  # type: ignore[union-attr]
+            self.assertFalse(provider.invoked)
+            self.assertFalse(pid_file.exists())
+            self.assertTrue(before.issubset({thread.ident for thread in threading.enumerate()}))
+        finally:
+            if provider.child_pid is not None:
+                try:
+                    os.kill(provider.child_pid, 9)
+                except ProcessLookupError:
+                    pass
+            if provider.child_process is not None:
+                provider.child_process.wait(timeout=1)
 
     def test_pipe_read_failure_cannot_become_success(self) -> None:
         original = executor_module._read_pipe
@@ -405,6 +453,20 @@ while True: time.sleep(.02)
             executor_module._read_pipe = original
         self.assertIs(record.status, ExecutionStatus.OUTPUT_FAILURE)
         self.assertIsNotNone(record.failure)
+
+    def test_system_exit_from_pipe_reader_is_recorded_as_output_failure(self) -> None:
+        original = executor_module._read_pipe
+
+        def terminate_reader(pipe, capture, stream_index):
+            raise SystemExit("synthetic reader termination")
+
+        executor_module._read_pipe = terminate_reader
+        try:
+            record = self._execute(self._plan("print('must-fail')\n"), self._policy(), provider=self.provider)
+        finally:
+            executor_module._read_pipe = original
+        self.assertIs(record.status, ExecutionStatus.OUTPUT_FAILURE)
+        self.assertTrue(any("SystemExit" in error for error in record.failure.details["capture_errors"]))  # type: ignore[union-attr]
 
     def test_cleanup_never_signals_the_evaluator_process_group(self) -> None:
         process = MagicMock()

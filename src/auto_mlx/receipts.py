@@ -1034,6 +1034,34 @@ def _receipt_from_observation_bundle(
     frozen_workload = _coerce_workload(workload)
     frozen_candidate = _coerce_candidate(candidate, frozen_workload)
     frozen_policy = _coerce_policy(policy)
+    from .evaluator import _execution_policy_digest, _execution_policy_from_contract
+    from .executor import ExecutionPolicy
+
+    bundle_policy = getattr(bundle, "evaluation_policy", None)
+    if type(bundle_policy) is not EvaluationPolicy or bundle_policy != frozen_policy:
+        raise ContractError(
+            "evaluator bundle policy does not exactly match receipt policy",
+            code=FailureCode.INVALID_POLICY,
+        )
+    expected_policy_digest = sha256_hex(frozen_policy.to_dict())
+    if type(getattr(bundle, "policy_digest", None)) is not str or bundle.policy_digest != expected_policy_digest:
+        raise ContractError(
+            "evaluator bundle policy digest does not match receipt policy",
+            code=FailureCode.INVALID_POLICY,
+        )
+    bundle_execution_policy = getattr(bundle, "execution_policy", None)
+    expected_execution_policy = _execution_policy_from_contract(frozen_policy)
+    if type(bundle_execution_policy) is not ExecutionPolicy or bundle_execution_policy.to_dict() != expected_execution_policy.to_dict():
+        raise ContractError(
+            "evaluator bundle execution policy does not match receipt policy",
+            code=FailureCode.INVALID_POLICY,
+        )
+    expected_execution_policy_digest = _execution_policy_digest(bundle_execution_policy)
+    if type(getattr(bundle, "execution_policy_digest", None)) is not str or bundle.execution_policy_digest != expected_execution_policy_digest:
+        raise ContractError(
+            "evaluator bundle execution policy digest does not match receipt policy",
+            code=FailureCode.INVALID_POLICY,
+        )
     if bundle.candidate_id != frozen_candidate.candidate_id or bundle.workload_hash != frozen_workload.workload_hash:
         raise ContractError("evaluator bundle identity does not match receipt context", code=FailureCode.IDENTITY_MISMATCH)
     from .oracle import ExactOutputOracle

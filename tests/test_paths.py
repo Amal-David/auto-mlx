@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+import subprocess
 import tempfile
 from pathlib import Path
 import unittest
@@ -131,6 +132,60 @@ class SafePathTests(unittest.TestCase):
             with self.assertRaises(ArtifactIntegrityError) as context:
                 file_identity(root, "directory")
             self.assertEqual(context.exception.code, FailureCode.ARTIFACT_NOT_REGULAR)
+
+    def test_fifo_is_classified_promptly_with_nonblocking_open_and_closed_descriptor(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is unavailable")
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            fifo = root / "pipe"
+            os.mkfifo(fifo)
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+            code = (
+                "from auto_mlx.paths import file_identity\n"
+                "from auto_mlx.errors import ArtifactIntegrityError\n"
+                "import sys\n"
+                "try:\n"
+                "    file_identity(sys.argv[1], 'pipe')\n"
+                "except ArtifactIntegrityError as exc:\n"
+                "    print(exc.code.value)\n"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", code, str(root)],
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), FailureCode.ARTIFACT_NOT_REGULAR.value)
+
+            real_open = paths_module.os.open
+            real_close = paths_module.os.close
+            opened: list[int] = []
+            closed: list[int] = []
+
+            def tracking_open(path: object, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+                if dir_fd is None:
+                    descriptor = real_open(path, flags, mode)
+                else:
+                    descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+                opened.append(descriptor)
+                return descriptor
+
+            def tracking_close(descriptor: int) -> None:
+                closed.append(descriptor)
+                real_close(descriptor)
+
+            with patch.object(paths_module.os, "open", tracking_open):
+                with patch.object(paths_module.os, "close", tracking_close):
+                    with self.assertRaises(ArtifactIntegrityError) as context:
+                        file_identity(root, "pipe")
+            self.assertEqual(context.exception.code, FailureCode.ARTIFACT_NOT_REGULAR)
+            self.assertTrue(opened)
+            self.assertIn(opened[-1], closed)
 
     def test_open_and_read_failures_do_not_look_like_digest_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

@@ -74,8 +74,8 @@ class ProviderTests(unittest.TestCase):
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
         self.assertTrue(schema["properties"]["configs"]["uniqueItems"])
         self.assertEqual(
-            schema["properties"]["configs"]["items"]["additionalProperties"]["oneOf"],
-            [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}],
+            schema["properties"]["configs"]["items"]["additionalProperties"],
+            {"$ref": "#/$defs/scalar"},
         )
 
         with self.assertRaises(ContractError) as context:
@@ -86,6 +86,18 @@ class ProviderTests(unittest.TestCase):
                 }
             )
         self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)
+
+    def test_provider_string_surfaces_reject_surrogates_without_raw_diagnostics(self) -> None:
+        cases = (
+            lambda: DeclarativeProvider("grid\ud800", ()),
+            lambda: DeclarativeProvider("grid", ({"bad\ud800": "ok"},)),
+            lambda: DeclarativeProvider("grid", ({"mode": "bad\ud800"},)),
+        )
+        for build in cases:
+            with self.subTest(build=build), self.assertRaises(ContractError) as context:
+                build()
+            self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+            self.assertNotIn("\ud800", str(context.exception))
 
     def test_provider_config_count_is_bounded_before_materialization(self) -> None:
         with self.assertRaises(ContractError) as context:

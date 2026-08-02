@@ -5,9 +5,10 @@
   "$comment": "The recursive json_value definition is intentionally open-ended for standalone JSON Schema. The supported loader is authoritative for the finite depth bound: strict_json_loads and FrozenWorkload enforce MAX_JSON_DEPTH=64 before accepting a workload.",
   "type": "object",
   "additionalProperties": false,
+  "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
   "required": ["name", "artifacts", "knobs", "parameters"],
   "properties": {
-    "name": {"type": "string", "minLength": 1},
+    "name": {"allOf": [{"$ref": "#/$defs/no_surrogate_string"}], "minLength": 1},
     "artifacts": {
       "type": "array",
       "items": {"$ref": "artifact.json"},
@@ -15,6 +16,7 @@
     },
     "knobs": {
       "type": "array",
+      "maxItems": 64,
       "items": {"$ref": "knob.json"},
       "description": "Python rejects duplicate knob.name values."
     },
@@ -24,16 +26,25 @@
     "json_value": {
       "oneOf": [
         {"type": "null"},
-        {"type": "string"},
+        {"$ref": "#/$defs/no_surrogate_string"},
         {"type": "integer"},
         {"type": "boolean"},
         {"type": "array", "items": {"$ref": "#/$defs/json_value"}},
-        {"type": "object", "additionalProperties": {"$ref": "#/$defs/json_value"}}
+        {
+          "type": "object",
+          "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
+          "additionalProperties": {"$ref": "#/$defs/json_value"}
+        }
       ]
     },
     "json_value_object": {
       "type": "object",
+      "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
       "additionalProperties": {"$ref": "#/$defs/json_value"}
+    },
+    "no_surrogate_string": {
+      "type": "string",
+      "not": {"pattern": "[\\uD800-\\uDFFF]"}
     }
   }
 }

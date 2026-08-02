@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping
 from typing import Final, Protocol, runtime_checkable
 
-from .canonical import canonical_json, strict_json_loads
+from .canonical import canonical_json, strict_json_loads, validate_json_value
 from .contracts import CandidateProposal, FrozenWorkload, validate_config, _freeze_config
 from .errors import ContractError, FailureCode, UnknownFieldError
 
@@ -81,6 +81,7 @@ class DeclarativeProvider:
 
     @classmethod
     def from_dict(cls, value: object) -> "DeclarativeProvider":
+        validate_json_value(value)
         if type(value) is not dict:
             raise ContractError("provider must be a JSON object", code=FailureCode.WRONG_TYPE)
         expected = {"provider_id", "configs"}

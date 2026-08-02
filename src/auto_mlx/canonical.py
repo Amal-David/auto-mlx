@@ -30,8 +30,13 @@ def _reject_float(value: str) -> None:
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
+        if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+            raise CanonicalJSONError(
+                "JSON contains an unpaired UTF-16 surrogate in an object key",
+                code=FailureCode.INVALID_UNICODE,
+            )
         if key in result:
-            raise DuplicateKeyError(f"duplicate JSON object key {key!r}")
+            raise DuplicateKeyError("duplicate JSON object key")
         result[key] = value
     return result
 
@@ -109,7 +114,7 @@ def _validate_json_value(
                 raise CanonicalJSONError(f"object key at {path} is not a string")
             if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
                 raise CanonicalJSONError(
-                    f"JSON contains an unpaired UTF-16 surrogate at {path}.{key}",
+                    f"JSON contains an unpaired UTF-16 surrogate in an object key at {path}",
                     code=FailureCode.INVALID_UNICODE,
                 )
             _validate_json_value(item, path=f"{path}.{key}", allow_tuple=allow_tuple, depth=depth + 1)
@@ -119,6 +124,12 @@ def _validate_json_value(
             _validate_json_value(item, path=f"{path}[{index}]", allow_tuple=allow_tuple, depth=depth + 1)
         return
     raise CanonicalJSONError(f"unsupported JSON value at {path}: {type(value).__name__}")
+
+
+def validate_json_value(value: Any, *, allow_tuple: bool = False) -> None:
+    """Validate an in-memory value with the same rules as strict JSON input."""
+
+    _validate_json_value(value, allow_tuple=allow_tuple)
 
 
 def _json_ready(value: Any) -> Any:

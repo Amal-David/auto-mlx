@@ -4,12 +4,13 @@
   "title": "Knob",
   "type": "object",
   "additionalProperties": false,
+  "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
   "not": {"properties": {"name": {"const": "candidate_id"}}},
   "required": ["name", "type", "values", "minimum", "maximum"],
   "properties": {
-    "name": {"type": "string", "minLength": 1},
+    "name": {"allOf": [{"$ref": "#/$defs/no_surrogate_string"}], "minLength": 1},
     "type": {"enum": ["enum", "integer", "bool"]},
-    "values": {"type": "array", "uniqueItems": true},
+    "values": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/no_surrogate_string"}},
     "minimum": {"type": ["integer", "null"]},
     "maximum": {"type": ["integer", "null"]}
   },
@@ -45,5 +46,11 @@
         }
       }
     }
-  ]
+  ],
+  "$defs": {
+    "no_surrogate_string": {
+      "type": "string",
+      "not": {"pattern": "[\\uD800-\\uDFFF]"}
+    }
+  }
 }

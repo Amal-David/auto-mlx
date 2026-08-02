@@ -12,7 +12,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json, sha256_hex, validate_config
-from auto_mlx.errors import AutoMLXError, ContractError, Failure, FailureCode, UnknownFieldError, UnsafePathError
+from auto_mlx.errors import AutoMLXError, CanonicalJSONError, ContractError, Failure, FailureCode, UnknownFieldError, UnsafePathError
 from auto_mlx.contracts import MAX_CONFIG_ENTRIES, MAX_JSON_DEPTH, MAX_MEASUREMENT_RUNS, MAX_POLICY_OUTPUT_BYTES, MAX_WARMUP_RUNS
 
 
@@ -98,7 +98,7 @@ class ContractTests(unittest.TestCase):
     def test_error_codes_and_failure_details_are_validated_at_construction(self) -> None:
         with self.assertRaises(TypeError):
             AutoMLXError("bad code", code="invalid")  # type: ignore[arg-type]
-        for details in ({"bad": {1, 2}}, {"bad": object()}, {"bad": math.nan}, {"bad": "\ud800"}):
+        for details in ({"bad": {1, 2}}, {"bad": object()}, {"bad": math.nan}, {"bad": "\ud800"}, {"bad\ud800": 1}):
             with self.subTest(details=repr(details)), self.assertRaises(TypeError):
                 Failure(FailureCode.INVALID_VALUE, "bad", details)
 
@@ -196,6 +196,46 @@ class ContractTests(unittest.TestCase):
             FrozenWorkload("toy", parameters={"nested": nested})
         self.assertEqual(context.exception.code, FailureCode.JSON_TOO_DEEP)
 
+    def test_public_workload_mapping_ingress_rejects_surrogate_keys_without_raw_value_errors(self) -> None:
+        data = self.workload.to_dict()
+        data["parameters"] = {"bad\ud800": 1}
+        with self.assertRaises(CanonicalJSONError) as context:
+            FrozenWorkload.from_dict(data)
+        self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+        self.assertNotIn("\ud800", str(context.exception))
+
+    def test_public_workload_mapping_ingress_applies_document_depth(self) -> None:
+        nested: object = "leaf"
+        for _ in range(MAX_JSON_DEPTH - 1):
+            nested = [nested]
+        workload = FrozenWorkload("deep", parameters={"nested": nested})
+        with self.assertRaises(CanonicalJSONError) as context:
+            FrozenWorkload.from_dict(workload.to_dict())
+        self.assertEqual(context.exception.code, FailureCode.JSON_TOO_DEEP)
+
+    def test_schema_string_surfaces_reject_surrogates_independently_of_jsonschema(self) -> None:
+        cases = (
+            lambda: Knob("mode\ud800", "enum", values=("ok",)),
+            lambda: Knob("mode", "enum", values=("bad\ud800",)),
+            lambda: FrozenWorkload("toy\ud800"),
+            lambda: FrozenWorkload("toy", parameters={"bad\ud800": "ok"}),
+            lambda: FrozenWorkload("toy", parameters={"ok": "bad\ud800"}),
+            lambda: CandidateProposal("grid\ud800", self.workload, {"mode": "eager", "batch": 2, "cache": False}),
+            lambda: CandidateProposal("grid", self.workload, {"mode\ud800": "eager", "batch": 2, "cache": False}),
+            lambda: CandidateProposal("grid", self.workload, {"mode": "bad\ud800", "batch": 2, "cache": False}),
+            lambda: RuntimeIdentity("python\ud800", "3.11", "Darwin", "arm64"),
+        )
+        for build in cases:
+            with self.subTest(build=build), self.assertRaises(ContractError) as context:
+                build()
+            self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+            self.assertNotIn("\ud800", str(context.exception))
+
+        with self.assertRaises(ContractError) as context:
+            Artifact("model\ud800.bin", "0" * 64, 0)
+        self.assertEqual(context.exception.code, FailureCode.UNSAFE_PATH)
+        self.assertNotIn("\ud800", str(context.exception))
+
     def test_frozen_workload_schema_documents_the_loader_depth_gate(self) -> None:
         schema_path = Path(__file__).resolve().parents[1] / "schemas" / "frozen_workload.json"
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -219,4 +259,14 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(context.exception.code, FailureCode.INVALID_POLICY)
         with self.assertRaises(ContractError) as context:
             validate_config(self.workload, {f"extra{i}": i for i in range(MAX_CONFIG_ENTRIES + 1)})
+        self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)
+
+    def test_workload_knob_count_matches_config_capacity_at_the_boundary(self) -> None:
+        knobs = tuple(Knob(f"knob{i}", "bool") for i in range(MAX_CONFIG_ENTRIES))
+        workload = FrozenWorkload("max-knobs", knobs=knobs)
+        proposal = CandidateProposal("grid", workload, {knob.name: False for knob in knobs})
+        self.assertEqual(len(proposal.config), MAX_CONFIG_ENTRIES)
+
+        with self.assertRaises(ContractError) as context:
+            FrozenWorkload("too-many-knobs", knobs=knobs + (Knob("overflow", "bool"),))
         self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)

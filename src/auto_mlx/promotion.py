@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final
 
-from .canonical import canonical_bytes, canonical_json, sha256_hex, strict_json_loads
+from .canonical import canonical_bytes, canonical_json, sha256_hex, strict_json_loads, validate_json_value
 from .contracts import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, RuntimeIdentity
 from .errors import ContractError, Failure, FailureCode, UnknownFieldError
 from .paths import validate_sha256
@@ -36,6 +36,7 @@ NATIVE: Final = "native_fallback"
 
 
 def _object(value: Any, *, label: str) -> dict[str, Any]:
+    validate_json_value(value)
     if type(value) is not dict:
         raise ContractError(f"{label} must be a JSON object", code=FailureCode.WRONG_TYPE)
     return value
@@ -58,6 +59,8 @@ def _exact(value: dict[str, Any], expected: set[str], *, label: str) -> None:
 def _string(value: Any, *, label: str) -> str:
     if type(value) is not str or not value:
         raise ContractError(f"{label} must be a non-empty string", code=FailureCode.WRONG_TYPE)
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ContractError(f"{label} must not contain unpaired surrogates", code=FailureCode.INVALID_UNICODE)
     return value
 
 

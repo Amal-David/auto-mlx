@@ -46,6 +46,16 @@ class CanonicalJSONTests(unittest.TestCase):
                     canonical_json(value)
             self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
 
+    def test_surrogate_object_keys_have_safe_deterministic_diagnostics(self) -> None:
+        for value in ({"bad\ud800": 1}, '{"\\ud800":1}', '{"\\ud800":1,"\\ud800":2}'):
+            with self.subTest(value=repr(value)), self.assertRaises(CanonicalJSONError) as context:
+                if isinstance(value, str):
+                    strict_json_loads(value)
+                else:
+                    canonical_json(value)
+            self.assertEqual(context.exception.code, FailureCode.INVALID_UNICODE)
+            self.assertNotIn("\ud800", str(context.exception))
+
     def test_excessive_nesting_has_a_stable_contract_error(self) -> None:
         value: object = "leaf"
         for _ in range(MAX_JSON_DEPTH + 2):

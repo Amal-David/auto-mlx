@@ -15,6 +15,7 @@ from .errors import ArtifactIntegrityError, FailureCode, UnsafePathError
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NOFOLLOW_AVAILABLE = hasattr(os, "O_NOFOLLOW")
+_NONBLOCK_AVAILABLE = hasattr(os, "O_NONBLOCK")
 _OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", ())
 _MAX_HASH_BYTES = 1 << 30
 
@@ -58,7 +59,7 @@ def validate_relative_posix_path(value: str) -> str:
     return value
 
 
-def _open_flags(*, directory: bool) -> int:
+def _open_flags(*, directory: bool, nonblocking: bool = False) -> int:
     """Return flags required for descriptor-relative no-follow traversal."""
 
     if not _NOFOLLOW_AVAILABLE or not _OPEN_SUPPORTS_DIR_FD:
@@ -69,6 +70,13 @@ def _open_flags(*, directory: bool) -> int:
     flags = os.O_RDONLY | os.O_NOFOLLOW
     if directory:
         flags |= getattr(os, "O_DIRECTORY", 0)
+    elif nonblocking:
+        if not _NONBLOCK_AVAILABLE:
+            raise ArtifactIntegrityError(
+                "nonblocking artifact classification is unavailable",
+                code=FailureCode.ARTIFACT_SECURITY_UNAVAILABLE,
+            )
+        flags |= os.O_NONBLOCK
     return flags
 
 
@@ -184,7 +192,7 @@ def _open_verified_file(root: str | os.PathLike[str], relative_path: str) -> int
                     f"artifact parent is not a directory: {safe}", code=FailureCode.ARTIFACT_NOT_REGULAR
                 )
         final_descriptor = os.open(
-            components[-1], _open_flags(directory=False), dir_fd=descriptors[-1]
+            components[-1], _open_flags(directory=False, nonblocking=True), dir_fd=descriptors[-1]
         )
         opened_stat = os.fstat(final_descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):

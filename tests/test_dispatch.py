@@ -9,6 +9,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity
+from auto_mlx.canonical import MAX_JSON_DEPTH
 from auto_mlx.dispatch import CANDIDATE_MODE, NATIVE_MODE, dispatch
 from auto_mlx.promotion import activate, rollback
 from auto_mlx.receipts import ContentAddressedStore, RawSample, Receipt, receipt_attestation, validate_receipt
@@ -148,6 +149,22 @@ class DispatchTests(unittest.TestCase):
             )
         self.assertEqual(result.mode, NATIVE_MODE)
         self.assertEqual(store.current_decision_id(), "native_fallback")
+
+    def test_dispatch_mapping_ingress_rejects_overdeep_workload_before_state_use(self) -> None:
+        nested: object = "leaf"
+        for _ in range(MAX_JSON_DEPTH - 1):
+            nested = [nested]
+        deep_workload = FrozenWorkload("deep-dispatch", parameters={"nested": nested})
+        with tempfile.TemporaryDirectory() as raw_root:
+            store = ContentAddressedStore(raw_root)
+            result = dispatch(
+                store,
+                deep_workload.to_dict(),
+                self.candidate.to_dict(),
+                self.policy.to_dict(),
+                self.runtime.to_dict(),
+            )
+        self.assertEqual(result.mode, NATIVE_MODE)
 
 
 if __name__ == "__main__":

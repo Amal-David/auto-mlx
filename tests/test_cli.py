@@ -108,6 +108,19 @@ class CLITests(unittest.TestCase):
         self.assertFalse(diagnostic["ok"])
         self.assertEqual(diagnostic["error"]["code"], "invalid_value")
 
+    def test_surrogate_object_key_has_stable_cli_diagnostic_and_exit_code(self) -> None:
+        raw = '{"name":"cli-toy","artifacts":[],"knobs":[],"parameters":{"\\ud800":1}}'
+        with tempfile.TemporaryDirectory() as raw_directory:
+            path = Path(raw_directory) / "surrogate-key.json"
+            path.write_text(raw, encoding="ascii")
+            status, stdout, stderr = self._run("validate", "workload", str(path))
+        self.assertEqual(status, EXIT_CONTRACT)
+        self.assertEqual(stdout, "")
+        diagnostic = json.loads(stderr)
+        self.assertFalse(diagnostic["ok"])
+        self.assertEqual(diagnostic["error"]["code"], FailureCode.INVALID_UNICODE.value)
+        self.assertNotIn("\ud800", diagnostic["error"]["message"])
+
     def test_missing_input_is_usage_error(self) -> None:
         status, stdout, stderr = self._run("validate", "workload")
         self.assertEqual(status, EXIT_USAGE)

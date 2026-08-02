@@ -88,7 +88,7 @@ def _freeze_detail(value: Any, *, path: str = "$", depth: int = 0) -> Any:
             if type(key) is not str:
                 raise TypeError(f"failure detail object keys must be strings at {path}")
             if _contains_surrogate(key):
-                raise TypeError(f"failure details contain an unpaired surrogate at {path}.{key}")
+                raise TypeError(f"failure details contain an unpaired surrogate in an object key at {path}")
             frozen[key] = _freeze_detail(item, path=f"{path}.{key}", depth=depth + 1)
         return MappingProxyType(frozen)
     if value_type in {list, tuple}:

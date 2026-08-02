@@ -4,22 +4,31 @@
   "title": "Artifact",
   "type": "object",
   "additionalProperties": false,
+  "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
   "required": ["path", "sha256", "size_bytes"],
   "properties": {
     "path": {
       "type": "string",
       "minLength": 1,
       "pattern": "^(?!/)(?![A-Za-z]:)(?!.*[\\\\\\u0000-\\u001f\\u007f])(?!.*//)(?!.*(?:^|/)\\.{1,2}(?:/|$))(?!.*\\/$)[^/]+(?:/[^/]+)*$",
+      "allOf": [{"$ref": "#/$defs/no_surrogate_string"}],
       "not": {"pattern": "[\\uD800-\\uDFFF]"},
       "description": "A non-empty relative POSIX path with no control characters, drive prefix, empty, dot, or dotdot components."
     },
     "sha256": {
       "type": "string",
+      "allOf": [{"$ref": "#/$defs/no_surrogate_string"}],
       "pattern": "^[0-9a-f]{64}$"
     },
     "size_bytes": {
       "type": "integer",
       "minimum": 0
+    }
+  },
+  "$defs": {
+    "no_surrogate_string": {
+      "type": "string",
+      "not": {"pattern": "[\\uD800-\\uDFFF]"}
     }
   }
 }

@@ -21,7 +21,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Protocol
 
-from .canonical import canonical_bytes, canonical_json, sha256_hex, strict_json_loads
+from .canonical import canonical_bytes, canonical_json, sha256_hex, strict_json_loads, validate_json_value
 from .contracts import (
     Artifact,
     CandidateProposal,
@@ -68,6 +68,7 @@ class ContractMapping(Protocol):
 
 
 def _object(value: Any, *, label: str) -> dict[str, Any]:
+    validate_json_value(value)
     if type(value) is not dict:
         raise ContractError(f"{label} must be a JSON object", code=FailureCode.WRONG_TYPE)
     return value
@@ -90,6 +91,8 @@ def _exact(value: dict[str, Any], expected: set[str], *, label: str) -> None:
 def _string(value: Any, *, label: str, non_empty: bool = True) -> str:
     if type(value) is not str or (non_empty and not value):
         raise ContractError(f"{label} must be a {'non-empty ' if non_empty else ''}string", code=FailureCode.WRONG_TYPE)
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        raise ContractError(f"{label} must not contain unpaired surrogates", code=FailureCode.INVALID_UNICODE)
     return value
 
 
@@ -127,6 +130,11 @@ def _freeze_json(value: Any, *, path: str = "$") -> Any:
         for key, item in value.items():
             if type(key) is not str:
                 raise ContractError(f"object key at {path} must be a string", code=FailureCode.WRONG_TYPE)
+            if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
+                raise ContractError(
+                    f"JSON contains an unpaired UTF-16 surrogate in an object key at {path}",
+                    code=FailureCode.INVALID_UNICODE,
+                )
             frozen[key] = _freeze_json(item, path=f"{path}.{key}")
         return MappingProxyType(frozen)
     if isinstance(value, (list, tuple)):

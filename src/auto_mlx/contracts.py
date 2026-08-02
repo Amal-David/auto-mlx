@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Final, Mapping
 
-from .canonical import MAX_JSON_DEPTH, canonical_json, sha256_hex, strict_json_loads
+from .canonical import MAX_JSON_DEPTH, canonical_json, sha256_hex, strict_json_loads, validate_json_value
 from .errors import ContractError, FailureCode, UnknownFieldError
 from .paths import validate_non_negative_int, validate_relative_posix_path, validate_sha256
 
@@ -23,6 +23,7 @@ MAX_POLICY_OUTPUT_BYTES: Final = 8 * 1024 * 1024
 
 
 def _object(value: Any, *, label: str) -> dict[str, Any]:
+    validate_json_value(value)
     if type(value) is not dict:
         raise ContractError(f"{label} must be a JSON object", code=FailureCode.WRONG_TYPE)
     return value
@@ -108,7 +109,7 @@ def _freeze_json(value: Any, *, path: str = "$", depth: int = 0) -> Any:
                 raise ContractError(f"object key at {path} must be a string", code=FailureCode.WRONG_TYPE)
             if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
                 raise ContractError(
-                    f"JSON contains an unpaired UTF-16 surrogate at {path}.{key}",
+                    f"JSON contains an unpaired UTF-16 surrogate in an object key at {path}",
                     code=FailureCode.INVALID_UNICODE,
                 )
             frozen[key] = _freeze_json(item, path=f"{path}.{key}", depth=depth + 1)
@@ -143,7 +144,7 @@ def _freeze_config(value: Any) -> MappingProxyType:
             raise ContractError("config keys must be strings", code=FailureCode.WRONG_TYPE)
         if any(0xD800 <= ord(character) <= 0xDFFF for character in key):
             raise ContractError(
-                f"config key {key!r} contains an unpaired UTF-16 surrogate",
+                "config keys must not contain unpaired surrogates",
                 code=FailureCode.INVALID_UNICODE,
             )
         if key in _RESERVED_CONFIG_NAMES:
@@ -155,7 +156,7 @@ def _freeze_config(value: Any) -> MappingProxyType:
             )
         if type(item) is str and any(0xD800 <= ord(character) <= 0xDFFF for character in item):
             raise ContractError(
-                f"config value for {key!r} contains an unpaired UTF-16 surrogate",
+                "config values must not contain unpaired surrogates",
                 code=FailureCode.INVALID_UNICODE,
             )
         result[key] = item
@@ -348,6 +349,11 @@ class FrozenWorkload:
             raise ContractError("workload.artifacts must contain only Artifact values", code=FailureCode.WRONG_TYPE)
         if any(not isinstance(item, Knob) for item in knobs):
             raise ContractError("workload.knobs must contain only Knob values", code=FailureCode.WRONG_TYPE)
+        if len(knobs) > MAX_CONFIG_ENTRIES:
+            raise ContractError(
+                f"workload.knobs cannot contain more than {MAX_CONFIG_ENTRIES} entries",
+                code=FailureCode.CONFIG_MISMATCH,
+            )
         if len({item.path for item in artifacts}) != len(artifacts):
             raise ContractError("workload artifact paths must be unique", code=FailureCode.INVALID_VALUE)
         if len({item.name for item in knobs}) != len(knobs):

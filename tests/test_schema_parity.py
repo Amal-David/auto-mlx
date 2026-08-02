@@ -69,6 +69,46 @@ class SchemaParityTests(unittest.TestCase):
             pattern = schema["allOf"][0]["then"]["properties"]["values"]["items"]["not"]["pattern"]  # type: ignore[index]
             self.assertIsNotNone(re.search(pattern, instance["values"][0]))  # type: ignore[arg-type]
 
+    def test_all_schema_objects_have_reusable_no_surrogate_property_name_constraints(self) -> None:
+        for path in sorted((PROJECT_ROOT / "schemas").glob("*.json")):
+            with self.subTest(schema=path.name):
+                schema = self._schema(path.name)
+                self.assertEqual(schema["propertyNames"], {"$ref": "#/$defs/no_surrogate_string"})
+                self.assertIn("no_surrogate_string", schema["$defs"])
+
+        workload = self._schema("frozen_workload.json")
+        self.assertEqual(
+            workload["$defs"]["json_value"]["oneOf"][5]["propertyNames"],
+            {"$ref": "#/$defs/no_surrogate_string"},
+        )
+        self.assertEqual(workload["properties"]["knobs"]["maxItems"], 64)
+
+    def test_live_draft_2020_12_validators_reject_surrogates_on_every_schema_surface(self) -> None:
+        cases = (
+            ("artifact.json", {"path": "model\ud800.bin", "sha256": "0" * 64, "size_bytes": 0}),
+            ("candidate_proposal.json", {"provider_id": "grid\ud800", "workload_hash": "0" * 64, "config": {}, "candidate_id": "0" * 64}),
+            ("candidate_proposal.json", {"provider_id": "grid", "workload_hash": "0" * 64, "config": {"mode\ud800": "a"}, "candidate_id": "0" * 64}),
+            ("candidate_proposal.json", {"provider_id": "grid", "workload_hash": "0" * 64, "config": {"mode": "a\ud800"}, "candidate_id": "0" * 64}),
+            ("declarative_provider.json", {"provider_id": "grid\ud800", "configs": []}),
+            ("declarative_provider.json", {"provider_id": "grid", "configs": [{"mode\ud800": "a"}]}),
+            ("declarative_provider.json", {"provider_id": "grid", "configs": [{"mode": "a\ud800"}]}),
+            ("evaluation_policy.json", {"warmup_runs": 0, "measurement_runs": 1, "timeout_seconds": 1, "max_output_bytes": 1, "bad\ud800": 1}),
+            ("frozen_workload.json", {"name": "toy\ud800", "artifacts": [], "knobs": [], "parameters": {}}),
+            ("frozen_workload.json", {"name": "toy", "artifacts": [], "knobs": [], "parameters": {"nested": {"bad\ud800": "ok"}}}),
+            ("frozen_workload.json", {"name": "toy", "artifacts": [], "knobs": [], "parameters": {"nested": "bad\ud800"}}),
+            ("knob.json", {"name": "mode\ud800", "type": "enum", "values": ["a"], "minimum": None, "maximum": None}),
+            ("knob.json", {"name": "mode", "type": "enum", "values": ["bad\ud800"], "minimum": None, "maximum": None}),
+            ("runtime_identity.json", {"runtime": "python\ud800", "version": "3.11", "platform": "Darwin", "machine": "arm64"}),
+        )
+        for schema_name, instance in cases:
+            with self.subTest(schema=schema_name, instance=repr(instance)):
+                schema = self._schema(schema_name)
+                if jsonschema is not None:
+                    errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
+                    self.assertTrue(errors)
+                else:
+                    self.assertEqual(schema["propertyNames"], {"$ref": "#/$defs/no_surrogate_string"})
+
     def test_recursive_workload_schema_calls_out_to_loader_depth_gate(self) -> None:
         schema = self._schema("frozen_workload.json")
         self.assertIn("MAX_JSON_DEPTH=64", schema["$comment"])

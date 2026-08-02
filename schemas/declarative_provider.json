@@ -4,9 +4,10 @@
   "title": "DeclarativeProvider",
   "type": "object",
   "additionalProperties": false,
+  "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
   "required": ["provider_id", "configs"],
   "properties": {
-    "provider_id": {"type": "string", "minLength": 1},
+    "provider_id": {"allOf": [{"$ref": "#/$defs/no_surrogate_string"}], "minLength": 1},
     "configs": {
       "type": "array",
       "maxItems": 4096,
@@ -14,9 +15,19 @@
       "items": {
         "type": "object",
         "maxProperties": 64,
+        "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
         "not": {"required": ["candidate_id"]},
-        "additionalProperties": {"oneOf": [{"type": "string"}, {"type": "integer"}, {"type": "boolean"}]}
+        "additionalProperties": {"$ref": "#/$defs/scalar"}
       }
+    }
+  },
+  "$defs": {
+    "no_surrogate_string": {
+      "type": "string",
+      "not": {"pattern": "[\\uD800-\\uDFFF]"}
+    },
+    "scalar": {
+      "oneOf": [{"$ref": "#/$defs/no_surrogate_string"}, {"type": "integer"}, {"type": "boolean"}]
     }
   },
   "description": "Declarative scalar maps only; candidate IDs are derived by CandidateProposal."

@@ -4,15 +4,66 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   offline-unittest:
-    runs-on: ubuntu-latest
+    name: unittest / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Compile the standard-library package
         run: python -m py_compile src/auto_mlx/*.py tests/*.py
       - name: Run offline unittest suite
         run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+  package-certification:
+    name: package / build-install-schema-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+      - name: Install build-only dependencies
+        run: python -m pip install --disable-pip-version-check --no-cache-dir "build>=1.2" "setuptools>=77" wheel
+      - name: Build sdist and wheel through the default source path
+        run: python -m build --no-isolation
+      - name: Inspect built archives
+        env:
+          AUTO_MLX_DIST_DIR: dist
+        run: python -m unittest discover -s tests -p 'test_packaging.py' -v
+      - name: Install and smoke-test the wheel offline
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          venv_dir="$RUNNER_TEMP/auto-mlx-wheel-env"
+          python -m venv "$venv_dir"
+          "$venv_dir/bin/python" -m pip install --no-index --no-deps "$wheel"
+          "$venv_dir/bin/python" tests/package_smoke.py \
+            --example "$GITHUB_WORKSPACE/examples/workload.json" \
+            --console-script "$venv_dir/bin/auto-mlx"
+      - name: Build and install a wheel from the sdist offline
+        run: |
+          sdist="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
+          extract_dir="$RUNNER_TEMP/auto-mlx-sdist"
+          wheel_dir="$RUNNER_TEMP/auto-mlx-sdist-wheel"
+          mkdir -p "$extract_dir" "$wheel_dir"
+          tar -xzf "$sdist" -C "$extract_dir"
+          source_dir="$(find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+          python -m build --no-isolation --wheel --outdir "$wheel_dir" "$source_dir"
+          venv_dir="$RUNNER_TEMP/auto-mlx-sdist-env"
+          python -m venv "$venv_dir"
+          sdist_wheel="$(find "$wheel_dir" -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          "$venv_dir/bin/python" -m pip install --no-index --no-deps "$sdist_wheel"
+          "$venv_dir/bin/python" tests/package_smoke.py \
+            --example "$GITHUB_WORKSPACE/examples/workload.json" \
+            --console-script "$venv_dir/bin/auto-mlx"

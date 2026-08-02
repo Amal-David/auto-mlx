@@ -9,8 +9,12 @@ activation boundaries are proven.
 from __future__ import annotations
 
 import argparse
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 import os
+import stat
 import sys
+import tempfile
+import tomllib
 from pathlib import Path
 from typing import Any, Final
 
@@ -68,12 +72,16 @@ class CLIUsageError(Exception):
     """An argument error that can be rendered as the CLI's JSON diagnostic."""
 
 
+class CLIIOError(Exception):
+    """An input/output failure at the CLI boundary."""
+
+
 class JSONArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         raise CLIUsageError(message)
 
 
-def _kind_arguments(parser: argparse.ArgumentParser) -> None:
+def _kind_arguments(parser: argparse.ArgumentParser, *, command: str) -> None:
     parser.add_argument("kind", nargs="?", choices=_CONTRACT_KINDS, help="document kind")
     parser.add_argument(
         "path",
@@ -84,15 +92,32 @@ def _kind_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-i", "--input", dest="input_option", help="document path, or '-' for stdin")
     parser.add_argument("--workload", help="workload document required for candidate validation")
     parser.add_argument("--artifact-root", help="local root against which workload artifact bytes are checked")
-    parser.add_argument("--output", help="create this canonical document file; an existing file is never overwritten")
+    if command == "validate":
+        parser.add_argument("--output", help="create this canonical document file; an existing file is never overwritten")
+
+
+def _package_version() -> str:
+    try:
+        return distribution_version("auto-mlx")
+    except PackageNotFoundError:
+        # Source-tree tests and ``PYTHONPATH=src`` development use do not have
+        # installed distribution metadata. Keep the version in pyproject.toml
+        # as the only source of truth in that case.
+        project_file = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        try:
+            with project_file.open("rb") as handle:
+                return str(tomllib.load(handle)["project"]["version"])
+        except (FileNotFoundError, KeyError, OSError, TypeError, ValueError):
+            return "unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = JSONArgumentParser(
         prog="auto-mlx",
         description="Validate canonical Auto MLX documents and inspect their identities without MLX.",
+        allow_abbrev=False,
     )
-    parser.add_argument("--version", action="version", version="auto-mlx 0.1.0")
+    parser.add_argument("--version", action="version", version=f"auto-mlx {_package_version()}")
     subparsers = parser.add_subparsers(dest="command", required=True, parser_class=JSONArgumentParser)
     for command in ("validate", "inspect"):
         command_parser = subparsers.add_parser(
@@ -107,10 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
                 if command == "validate"
                 else "Validate, then inspect the canonical IDs in a G0 contract or document."
             ),
+            allow_abbrev=False,
         )
-        _kind_arguments(command_parser)
+        _kind_arguments(command_parser, command=command)
     for command, reason in _DEFERRED_COMMANDS.items():
-        subparsers.add_parser(command, help=f"deferred: {reason}")
+        subparsers.add_parser(command, help=f"deferred: {reason}", allow_abbrev=False)
     return parser
 
 
@@ -126,7 +152,39 @@ def _diagnostic(code: str, message: str, *, details: dict[str, Any] | None = Non
 
 
 def _write_diagnostic(value: dict[str, Any]) -> None:
-    sys.stderr.write(canonical_json(value) + "\n")
+    try:
+        sys.stderr.write(canonical_json(value) + "\n")
+        sys.stderr.flush()
+    except (BrokenPipeError, OSError, UnicodeError):
+        # There is no reliable destination left for a diagnostic. Never turn
+        # a handled CLI failure into an interpreter traceback.
+        return
+
+
+def _quieten_broken_stdout() -> None:
+    """Prevent interpreter shutdown from reporting a second broken pipe."""
+
+    try:
+        descriptor = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        null_descriptor = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(null_descriptor, descriptor)
+        finally:
+            os.close(null_descriptor)
+    except OSError:
+        return
+
+
+def _write_stdout(value: str) -> None:
+    try:
+        sys.stdout.write(value)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        _quieten_broken_stdout()
+        raise CLIIOError("cannot write command result to stdout") from exc
 
 
 def _input_limit_error(source: str) -> AutoMLXError:
@@ -168,10 +226,19 @@ def _read_json(path_value: str) -> Any:
         raw = _read_bounded(stream, source="stdin", text_stream=stream is sys.stdin)
     else:
         path = Path(path_value)
-        if path.stat().st_size > MAX_JSON_INPUT_BYTES:
+        try:
+            info = path.stat()
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(f"cannot inspect input {path}: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode):
+            raise CLIIOError(f"input path is not a regular file: {path}")
+        if info.st_size > MAX_JSON_INPUT_BYTES:
             raise _input_limit_error(str(path))
-        with path.open("rb") as stream:
-            raw = _read_bounded(stream, source=str(path))
+        try:
+            with path.open("rb") as stream:
+                raw = _read_bounded(stream, source=str(path))
+        except (OSError, ValueError) as exc:
+            raise CLIIOError(f"cannot read input {path}: {exc}") from exc
     return strict_json_loads(raw)
 
 
@@ -267,36 +334,71 @@ def _identity_fields(kind: str, value: Any, document: Any) -> dict[str, Any]:
 
 
 def _create_only(path_value: str, payload: bytes) -> None:
+    """Publish a private file atomically, durably, and without replacement."""
+
     path = Path(path_value)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    parent = path.parent
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    temporary_path: str | None = None
     try:
-        descriptor = os.open(path, flags, 0o600)
-    except FileExistsError as exc:
-        raise ContractError(
-            f"refusing to overwrite existing output: {path}",
-            code=FailureCode.INVALID_VALUE,
-        ) from exc
-    except OSError as exc:
-        raise AutoMLXError(f"cannot create output {path}: {exc}", code=FailureCode.INVALID_VALUE) from exc
+        directory_descriptor = os.open(parent, directory_flags)
+    except (OSError, ValueError) as exc:
+        raise CLIIOError(f"cannot open output directory {parent}: {exc}") from exc
     try:
+        # Refuse early if the filesystem cannot durably sync the containing
+        # directory. Publication below relies on the same descriptor.
+        os.fsync(directory_descriptor)
+        descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", dir=parent)
+        if hasattr(os, "fchmod"):
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
-    except OSError as exc:
-        raise AutoMLXError(f"cannot write output {path}: {exc}", code=FailureCode.INVALID_VALUE) from exc
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        # A hard link is the portable POSIX create-without-replace primitive:
+        # unlike os.replace(), it cannot overwrite an existing destination.
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except TypeError:  # pragma: no cover - for older platform bindings
+            os.link(temporary_path, path)
+        os.fsync(directory_descriptor)
+        os.unlink(temporary_path)
+        temporary_path = None
+        os.fsync(directory_descriptor)
+    except FileExistsError as exc:
+        raise CLIIOError(f"refusing to overwrite existing output: {path}") from exc
+    except (OSError, ValueError) as exc:
+        raise CLIIOError(f"cannot publish output {path}: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        try:
+            os.close(directory_descriptor)
+        except OSError:
+            pass
 
 
 def _run_document_command(args: argparse.Namespace) -> dict[str, Any]:
     kind = _resolve_kind(args)
+    if args.workload is not None and kind != "candidate":
+        raise CLIUsageError("--workload is only valid for candidate validation")
+    if args.artifact_root is not None and kind not in {"candidate", "receipt", "workload"}:
+        raise CLIUsageError("--artifact-root is only valid for workload, candidate, or receipt documents")
     input_path = _resolve_path(args)
     value = _read_json(input_path)
     workload_value = _read_json(args.workload) if args.workload is not None else None
     document = _as_document(kind, value, workload_value=workload_value, artifact_root=args.artifact_root)
     document_value = _to_dict(document)
     canonical = canonical_json(document_value)
-    if args.output is not None:
-        _create_only(args.output, canonical.encode("utf-8"))
+    output_path = getattr(args, "output", None)
+    if output_path is not None:
+        _create_only(output_path, canonical.encode("utf-8"))
     result: dict[str, Any] = {
         "ok": True,
         "command": args.command,
@@ -307,8 +409,8 @@ def _run_document_command(args: argparse.Namespace) -> dict[str, Any]:
         result["document"] = document_value
     else:
         result["ids"] = _identity_fields(kind, value, document)
-    if args.output is not None:
-        result["output"] = args.output
+    if output_path is not None:
+        result["output"] = output_path
     return result
 
 
@@ -317,8 +419,8 @@ def _exit_for_error(error: AutoMLXError) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
     try:
+        parser = build_parser()
         args = parser.parse_args(argv)
         if args.command in _DEFERRED_COMMANDS:
             _write_diagnostic(
@@ -334,6 +436,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             return EXIT_UNAVAILABLE
         result = _run_document_command(args)
+        _write_stdout(canonical_json(result) + "\n")
+        return EXIT_OK
     except SystemExit as exc:
         # argparse uses SystemExit for normal --help/--version output. Keep
         # the public ``main`` helper return-oriented for embedding and tests.
@@ -341,17 +445,25 @@ def main(argv: list[str] | None = None) -> int:
     except CLIUsageError as exc:
         _write_diagnostic(_diagnostic("usage_error", str(exc)))
         return EXIT_USAGE
+    except CLIIOError as exc:
+        _write_diagnostic(_diagnostic("io_error", str(exc)))
+        return EXIT_IO
+    except BrokenPipeError as exc:
+        _quieten_broken_stdout()
+        _write_diagnostic(_diagnostic("io_error", "cannot write command output"))
+        return EXIT_IO
     except AutoMLXError as exc:
         _write_diagnostic(_diagnostic(exc.code.value, exc.message))
         return _exit_for_error(exc)
-    except (FileNotFoundError, PermissionError, IsADirectoryError, OSError) as exc:
+    except OSError as exc:
         _write_diagnostic(_diagnostic("io_error", str(exc)))
         return EXIT_IO
+    except (RecursionError, UnicodeError) as exc:
+        _write_diagnostic(_diagnostic("invalid_json", f"invalid JSON document: {exc}"))
+        return EXIT_CONTRACT
     except Exception as exc:  # pragma: no cover - a final stable boundary for CLI callers
         _write_diagnostic(_diagnostic("internal_error", str(exc)))
         return EXIT_INTERNAL
-    sys.stdout.write(canonical_json(result) + "\n")
-    return EXIT_OK
 
 
 __all__ = [

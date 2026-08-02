@@ -7,16 +7,18 @@ import os
 import shutil
 import sys
 import subprocess
+import stat
 import tempfile
 import tomllib
 from pathlib import Path
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 import auto_mlx
 from auto_mlx import CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json
-from auto_mlx.cli import EXIT_CONTRACT, EXIT_UNAVAILABLE, EXIT_USAGE, MAX_JSON_INPUT_BYTES, main
+from auto_mlx.cli import EXIT_CONTRACT, EXIT_IO, EXIT_UNAVAILABLE, EXIT_USAGE, MAX_JSON_INPUT_BYTES, main
 from auto_mlx.errors import Failure, FailureCode
 from auto_mlx.receipts import RawSample, Receipt
 
@@ -146,6 +148,62 @@ class CLITests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(json.loads(stderr)["error"]["code"], FailureCode.INPUT_TOO_LARGE.value)
 
+    def test_deep_nesting_is_a_contract_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            path = Path(raw_directory) / "deep.json"
+            path.write_text("[" * 5000 + "0" + "]" * 5000, encoding="utf-8")
+            status, stdout, stderr = self._run("validate", "document", str(path))
+        self.assertEqual(status, EXIT_CONTRACT)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["error"]["code"], "invalid_json")
+
+    def test_unpaired_surrogate_is_a_contract_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            path = Path(raw_directory) / "surrogate.json"
+            path.write_bytes(b'{"value":"\\ud800"}')
+            status, stdout, stderr = self._run("validate", "document", str(path))
+        self.assertEqual(status, EXIT_CONTRACT)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["error"]["code"], "invalid_json")
+
+    def test_stdin_remains_a_supported_input_source(self) -> None:
+        status, stdout, stderr = self._run("validate", "document", "-", stdin='{"value":1}')
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["document"], {"value": 1})
+
+    def test_non_regular_input_is_rejected_without_opening_it(self) -> None:
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("FIFO creation is not available")
+        with tempfile.TemporaryDirectory() as raw_directory:
+            fifo = Path(raw_directory) / "input.fifo"
+            os.mkfifo(fifo)
+            status, stdout, stderr = self._run("validate", "document", str(fifo))
+        self.assertEqual(status, EXIT_IO)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
+
+    def test_ambiguous_long_options_are_rejected(self) -> None:
+        status, stdout, stderr = self._run("validate", "document", "--inp", "-")
+        self.assertEqual(status, EXIT_USAGE)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["error"]["code"], "usage_error")
+
+    def test_irrelevant_output_and_context_options_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            source = self._write(Path(raw_directory), "document.json", {"value": 1})
+            cases = (
+                ("inspect", "document", str(source), "--output", str(Path(raw_directory) / "out.json")),
+                ("validate", "document", str(source), "--workload", str(source)),
+                ("validate", "provider", str(source), "--artifact-root", raw_directory),
+            )
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    status, stdout, stderr = self._run(*arguments)
+                    self.assertEqual(status, EXIT_USAGE)
+                    self.assertEqual(stdout, "")
+                    self.assertEqual(json.loads(stderr)["error"]["code"], "usage_error")
+
     def test_failure_default_details_is_python311_compatible_and_immutable(self) -> None:
         first = Failure(FailureCode.INVALID_VALUE, "bad")
         second = Failure(FailureCode.INVALID_VALUE, "also bad")
@@ -242,7 +300,7 @@ class CLITests(unittest.TestCase):
             config = tomllib.load(handle)
         data_files = config["tool"]["setuptools"]["data-files"]
         self.assertEqual(data_files["schemas"], ["schemas/*.json"])
-        self.assertEqual(config["project"]["license"], {"text": "MIT"})
+        self.assertEqual(config["project"]["license"], "MIT")
 
     def test_output_is_create_only(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
@@ -252,9 +310,65 @@ class CLITests(unittest.TestCase):
             first = self._run("validate", "workload", str(source), "--output", str(output))
             second = self._run("validate", "workload", str(source), "--output", str(output))
         self.assertEqual(first[0], 0)
-        self.assertEqual(second[0], EXIT_CONTRACT)
+        self.assertEqual(second[0], EXIT_IO)
         self.assertEqual(second[1], "")
+        self.assertEqual(json.loads(second[2])["error"]["code"], "io_error")
         self.assertIn("refusing to overwrite", second[2])
+
+    def test_output_is_private_atomic_and_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = self._write(directory, "workload.json", self.workload.to_dict())
+            output = directory / "canonical.json"
+            status, stdout, stderr = self._run("validate", "workload", str(source), "--output", str(output))
+            self.assertEqual(status, 0)
+            self.assertEqual(stderr, "")
+            self.assertEqual(json.loads(stdout)["output"], str(output))
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertEqual(output.read_text(encoding="utf-8"), canonical_json(self.workload.to_dict()))
+            self.assertEqual(list(directory.glob(".canonical.json.*")), [])
+
+    def test_output_write_failure_cleans_up_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = self._write(directory, "workload.json", self.workload.to_dict())
+            output = directory / "canonical.json"
+            def fail_first_fsync(descriptor: int) -> None:
+                raise OSError("simulated fsync failure")
+
+            with mock.patch("auto_mlx.cli.os.fsync", side_effect=fail_first_fsync):
+                status, stdout, stderr = self._run("validate", "workload", str(source), "--output", str(output))
+            self.assertEqual(status, EXIT_IO)
+            self.assertEqual(stdout, "")
+            self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
+            self.assertFalse(output.exists())
+            self.assertEqual(list(directory.glob(".canonical.json.*")), [])
+
+    def test_missing_output_parent_is_an_io_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory)
+            source = self._write(directory, "document.json", {"value": 1})
+            output = directory / "missing" / "canonical.json"
+            status, stdout, stderr = self._run("validate", "document", str(source), "--output", str(output))
+        self.assertEqual(status, EXIT_IO)
+        self.assertEqual(stdout, "")
+        self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
+
+    def test_broken_stdout_is_a_handled_io_failure(self) -> None:
+        class BrokenPipeStream:
+            def write(self, value: str) -> int:
+                raise BrokenPipeError("closed pipe")
+
+            def flush(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            source = self._write(Path(raw_directory), "document.json", {"value": 1})
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(BrokenPipeStream()):
+                status = main(["validate", "document", str(source)])
+        self.assertEqual(status, EXIT_IO)
+        self.assertEqual(json.loads(stderr.getvalue())["error"]["code"], "io_error")
 
 
 if __name__ == "__main__":

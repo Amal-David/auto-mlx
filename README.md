@@ -13,12 +13,18 @@ Auto MLX is a small, standalone G0 contract layer for evidence-gated MLX tuning.
 
 ## Install and validate
 
-The package has no runtime dependencies. From this directory:
+The package has no runtime dependencies. For a normal local installation from this directory:
+
+```bash
+python3 -m pip install .
+auto-mlx validate workload --input examples/workload.json
+auto-mlx inspect workload --input examples/workload.json
+```
+
+Editable installation is intended for development only:
 
 ```bash
 python3 -m pip install -e .
-auto-mlx validate workload --input examples/workload.json
-auto-mlx inspect workload --input examples/workload.json
 ```
 
 Both successful commands emit one JSON object on stdout. Failures emit a JSON diagnostic on stderr and return a stable nonzero exit code. The same CLI is available as `python3 -m auto_mlx`.
@@ -30,7 +36,8 @@ PYTHONPATH=src python3 -m auto_mlx validate provider --input examples/provider.j
 PYTHONPATH=src python3 -m auto_mlx validate workload examples/workload.json --output /tmp/auto-mlx-workload.json
 ```
 
-Output creation is exclusive; choose a new path for a second run.
+Output creation is private, atomic, durable, and exclusive; choose a new path for a second run. Existing output
+paths and other filesystem/output failures return exit code 5 and never replace the existing file.
 
 ## Explicit non-capabilities
 

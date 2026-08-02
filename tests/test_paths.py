@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import subprocess
+import socket
 import tempfile
 from pathlib import Path
 import unittest
@@ -127,6 +128,102 @@ class SafePathTests(unittest.TestCase):
             with self.assertRaises(ArtifactIntegrityError) as context:
                 file_identity(root, "model.bin", expected_size=1)
             self.assertEqual(context.exception.code, FailureCode.ARTIFACT_SIZE_MISMATCH)
+
+    def test_directory_chain_close_failures_are_aggregated_and_all_descriptors_are_attempted(self) -> None:
+        real_close = os.close
+        close_attempts: list[int] = []
+        failed_descriptors: list[int] = []
+
+        def fail_close(descriptor: int) -> None:
+            close_attempts.append(descriptor)
+            failed_descriptors.append(descriptor)
+            raise OSError(errno.EIO, f"close-{len(close_attempts)}")
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            (root / "nested").mkdir()
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                with patch.object(paths_module.os, "close", side_effect=fail_close):
+                    with self.assertRaises(ArtifactIntegrityError) as context:
+                        paths_module._open_directory_chain("nested/model.bin", label="artifact root")
+            finally:
+                os.chdir(previous)
+                for descriptor in failed_descriptors:
+                    real_close(descriptor)
+        self.assertEqual(context.exception.code, FailureCode.ARTIFACT_MISSING)
+        self.assertEqual(len(close_attempts), 2)
+        self.assertIn("close-1", str(context.exception))
+        self.assertIn("close-2", str(context.exception))
+
+    def test_primary_artifact_error_preserves_code_when_final_close_also_fails(self) -> None:
+        real_open = os.open
+        real_close = os.close
+        final_descriptor: int | None = None
+        failed_descriptors: list[int] = []
+
+        def record_open(name: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+            nonlocal final_descriptor
+            descriptor = real_open(name, flags, mode, **kwargs)
+            if kwargs.get("dir_fd") is not None and not flags & os.O_DIRECTORY:
+                final_descriptor = descriptor
+            return descriptor
+
+        def fail_final_close(descriptor: int) -> None:
+            if descriptor == final_descriptor:
+                failed_descriptors.append(descriptor)
+                raise OSError(errno.EIO, "final close failed")
+            real_close(descriptor)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            (root / "model.bin").write_bytes(b"payload")
+            try:
+                with patch.object(paths_module.os, "open", side_effect=record_open), patch.object(
+                    paths_module.os, "close", side_effect=fail_final_close
+                ):
+                    with self.assertRaises(ArtifactIntegrityError) as context:
+                        file_identity(root, "model.bin", expected_size=0)
+            finally:
+                for descriptor in failed_descriptors:
+                    real_close(descriptor)
+        self.assertEqual(context.exception.code, FailureCode.ARTIFACT_SIZE_MISMATCH)
+        self.assertIn("final close failed", str(context.exception))
+
+    def test_socket_style_open_errno_is_not_regular_and_never_digest_mismatch(self) -> None:
+        real_open = os.open
+
+        def reject_socket_open(name: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+            if kwargs.get("dir_fd") is not None and Path(name) == Path("model.bin"):
+                raise OSError(errno.EOPNOTSUPP, "socket open is unsupported")
+            return real_open(name, flags, mode, **kwargs)
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            (root / "model.bin").write_bytes(b"payload")
+            with patch.object(paths_module.os, "open", side_effect=reject_socket_open):
+                with self.assertRaises(ArtifactIntegrityError) as context:
+                    file_identity(root, "model.bin")
+        self.assertEqual(context.exception.code, FailureCode.ARTIFACT_NOT_REGULAR)
+
+    def test_real_socket_final_artifact_is_not_regular_when_filesystem_sockets_are_allowed(self) -> None:
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("Unix domain sockets are not available")
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            socket_path = root / "model.sock"
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                try:
+                    listener.bind(str(socket_path))
+                except OSError:
+                    self.skipTest("the host forbids filesystem Unix sockets")
+                with self.assertRaises(ArtifactIntegrityError) as context:
+                    file_identity(root, "model.sock")
+            finally:
+                listener.close()
+        self.assertEqual(context.exception.code, FailureCode.ARTIFACT_NOT_REGULAR)
 
     def test_symlink_and_non_regular_artifacts_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

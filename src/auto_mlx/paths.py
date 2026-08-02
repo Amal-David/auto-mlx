@@ -20,6 +20,16 @@ _OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", ())
 _STAT_SUPPORTS_DIR_FD = os.stat in getattr(os, "supports_dir_fd", ())
 _STAT_SUPPORTS_NOFOLLOW = os.stat in getattr(os, "supports_follow_symlinks", ())
 _MAX_HASH_BYTES = 1 << 30
+_NON_REGULAR_OPEN_ERRNOS = {
+    errno.EISDIR,
+    errno.ENOTDIR,
+    errno.ENXIO,
+    errno.EOPNOTSUPP,
+}
+for _errno_name in ("ENOTSUP", "ENODEV", "ENOTTY"):
+    _errno_value = getattr(errno, _errno_name, None)
+    if _errno_value is not None:
+        _NON_REGULAR_OPEN_ERRNOS.add(_errno_value)
 
 
 def validate_sha256(value: str) -> str:
@@ -89,7 +99,7 @@ def _open_error(exc: OSError | ValueError | NotImplementedError, *, path: str) -
         return ArtifactIntegrityError(f"artifact does not exist: {path}", code=FailureCode.ARTIFACT_MISSING)
     if exc.errno == errno.ELOOP:
         return ArtifactIntegrityError(f"artifact path contains a symlink: {path}", code=FailureCode.ARTIFACT_SYMLINK)
-    if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
+    if exc.errno in _NON_REGULAR_OPEN_ERRNOS:
         return ArtifactIntegrityError(f"artifact path is not a regular file: {path}", code=FailureCode.ARTIFACT_NOT_REGULAR)
     if exc.errno in {errno.EACCES, errno.EPERM}:
         return ArtifactIntegrityError(f"cannot access artifact safely: {exc}", code=FailureCode.ARTIFACT_ACCESS)
@@ -102,15 +112,6 @@ def _read_error(exc: OSError | ValueError | NotImplementedError, *, path: str) -
     if exc.errno in {errno.EACCES, errno.EPERM}:
         return ArtifactIntegrityError(f"cannot access artifact: {path}: {exc}", code=FailureCode.ARTIFACT_ACCESS)
     return ArtifactIntegrityError(f"cannot read artifact: {path}: {exc}", code=FailureCode.ARTIFACT_IO_ERROR)
-
-
-def _close_descriptor(descriptor: int) -> None:
-    """Close a descriptor during cleanup without masking the active failure."""
-
-    try:
-        os.close(descriptor)
-    except OSError:
-        pass
 
 
 def _path_parts(
@@ -148,7 +149,7 @@ def _component_open_error(
     if exc.errno == errno.ENOTDIR and _STAT_SUPPORTS_DIR_FD and _STAT_SUPPORTS_NOFOLLOW:
         try:
             entry = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
-        except OSError:
+        except (OSError, ValueError, NotImplementedError):
             entry = None
         if entry is not None and stat.S_ISLNK(entry.st_mode):
             return ArtifactIntegrityError(
@@ -157,53 +158,81 @@ def _component_open_error(
     return _open_error(exc, path=str(path))
 
 
+def _close_owned(descriptors: list[int]) -> list[tuple[int, OSError | ValueError]]:
+    """Attempt every owned close and discard ownership even when close fails."""
+
+    failures: list[tuple[int, OSError | ValueError]] = []
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except (OSError, ValueError) as exc:
+            failures.append((descriptor, exc))
+    return failures
+
+
+def _cleanup_detail(failures: list[tuple[int, OSError | ValueError]]) -> str:
+    return "; ".join(f"fd {descriptor}: {error}" for descriptor, error in failures)
+
+
+def _artifact_cleanup_error(
+    primary: ArtifactIntegrityError | None,
+    failures: list[tuple[int, OSError | ValueError]],
+    *,
+    context: str,
+) -> ArtifactIntegrityError:
+    code = primary.code if primary is not None else FailureCode.ARTIFACT_MISSING
+    prefix = primary.message if primary is not None else f"{context} cleanup failed"
+    return ArtifactIntegrityError(f"{prefix}; {context} cleanup failed: {_cleanup_detail(failures)}", code=code)
+
+
 def _open_directory_chain(path_value: str | os.PathLike[str], *, label: str) -> tuple[int, tuple[str, ...], Path]:
     """Walk from one stable anchor, opening each directory with O_NOFOLLOW."""
 
     path, anchor, components = _path_parts(path_value, label=label, allow_empty=True)
     flags = _open_flags(directory=True)
     descriptor: int | None = None
+    owned: list[int] = []
     try:
         descriptor = os.open(anchor, flags)
+        owned.append(descriptor)
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise ArtifactIntegrityError(f"{label} anchor is not a directory", code=FailureCode.ARTIFACT_NOT_REGULAR)
         for component in components:
-            child: int | None = None
             try:
                 child = os.open(component, flags, dir_fd=descriptor)
-                if not stat.S_ISDIR(os.fstat(child).st_mode):
-                    raise ArtifactIntegrityError(
-                        f"{label} contains a non-directory component: {path}",
-                        code=FailureCode.ARTIFACT_NOT_REGULAR,
-                    )
-            except ArtifactIntegrityError:
-                if child is not None:
-                    _close_descriptor(child)
-                raise
             except (OSError, ValueError, NotImplementedError) as exc:
-                if child is not None:
-                    _close_descriptor(child)
                 raise _component_open_error(path, component, descriptor, exc) from exc
+            owned.append(child)
+            if not stat.S_ISDIR(os.fstat(child).st_mode):
+                raise ArtifactIntegrityError(
+                    f"{label} contains a non-directory component: {path}",
+                    code=FailureCode.ARTIFACT_NOT_REGULAR,
+                )
             try:
                 os.close(descriptor)
-            except OSError as exc:
-                _close_descriptor(child)
+            except (OSError, ValueError) as exc:
+                owned.remove(descriptor)
                 raise ArtifactIntegrityError(
-                    "cannot close artifact directory descriptor",
-                    code=FailureCode.ARTIFACT_IO_ERROR,
+                    f"cannot close artifact directory descriptor: {exc}",
+                    code=FailureCode.ARTIFACT_MISSING,
                 ) from exc
+            owned.remove(descriptor)
             descriptor = child
         if descriptor is None:  # pragma: no cover - _path_parts guarantees a component
             raise ArtifactIntegrityError("artifact directory could not be opened", code=FailureCode.ARTIFACT_MISSING)
         return descriptor, components, path
-    except ArtifactIntegrityError:
-        if descriptor is not None:
-            _close_descriptor(descriptor)
+    except ArtifactIntegrityError as primary:
+        failures = _close_owned(owned)
+        if failures:
+            raise _artifact_cleanup_error(primary, failures, context=f"{label} descriptor") from primary
         raise
     except (OSError, ValueError, NotImplementedError) as exc:
-        if descriptor is not None:
-            _close_descriptor(descriptor)
-        raise _open_error(exc, path=str(path)) from exc
+        primary = _open_error(exc, path=str(path))
+        failures = _close_owned(owned)
+        if failures:
+            raise _artifact_cleanup_error(primary, failures, context=f"{label} descriptor") from primary
+        raise primary from exc
 
 
 def _open_root_directory(root: str | os.PathLike[str]) -> int:
@@ -221,14 +250,20 @@ def _open_root_directory(root: str | os.PathLike[str]) -> int:
     descriptor, _, _ = _open_directory_chain(root_input, label="artifact root")
     try:
         opened_stat = os.fstat(descriptor)
-    except OSError as exc:
-        _close_descriptor(descriptor)
-        raise _open_error(exc, path=str(root_input)) from exc
+    except (OSError, ValueError, NotImplementedError) as exc:
+        primary = _open_error(exc, path=str(root_input))
+        failures = _close_owned([descriptor])
+        if failures:
+            raise _artifact_cleanup_error(primary, failures, context="artifact root descriptor") from primary
+        raise primary from exc
     if (opened_stat.st_dev, opened_stat.st_ino) != (input_stat.st_dev, input_stat.st_ino):
-        _close_descriptor(descriptor)
-        raise ArtifactIntegrityError(
+        primary = ArtifactIntegrityError(
             "artifact root changed while it was being opened", code=FailureCode.IDENTITY_MISMATCH
         )
+        failures = _close_owned([descriptor])
+        if failures:
+            raise _artifact_cleanup_error(primary, failures, context="artifact root descriptor") from primary
+        raise primary
     return descriptor
 
 
@@ -238,54 +273,80 @@ def _open_verified_file(root: str | os.PathLike[str], relative_path: str) -> int
     safe = validate_relative_posix_path(relative_path)
     components = safe.split("/")
     root_descriptor = _open_root_directory(root)
-    descriptors = [root_descriptor]
-    final_descriptor: int | None = None
-    success = False
+    owned = [root_descriptor]
     try:
         directory_flags = _open_flags(directory=True)
         for component in components[:-1]:
             try:
-                child = os.open(component, directory_flags, dir_fd=descriptors[-1])
+                child = os.open(component, directory_flags, dir_fd=owned[-1])
             except (OSError, ValueError, NotImplementedError) as exc:
-                raise _component_open_error(Path(safe), component, descriptors[-1], exc) from exc
+                raise _component_open_error(Path(safe), component, owned[-1], exc) from exc
+            owned.append(child)
             try:
                 child_stat = os.fstat(child)
             except (OSError, ValueError, NotImplementedError):
-                try:
-                    os.close(child)
-                except OSError:
-                    pass
                 raise
             if not stat.S_ISDIR(child_stat.st_mode):
-                try:
-                    os.close(child)
-                except OSError:
-                    pass
                 raise ArtifactIntegrityError(
                     f"artifact parent is not a directory: {safe}", code=FailureCode.ARTIFACT_NOT_REGULAR
                 )
-            descriptors.append(child)
+            parent_descriptor = owned[-2]
+            try:
+                os.close(parent_descriptor)
+            except (OSError, ValueError) as exc:
+                owned.remove(parent_descriptor)
+                raise ArtifactIntegrityError(
+                    f"cannot close artifact parent descriptor: {exc}", code=FailureCode.ARTIFACT_MISSING
+                ) from exc
+            owned.remove(parent_descriptor)
+
+        parent_descriptor = owned[-1]
+        if _STAT_SUPPORTS_DIR_FD and _STAT_SUPPORTS_NOFOLLOW:
+            try:
+                entry = os.stat(components[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+            except (OSError, ValueError, NotImplementedError) as exc:
+                if isinstance(exc, OSError) and exc.errno in _NON_REGULAR_OPEN_ERRNOS:
+                    raise ArtifactIntegrityError(
+                        f"artifact is not a regular file: {safe}", code=FailureCode.ARTIFACT_NOT_REGULAR
+                    ) from exc
+            else:
+                if stat.S_ISLNK(entry.st_mode):
+                    raise ArtifactIntegrityError(
+                        f"artifact path contains a symlink: {safe}", code=FailureCode.ARTIFACT_SYMLINK
+                    )
+                if not stat.S_ISREG(entry.st_mode):
+                    raise ArtifactIntegrityError(
+                        f"artifact is not a regular file: {safe}", code=FailureCode.ARTIFACT_NOT_REGULAR
+                    )
+
         final_descriptor = os.open(
-            components[-1], _open_flags(directory=False, nonblocking=True), dir_fd=descriptors[-1]
+            components[-1], _open_flags(directory=False, nonblocking=True), dir_fd=parent_descriptor
         )
+        owned.append(final_descriptor)
         opened_stat = os.fstat(final_descriptor)
         if not stat.S_ISREG(opened_stat.st_mode):
-            _close_descriptor(final_descriptor)
-            final_descriptor = None
             raise ArtifactIntegrityError(
                 f"artifact is not a regular file: {safe}", code=FailureCode.ARTIFACT_NOT_REGULAR
             )
-        success = True
+
+        parent_descriptors = owned[:-1]
+        del owned[:-1]
+        failures = _close_owned(parent_descriptors)
+        if failures:
+            failures.extend(_close_owned(owned))
+            raise _artifact_cleanup_error(None, failures, context="artifact descriptor")
         return final_descriptor
-    except ArtifactIntegrityError:
+    except ArtifactIntegrityError as primary:
+        failures = _close_owned(owned)
+        if failures:
+            raise _artifact_cleanup_error(primary, failures, context="artifact descriptor") from primary
         raise
     except (OSError, ValueError, NotImplementedError) as exc:
-        raise _open_error(exc, path=safe) from exc
-    finally:
-        if final_descriptor is not None and not success:
-            _close_descriptor(final_descriptor)
-        for descriptor in reversed(descriptors):
-            _close_descriptor(descriptor)
+        primary = _open_error(exc, path=safe)
+        failures = _close_owned(owned)
+        if failures:
+            raise _artifact_cleanup_error(primary, failures, context="artifact descriptor") from primary
+        raise primary from exc
 
 
 def file_identity(
@@ -299,8 +360,7 @@ def file_identity(
 
     descriptor = _open_verified_file(root, relative_path)
     digest = hashlib.sha256()
-    operation_error: ArtifactIntegrityError | None = None
-    close_error: OSError | None = None
+    primary: ArtifactIntegrityError | None = None
     try:
         if expected_size is not None:
             validate_non_negative_int(expected_size, label="expected_size")
@@ -333,18 +393,16 @@ def file_identity(
                 code=FailureCode.ARTIFACT_SIZE_MISMATCH,
             )
     except ArtifactIntegrityError as exc:
-        operation_error = exc
+        primary = exc
     except (OSError, ValueError, NotImplementedError) as exc:
-        operation_error = _read_error(exc, path=relative_path)
-    finally:
-        try:
-            os.close(descriptor)
-        except OSError as exc:
-            close_error = exc
-    if operation_error is not None:
-        raise operation_error
-    if close_error is not None:
-        raise _read_error(close_error, path=relative_path) from close_error
+        primary = _read_error(exc, path=relative_path)
+    failures = _close_owned([descriptor])
+    if failures:
+        if primary is None:
+            raise _artifact_cleanup_error(None, failures, context="artifact descriptor") from failures[0][1]
+        raise _artifact_cleanup_error(primary, failures, context="artifact descriptor") from primary
+    if primary is not None:
+        raise primary
     return size, digest.hexdigest()
 
 

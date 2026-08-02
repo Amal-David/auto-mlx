@@ -35,6 +35,10 @@ inputs, artifact roots, and outputs is walked from a stable anchor (the opened c
 filesystem anchor for absolute paths) with no-follow directory opens and `fstat`; symlink ancestors, missing or
 non-directory parents, and special final inputs are rejected. The final input is opened once and read only from that
 descriptor. FIFO, socket, directory, device, and symlink final inputs fail closed; `-` remains the stdin spelling.
+The no-follow descriptor-relative stat is only an early classification aid: a regular-file decision is still confirmed
+by the final `open`/`fstat` pair, and platform socket/special-file open errors are reported as regular-file failures.
+This same component walk rejects symlink ancestors such as `/tmp` or `/var` when those names are symlinks on the host;
+they are not resolved as a fallback.
 
 `--output` opens the parent directory once, creates an unpredictable private staging name with `O_CREAT|O_EXCL|O_NOFOLLOW`
 and `dir_fd`, writes all bytes, applies mode `0600`, fsyncs the staged descriptor, and verifies that the staging name

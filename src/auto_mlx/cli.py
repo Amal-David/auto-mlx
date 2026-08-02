@@ -47,6 +47,19 @@ _STAT_SUPPORTS_NOFOLLOW: Final = os.stat in getattr(os, "supports_follow_symlink
 _LINK_SUPPORTS_DIR_FD: Final = os.link in getattr(os, "supports_dir_fd", ())
 _LINK_SUPPORTS_NOFOLLOW: Final = os.link in getattr(os, "supports_follow_symlinks", ())
 _UNLINK_SUPPORTS_DIR_FD: Final = os.unlink in getattr(os, "supports_dir_fd", ())
+_NON_REGULAR_OPEN_ERRNOS: Final = frozenset(
+    value
+    for value in (
+        errno.EISDIR,
+        errno.ENOTDIR,
+        errno.ENXIO,
+        errno.EOPNOTSUPP,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "ENODEV", None),
+        getattr(errno, "ENOTTY", None),
+    )
+    if value is not None
+)
 
 _CONTRACT_KINDS: Final = (
     "artifact",
@@ -288,7 +301,7 @@ def _walk_error(
     ):
         try:
             entry = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
-        except OSError:
+        except (OSError, ValueError, NotImplementedError):
             entry = None
         if entry is not None and stat.S_ISLNK(entry.st_mode):
             return CLIIOError(f"{path} contains a symlink ancestor at {component!r}")
@@ -297,6 +310,39 @@ def _walk_error(
     if exc.errno in {errno.ENOTDIR, errno.EISDIR}:
         return CLIIOError(f"{path} has a non-directory parent component: {component!r}")
     return CLIIOError(f"cannot open {path} parent component {component!r}: {exc}")
+
+
+def _close_owned(descriptors: list[int]) -> list[tuple[int, OSError | ValueError]]:
+    """Attempt every owned close and discard ownership even when close fails."""
+
+    failures: list[tuple[int, OSError | ValueError]] = []
+    while descriptors:
+        descriptor = descriptors.pop()
+        try:
+            os.close(descriptor)
+        except (OSError, ValueError) as exc:
+            failures.append((descriptor, exc))
+    return failures
+
+
+def _cleanup_detail(failures: list[tuple[int, OSError | ValueError]]) -> str:
+    return "; ".join(f"fd {descriptor}: {error}" for descriptor, error in failures)
+
+
+def _cli_cleanup_error(
+    primary: Exception | None,
+    failures: list[tuple[int, OSError | ValueError]],
+    *,
+    context: str,
+) -> Exception:
+    detail = _cleanup_detail(failures)
+    if primary is None:
+        return CLIIOError(f"{context} cleanup failed: {detail}")
+    if isinstance(primary, CLIIOError):
+        return CLIIOError(f"{primary}; {context} cleanup failed: {detail}")
+    if isinstance(primary, AutoMLXError):
+        return ContractError(f"{primary.message}; {context} cleanup failed: {detail}", code=primary.code)
+    return CLIIOError(f"{primary}; {context} cleanup failed: {detail}")
 
 
 def _open_parent_directory(path_value: str, *, label: str) -> tuple[int, str, Path]:
@@ -308,57 +354,42 @@ def _open_parent_directory(path_value: str, *, label: str) -> tuple[int, str, Pa
     if hasattr(os, "O_CLOEXEC"):
         flags |= os.O_CLOEXEC
     descriptor: int | None = None
+    owned: list[int] = []
     try:
         descriptor = os.open(anchor, flags)
+        owned.append(descriptor)
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise CLIIOError(f"{label} anchor is not a directory: {anchor}")
         for component in components[:-1]:
-            child: int | None = None
             try:
                 child = os.open(component, flags, dir_fd=descriptor)
-                child_stat = os.fstat(child)
-                if not stat.S_ISDIR(child_stat.st_mode):
-                    raise CLIIOError(f"{path} has a non-directory parent component: {component!r}")
-            except CLIIOError:
-                if child is not None:
-                    try:
-                        os.close(child)
-                    except OSError:
-                        pass
-                raise
             except (OSError, ValueError, NotImplementedError) as exc:
-                if child is not None:
-                    try:
-                        os.close(child)
-                    except OSError:
-                        pass
                 raise _walk_error(path, component, exc, descriptor=descriptor) from exc
+            owned.append(child)
+            child_stat = os.fstat(child)
+            if not stat.S_ISDIR(child_stat.st_mode):
+                raise CLIIOError(f"{path} has a non-directory parent component: {component!r}")
             try:
                 os.close(descriptor)
-            except OSError as exc:
-                try:
-                    os.close(child)
-                except OSError:
-                    pass
+            except (OSError, ValueError) as exc:
+                owned.remove(descriptor)
                 raise CLIIOError(f"cannot close {label} parent descriptor for {path}: {exc}") from exc
+            owned.remove(descriptor)
             descriptor = child
         if descriptor is None:  # pragma: no cover - _path_components guarantees a component
             raise CLIIOError(f"cannot open {label} parent for {path}")
         return descriptor, components[-1], path
-    except CLIIOError:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+    except CLIIOError as primary:
+        failures = _close_owned(owned)
+        if failures:
+            raise _cli_cleanup_error(primary, failures, context=f"{label} descriptor") from primary
         raise
     except (OSError, ValueError, NotImplementedError) as exc:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        raise _walk_error(path, anchor, exc) from exc
+        primary = _walk_error(path, anchor, exc)
+        failures = _close_owned(owned)
+        if failures:
+            raise _cli_cleanup_error(primary, failures, context=f"{label} descriptor") from primary
+        raise primary from exc
 
 
 def _read_json(path_value: str) -> Any:
@@ -368,11 +399,20 @@ def _read_json(path_value: str) -> Any:
     else:
         parent_descriptor, name, path = _open_parent_directory(path_value, label="input")
         descriptor: int | None = None
-        operation_error: CLIIOError | None = None
-        close_error: OSError | None = None
+        operation_error: Exception | None = None
         try:
             if not callable(getattr(os, "read", None)) or getattr(os, "O_NONBLOCK", None) is None:
                 raise CLIIOError(f"cannot safely open input {path}: non-blocking descriptor reads are unavailable")
+            try:
+                entry = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except (OSError, ValueError, NotImplementedError) as exc:
+                if isinstance(exc, OSError) and exc.errno in _NON_REGULAR_OPEN_ERRNOS:
+                    raise CLIIOError(f"input path is not a regular file: {path}") from exc
+            else:
+                if stat.S_ISLNK(entry.st_mode):
+                    raise CLIIOError(f"input path contains a symlink: {path}")
+                if not stat.S_ISREG(entry.st_mode):
+                    raise CLIIOError(f"input path is not a regular file: {path}")
             flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
             if hasattr(os, "O_CLOEXEC"):
                 flags |= os.O_CLOEXEC
@@ -383,25 +423,22 @@ def _read_json(path_value: str) -> Any:
             if info.st_size > MAX_JSON_INPUT_BYTES:
                 raise _input_limit_error(str(path))
             raw = _read_bounded_descriptor(descriptor, source=str(path))
-        except CLIIOError as exc:
+        except (CLIIOError, AutoMLXError) as exc:
             operation_error = exc
         except (OSError, ValueError, NotImplementedError) as exc:
-            operation_error = CLIIOError(f"cannot read input {path}: {exc}")
-        finally:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError as exc:
-                    close_error = exc
-            try:
-                os.close(parent_descriptor)
-            except OSError as exc:
-                if close_error is None:
-                    close_error = exc
-        if close_error is not None:
+            if isinstance(exc, OSError) and exc.errno in _NON_REGULAR_OPEN_ERRNOS:
+                operation_error = CLIIOError(f"input path is not a regular file: {path}")
+            else:
+                operation_error = CLIIOError(f"cannot read input {path}: {exc}")
+        owned = [parent_descriptor]
+        if descriptor is not None:
+            owned.append(descriptor)
+        close_errors = _close_owned(owned)
+        if close_errors:
+            combined = _cli_cleanup_error(operation_error, close_errors, context=f"input {path} descriptor")
             if operation_error is not None:
-                raise CLIIOError(f"{operation_error}; input descriptor close failed: {path}: {close_error}") from operation_error
-            raise CLIIOError(f"cannot close input descriptor for {path}: {close_error}") from close_error
+                raise combined from operation_error
+            raise combined from close_errors[0][1]
         if operation_error is not None:
             raise operation_error
     return strict_json_loads(raw)
@@ -569,7 +606,7 @@ def _unlink_if_identity(
             return True, "removed"
         except FileNotFoundError:
             return True, "already absent"
-        except (OSError, NotImplementedError) as exc:
+        except (OSError, ValueError, NotImplementedError) as exc:
             last_error = exc
     return False, f"could not remove the identity-matched name: {last_error}"
 
@@ -600,7 +637,7 @@ def _create_only(path_value: str, payload: bytes) -> None:
     published = False
     rollback_required = False
     operation_error: CLIIOError | None = None
-    close_errors: list[OSError] = []
+    close_errors: list[tuple[int, OSError | ValueError]] = []
     cleanup_messages: list[str] = []
 
     try:
@@ -721,7 +758,7 @@ def _create_only(path_value: str, payload: bytes) -> None:
             if removed:
                 try:
                     os.fsync(directory_descriptor)
-                except OSError as exc:
+                except (OSError, ValueError, NotImplementedError) as exc:
                     cleanup_messages.append(f"destination rollback durability is uncertain: {exc}")
         if temporary_name is not None and staged_identity is not None:
             removed, detail = _unlink_if_identity(
@@ -733,18 +770,13 @@ def _create_only(path_value: str, payload: bytes) -> None:
             cleanup_messages.append(f"private staging cleanup: {detail}")
             if removed:
                 temporary_name = None
+        owned = [directory_descriptor]
         if staged_descriptor is not None:
-            try:
-                os.close(staged_descriptor)
-            except OSError as exc:
-                close_errors.append(exc)
-        try:
-            os.close(directory_descriptor)
-        except OSError as exc:
-            close_errors.append(exc)
+            owned.append(staged_descriptor)
+        close_errors.extend(_close_owned(owned))
 
     if close_errors:
-        close_detail = "; ".join(str(error) for error in close_errors)
+        close_detail = _cleanup_detail(close_errors)
         if operation_error is None:
             operation_error = CLIIOError(
                 f"output was published, but descriptor close failed; inspect {path}: {close_detail}"

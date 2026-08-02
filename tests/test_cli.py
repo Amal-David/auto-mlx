@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import json
 import os
@@ -21,7 +22,7 @@ import auto_mlx
 import auto_mlx.cli as cli
 from auto_mlx import CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json
 from auto_mlx.cli import EXIT_CONTRACT, EXIT_IO, EXIT_UNAVAILABLE, EXIT_USAGE, MAX_JSON_INPUT_BYTES, main
-from auto_mlx.errors import Failure, FailureCode
+from auto_mlx.errors import ContractError, Failure, FailureCode
 from auto_mlx.receipts import RawSample, Receipt
 
 
@@ -238,6 +239,132 @@ class CLITests(unittest.TestCase):
         self.assertEqual(status, EXIT_IO)
         self.assertEqual(stdout, "")
         self.assertEqual(json.loads(stderr)["error"]["code"], "io_error")
+        self.assertIn("not a regular file", json.loads(stderr)["error"]["message"])
+
+    def test_socket_style_open_errno_is_a_cli_regular_file_failure(self) -> None:
+        real_open = os.open
+
+        def reject_socket_open(name: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+            if kwargs.get("dir_fd") is not None and Path(name) == Path("input.json"):
+                raise OSError(errno.ENXIO, "socket open is unsupported")
+            return real_open(name, flags, mode, **kwargs)
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory).resolve()
+            source = self._write(directory, "input.json", {"value": 1})
+            with mock.patch("auto_mlx.cli.os.open", side_effect=reject_socket_open):
+                status, stdout, stderr = self._run("validate", "document", str(source))
+        self.assertEqual(status, EXIT_IO)
+        self.assertEqual(stdout, "")
+        self.assertIn("not a regular file", json.loads(stderr)["error"]["message"])
+
+    def test_parent_chain_close_failures_are_aggregated_and_all_descriptors_are_attempted(self) -> None:
+        real_close = os.close
+        close_attempts: list[int] = []
+        failed_descriptors: list[int] = []
+
+        def fail_close(descriptor: int) -> None:
+            close_attempts.append(descriptor)
+            failed_descriptors.append(descriptor)
+            raise OSError(errno.EIO, f"close-{len(close_attempts)}")
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            root = Path(raw_directory).resolve()
+            (root / "nested").mkdir()
+            previous = Path.cwd()
+            os.chdir(root)
+            try:
+                with mock.patch("auto_mlx.cli.os.close", side_effect=fail_close):
+                    with self.assertRaises(cli.CLIIOError) as context:
+                        cli._open_parent_directory("nested/input.json", label="input")
+            finally:
+                os.chdir(previous)
+                for descriptor in failed_descriptors:
+                    real_close(descriptor)
+        self.assertEqual(len(close_attempts), 2)
+        self.assertIn("close-1", str(context.exception))
+        self.assertIn("close-2", str(context.exception))
+
+    def test_input_primary_contract_error_preserves_code_with_multiple_close_failures(self) -> None:
+        real_open = os.open
+        real_close = os.close
+        directory_descriptors: list[int] = []
+        final_descriptor: int | None = None
+        failed_descriptors: list[int] = []
+
+        def record_open(name: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+            nonlocal final_descriptor
+            descriptor = real_open(name, flags, mode, **kwargs)
+            if flags & os.O_DIRECTORY:
+                directory_descriptors.append(descriptor)
+            elif kwargs.get("dir_fd") is not None:
+                final_descriptor = descriptor
+            return descriptor
+
+        def fail_owned_close(descriptor: int) -> None:
+            if descriptor in {final_descriptor, directory_descriptors[-1] if directory_descriptors else None}:
+                failed_descriptors.append(descriptor)
+                raise OSError(errno.EIO, f"close-{len(failed_descriptors)}")
+            real_close(descriptor)
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            directory = Path(raw_directory).resolve()
+            source = directory / "oversized.json"
+            source.write_bytes(b"x" * (MAX_JSON_INPUT_BYTES + 1))
+            try:
+                with mock.patch("auto_mlx.cli.os.open", side_effect=record_open), mock.patch(
+                    "auto_mlx.cli.os.close", side_effect=fail_owned_close
+                ):
+                    with self.assertRaises(ContractError) as context:
+                        cli._read_json(str(source))
+            finally:
+                for descriptor in set(failed_descriptors):
+                    real_close(descriptor)
+        self.assertEqual(context.exception.code, FailureCode.INPUT_TOO_LARGE)
+        self.assertIn("input_too_large", context.exception.code.value)
+        self.assertIn("cleanup failed", str(context.exception))
+        self.assertGreaterEqual(len(failed_descriptors), 2)
+
+    def test_output_close_failures_are_aggregated_after_publication(self) -> None:
+        real_open = os.open
+        real_close = os.close
+        directory_descriptor: int | None = None
+        staged_descriptor: int | None = None
+        failed_descriptors: list[int] = []
+        publication_descriptors_ready = False
+        published = False
+
+        def record_open(name: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+            nonlocal directory_descriptor, staged_descriptor, publication_descriptors_ready
+            descriptor = real_open(name, flags, mode, **kwargs)
+            if flags & os.O_DIRECTORY:
+                directory_descriptor = descriptor
+            elif flags & os.O_CREAT and flags & os.O_EXCL and kwargs.get("dir_fd") is not None:
+                staged_descriptor = descriptor
+                publication_descriptors_ready = True
+            return descriptor
+
+        def fail_owned_close(descriptor: int) -> None:
+            if publication_descriptors_ready and descriptor in {directory_descriptor, staged_descriptor}:
+                failed_descriptors.append(descriptor)
+                raise OSError(errno.EIO, f"close-{len(failed_descriptors)}")
+            real_close(descriptor)
+
+        with tempfile.TemporaryDirectory() as raw_directory:
+            output = Path(raw_directory).resolve() / "canonical.json"
+            try:
+                with mock.patch("auto_mlx.cli.os.open", side_effect=record_open), mock.patch(
+                    "auto_mlx.cli.os.close", side_effect=fail_owned_close
+                ):
+                    with self.assertRaises(cli.CLIIOError) as context:
+                        cli._create_only(str(output), b"payload")
+                published = output.is_file()
+            finally:
+                for descriptor in set(failed_descriptors):
+                    real_close(descriptor)
+        self.assertTrue(published)
+        self.assertIn("descriptor close failed", str(context.exception))
+        self.assertGreaterEqual(len(failed_descriptors), 2)
 
     def test_device_final_input_is_rejected(self) -> None:
         if not stat.S_ISCHR(os.stat(os.devnull).st_mode):

@@ -1,4 +1,17 @@
-"""Evidence-gated, MLX-free G0 contracts for declarative tuning."""
+"""Evidence-gated, MLX-free G0 contracts for declarative tuning.
+
+``auto_mlx.keys``, ``auto_mlx.supervisor``, and ``auto_mlx.store_config``
+are deliberately NOT imported here.  Importing this package is how any
+``auto_mlx.evaluator`` (or ``executor``/``sandbox``/``measurement``) caller
+gets those modules -- eagerly importing the key/supervisor modules at the
+package's top level would mean every such caller transitively loads
+``auto_mlx.keys`` into ``sys.modules`` just by importing anything from this
+package, undermining the module boundary that keeps attestation key
+material out of the evaluator's reach (see
+``tests/test_supervisor.py::EvaluatorKeyIsolationTests``). Import them
+directly: ``import auto_mlx.keys`` / ``from auto_mlx.supervisor import
+attest_receipt`` / ``import auto_mlx.store_config``.
+"""
 
 from .canonical import (
     canonical_bytes,
@@ -31,6 +44,9 @@ from .errors import (
     Error,
     Failure,
     FailureCode,
+    KeyMaterialError,
+    StoreConfigError,
+    SupervisorRefusalError,
     UnknownFieldError,
     UnsafePathError,
 )
@@ -111,6 +127,7 @@ __all__ = [
     "Failure",
     "FailureCode",
     "FrozenWorkload",
+    "KeyMaterialError",
     "Knob",
     "NATIVE",
     "NATIVE_FALLBACK",
@@ -124,6 +141,8 @@ __all__ = [
     "ReceiptStore",
     "ReceiptValidation",
     "RuntimeIdentity",
+    "StoreConfigError",
+    "SupervisorRefusalError",
     "UnknownFieldError",
     "UnsafePathError",
     "ACTIVATE",

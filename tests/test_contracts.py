@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_mlx import Artifact, CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json, sha256_hex, validate_config
 from auto_mlx.errors import AutoMLXError, CanonicalJSONError, ContractError, Failure, FailureCode, UnknownFieldError, UnsafePathError
 from auto_mlx.contracts import MAX_CONFIG_ENTRIES, MAX_JSON_DEPTH, MAX_MEASUREMENT_RUNS, MAX_POLICY_OUTPUT_BYTES, MAX_WARMUP_RUNS
+from auto_mlx.schemas import schema_names, schema_text
 
 
 class ContractTests(unittest.TestCase):
@@ -131,10 +132,10 @@ class ContractTests(unittest.TestCase):
         project_root = Path(__file__).resolve().parents[1]
         with (project_root / "pyproject.toml").open("rb") as handle:
             config = tomllib.load(handle)
-        data_files = config["tool"]["setuptools"]["data-files"]
-        self.assertIn("schemas/*.json", data_files["schemas"])
+        package_data = config["tool"]["setuptools"]["package-data"]
+        self.assertEqual(package_data["auto_mlx.schemas"], ["*.json"])
         self.assertEqual(
-            {path.name for path in (project_root / "schemas").glob("*.json")},
+            set(schema_names()),
             {
                 "artifact.json",
                 "candidate_proposal.json",
@@ -237,8 +238,7 @@ class ContractTests(unittest.TestCase):
         self.assertNotIn("\ud800", str(context.exception))
 
     def test_frozen_workload_schema_documents_the_loader_depth_gate(self) -> None:
-        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "frozen_workload.json"
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema = json.loads(schema_text("frozen_workload.json"))
         self.assertIn("MAX_JSON_DEPTH=64", schema["$comment"])
 
         nested: object = "leaf"

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import Artifact, file_identity, validate_relative_posix_path, verify_artifact
 from auto_mlx.errors import ArtifactIntegrityError, FailureCode, UnsafePathError
+from auto_mlx.schemas import schema_text
 import auto_mlx.paths as paths_module
 
 
@@ -55,8 +56,7 @@ class SafePathTests(unittest.TestCase):
         self.assertEqual(validate_relative_posix_path("nested/model.bin"), "nested/model.bin")
 
     def test_artifact_schema_and_python_reject_the_same_path_edge_cases(self) -> None:
-        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "artifact.json"
-        path_schema = json.loads(schema_path.read_text(encoding="utf-8"))["properties"]["path"]
+        path_schema = json.loads(schema_text("artifact.json"))["properties"]["path"]
         pattern = path_schema["pattern"]
         not_pattern = path_schema["not"]["pattern"]
         for raw in ("a/", "foo\n/../../bar", "foo\nbar", "a//b", "a/../b", "a\\b", "a\ud800b"):

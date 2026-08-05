@@ -28,10 +28,8 @@ auto-mlx = "auto_mlx.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.data-files]
-"schemas" = ["schemas/*.json"]
-"examples" = ["examples/*.json", "examples/README.md"]
-"docs" = ["docs/*.md"]
+[tool.setuptools.package-data]
+"auto_mlx.schemas" = ["*.json"]
 
 [tool.unittest]
 testpaths = ["tests"]

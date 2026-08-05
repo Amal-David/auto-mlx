@@ -29,6 +29,10 @@ The separation is intentional: a document can be valid without being runnable, a
 
 Canonical JSON is compact, sorted-key UTF-8 JSON with no floating-point values. Workload and candidate identity therefore binds all declared parameters, artifacts, knobs, provider, and configuration. Generic document inspection reports the SHA-256 of the canonical value; it does not grant that document receipt or promotion semantics.
 
+## JSON Schema documents
+
+The Draft 2020-12 schema for every G0 contract lives at `src/auto_mlx/schemas/*.json` and ships as an importable `auto_mlx.schemas` package resource (`from auto_mlx.schemas import schema_names, schema_text`), so external tooling can validate Auto MLX documents without importing the Python contract classes. This is the single source of truth for the schemas; they previously lived at a repo-root `schemas/` directory, which no longer exists. The schemas describe the same wire shape the `auto_mlx.contracts` and `auto_mlx.receipts` classes enforce in Python; `tests/test_schema_parity.py` checks the two stay in agreement.
+
 ## Design lessons versus evidence
 
 The architecture follows lessons from systems that separate candidate generation, measurement, and result application. Those are design inputs. This repository has measured no MLX speedup; a library being implemented is not evidence that production activation is safe. See [research-landscape.md](research-landscape.md) for source boundaries.

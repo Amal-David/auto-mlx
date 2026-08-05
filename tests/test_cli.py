@@ -526,8 +526,8 @@ class CLITests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         with (root / "pyproject.toml").open("rb") as handle:
             config = tomllib.load(handle)
-        data_files = config["tool"]["setuptools"]["data-files"]
-        self.assertEqual(data_files["schemas"], ["schemas/*.json"])
+        package_data = config["tool"]["setuptools"]["package-data"]
+        self.assertEqual(package_data["auto_mlx.schemas"], ["*.json"])
         self.assertEqual(config["project"]["license"], "MIT")
 
     def test_output_is_create_only(self) -> None:

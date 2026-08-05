@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_mlx import CandidateProvider, DeclarativeProvider, FrozenWorkload, Knob
 from auto_mlx.providers import MAX_PROVIDER_CONFIGS
 from auto_mlx.errors import ContractError, FailureCode, UnknownFieldError
+from auto_mlx.schemas import schema_text
 
 
 class ProviderTests(unittest.TestCase):
@@ -70,8 +71,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(context.exception.code, FailureCode.CONFIG_MISMATCH)
 
     def test_provider_schema_rejects_duplicate_configurations(self) -> None:
-        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "declarative_provider.json"
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        schema = json.loads(schema_text("declarative_provider.json"))
         self.assertTrue(schema["properties"]["configs"]["uniqueItems"])
         self.assertEqual(
             schema["properties"]["configs"]["items"]["additionalProperties"],

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 from importlib import metadata
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,6 +10,7 @@ import sys
 import sysconfig
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_NAMES = {
     "artifact.json",
     "candidate_proposal.json",
@@ -40,13 +41,26 @@ def main() -> int:
     parser.add_argument("--workdir", required=True, type=Path)
     parser.add_argument("--console-script", required=True, type=Path)
     args = parser.parse_args()
+
+    # This process runs with the wheel-installed venv's interpreter, so the
+    # package -- and its schemas, which ship as auto_mlx.schemas resources
+    # rather than loose files at the venv's data root -- is importable here.
+    from auto_mlx.schemas import schema_names, schema_text
+
+    installed_schema_names = set(schema_names())
+    if installed_schema_names != SCHEMA_NAMES:
+        raise AssertionError(f"installed schemas differ: {installed_schema_names}")
+    for schema_name in sorted(SCHEMA_NAMES):
+        payload = json.loads(schema_text(schema_name))
+        if not isinstance(payload, dict) or payload.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
+            raise AssertionError(f"invalid installed schema payload: {schema_name}")
+
+    # examples/ and docs/ are repo-only material and must not be installed
+    # into the wheel's data root at all.
     data_root = Path(sysconfig.get_path("data"))
-    example = data_root / "examples" / "workload.json"
-    if not example.is_file():
-        raise AssertionError(f"installed example is missing: {example}")
-    cli_doc = data_root / "docs" / "cli.md"
-    if not cli_doc.is_file():
-        raise AssertionError(f"installed CLI documentation is missing: {cli_doc}")
+    for leaked in (data_root / "examples", data_root / "docs", data_root / "schemas"):
+        if leaked.exists():
+            raise AssertionError(f"repo-only or relocated material leaked into the installed wheel: {leaked}")
 
     distribution = metadata.distribution("auto-mlx")
     if distribution.requires not in (None, []):
@@ -57,6 +71,12 @@ def main() -> int:
         if version_result.stdout.strip() != "auto-mlx 0.1.0":
             raise AssertionError(f"unexpected version output: {version_result.stdout!r}")
 
+    # examples/ ships in the sdist and the checkout, but never in the wheel;
+    # read the fixture straight from the checkout this script lives in.
+    example = PROJECT_ROOT / "examples" / "workload.json"
+    if not example.is_file():
+        raise AssertionError(f"example fixture is missing from the checkout: {example}")
+
     for command in (
         [sys.executable, "-m", "auto_mlx", "validate", "workload", "--input", str(example)],
         [str(args.console_script), "validate", "workload", "--input", str(example)],
@@ -65,16 +85,6 @@ def main() -> int:
         payload = json.loads(result.stdout)
         if payload.get("ok") is not True or payload.get("kind") != "workload":
             raise AssertionError(f"unexpected validation payload: {payload}")
-
-    schema_root = Path(sysconfig.get_path("data")) / "schemas"
-    installed_schema_names = {path.name for path in schema_root.glob("*.json")}
-    if installed_schema_names != SCHEMA_NAMES:
-        raise AssertionError(f"installed schemas differ: {installed_schema_names}")
-    for schema_name in sorted(SCHEMA_NAMES):
-        with (schema_root / schema_name).open(encoding="utf-8") as handle:
-            payload = json.load(handle)
-        if not isinstance(payload, dict) or payload.get("$schema") != "https://json-schema.org/draft/2020-12/schema":
-            raise AssertionError(f"invalid installed schema payload: {schema_name}")
     return 0
 
 

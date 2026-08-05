@@ -7,7 +7,7 @@
   "propertyNames": {"$ref": "#/$defs/no_surrogate_string"},
   "required": [
     "warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes", "thermal_gate_policy",
-    "k_repetitions", "max_measurement_runs", "min_effect_bps", "bootstrap_resamples", "calibration"
+    "k_repetitions", "max_measurement_runs", "min_effect_bps", "bootstrap_resamples", "calibration", "racing"
   ],
   "properties": {
     "warmup_runs": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -19,7 +19,8 @@
     "max_measurement_runs": {"type": "integer", "minimum": 1, "maximum": 100},
     "min_effect_bps": {"type": "integer", "minimum": 0, "maximum": 10000},
     "bootstrap_resamples": {"type": "integer", "minimum": 100, "maximum": 1000000},
-    "calibration": {"type": "boolean"}
+    "calibration": {"type": "boolean"},
+    "racing": {"type": "boolean"}
   },
   "$defs": {
     "no_surrogate_string": {

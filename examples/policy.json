@@ -8,5 +8,6 @@
   "max_measurement_runs": 20,
   "min_effect_bps": 200,
   "bootstrap_resamples": 10000,
-  "calibration": false
+  "calibration": false,
+  "racing": false
 }

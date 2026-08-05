@@ -553,6 +553,23 @@ class EvaluationPolicy:
     min_effect_bps: int = 200
     bootstrap_resamples: int = 10_000
     calibration: bool = False
+    # Wave C (auto_mlx.tuning): marks a policy used for racing a candidate
+    # against the baseline as part of a multi-candidate search rather than a
+    # single evaluate()/promote() decision.  The only behavioral effect is
+    # in the receipt wire's stopping-legitimacy check (see
+    # auto_mlx.receipts._validate_evaluator_bundle_wire): under ordinary
+    # (non-racing) policies, a sequential-sampling procedure may only stop
+    # on an inconclusive verdict at policy.max_measurement_runs -- stopping
+    # earlier would hide an unresolved result.  Racing legitimately stops a
+    # candidate's accrual earlier than that (elimination on statistical
+    # evidence that it cannot become a winner, or the race's own budget
+    # running out) without ever concealing anything: the stored verdict,
+    # CI, and block count remain the real, independently recomputed
+    # evidence: they are just allowed to be "inconclusive, stopped early"
+    # rather than forced to "inconclusive, ran to the cap". Default False
+    # everywhere outside auto_mlx.tuning, so this is a no-op for
+    # evaluate/promote/dispatch.
+    racing: bool = False
 
     def __post_init__(self) -> None:
         _integer(self.warmup_runs, label="warmup_runs", minimum=0, maximum=MAX_WARMUP_RUNS, bound_code=FailureCode.INVALID_POLICY)
@@ -599,6 +616,8 @@ class EvaluationPolicy:
         )
         if type(self.calibration) is not bool:
             raise ContractError("calibration must be a boolean", code=FailureCode.INVALID_POLICY)
+        if type(self.racing) is not bool:
+            raise ContractError("racing must be a boolean", code=FailureCode.INVALID_POLICY)
 
     @property
     def runs(self) -> int:
@@ -624,6 +643,7 @@ class EvaluationPolicy:
             "min_effect_bps": self.min_effect_bps,
             "bootstrap_resamples": self.bootstrap_resamples,
             "calibration": self.calibration,
+            "racing": self.racing,
         }
 
     def to_json(self) -> str:
@@ -637,6 +657,7 @@ class EvaluationPolicy:
             {
                 "warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes", "thermal_gate_policy",
                 "k_repetitions", "max_measurement_runs", "min_effect_bps", "bootstrap_resamples", "calibration",
+                "racing",
             },
             label="evaluation policy",
         )
@@ -651,6 +672,7 @@ class EvaluationPolicy:
             data["min_effect_bps"],
             data["bootstrap_resamples"],
             data["calibration"],
+            data["racing"],
         )
 
     @classmethod

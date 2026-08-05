@@ -60,6 +60,8 @@ _REQUIRED_ISOLATION: Final = frozenset({"network_denial", "descendant_containmen
 # oversized object is rejected before strict JSON parsing can accumulate it.
 MAX_STORED_RECEIPT_BYTES: Final = 8 * 1024 * 1024
 MAX_STORED_DECISION_BYTES: Final = 1 * 1024 * 1024
+MAX_STORED_TUNING_SUMMARY_BYTES: Final = 1 * 1024 * 1024
+MAX_STORED_HISTORY_INDEX_BYTES: Final = 1 * 1024 * 1024
 MAX_CURRENT_POINTER_BYTES: Final = 256
 _VALIDATION_TOKEN = object()
 # Unlike aggregates/oracle/compatibility/metrics (never legitimately null),
@@ -1328,7 +1330,25 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         # otherwise sequential extension should have continued (see
         # Evaluator.evaluate).  A decisive verdict may stop at any block
         # count in [measurement_runs, max_measurement_runs].
-        if expected_statistics.verdict == VERDICT_INCONCLUSIVE and block_count != policy.max_measurement_runs:
+        #
+        # Wave C (auto_mlx.tuning) exception: a policy explicitly marked
+        # ``racing`` may ALSO stop on an inconclusive verdict before the cap
+        # when the CI upper bound has already fallen below the min-effect
+        # threshold -- i.e. this candidate cannot become a winner no matter
+        # how many further blocks are added, so continuing to the cap would
+        # only spend budget confirming a foregone conclusion. This is
+        # independently re-verified here from the same recomputed CI/
+        # threshold every other statistics field is checked against, not
+        # merely trusted from the stored verdict -- a bug or forged receipt
+        # cannot claim an illegitimate early stop this way.
+        racing_eliminable = (
+            policy.racing and expected_statistics.ci_upper_ns < expected_statistics.min_effect_ns
+        )
+        if (
+            expected_statistics.verdict == VERDICT_INCONCLUSIVE
+            and block_count != policy.max_measurement_runs
+            and not racing_eliminable
+        ):
             raise ContractError(
                 "evaluation stopped on an inconclusive verdict before reaching the sequential sampling cap",
                 code=FailureCode.INVALID_VALUE,
@@ -2105,6 +2125,8 @@ def _read_existing(root: str | os.PathLike[str], kind: str, identity: str) -> by
         read_cap = MAX_STORED_RECEIPT_BYTES
     elif kind == "decisions":
         read_cap = MAX_STORED_DECISION_BYTES
+    elif kind == "tuning_summaries":
+        read_cap = MAX_STORED_TUNING_SUMMARY_BYTES
     else:
         raise ContractError("unknown content-addressed object kind", code=FailureCode.INVALID_VALUE)
     root_fd = _open_or_create_absolute_directory(root)
@@ -2133,6 +2155,41 @@ def _read_existing(root: str | os.PathLike[str], kind: str, identity: str) -> by
     finally:
         if fd is not None:
             os.close(fd)
+        if kind_fd is not None:
+            os.close(kind_fd)
+        os.close(root_fd)
+
+
+def _list_kind_ids(root: str | os.PathLike[str], kind: str) -> tuple[str, ...]:
+    """Every valid content-addressed identity stored under one store kind.
+
+    Fails open (empty tuple) on a kind directory that does not exist yet --
+    listing a fresh store before anything of that kind was ever written is
+    not an error. A stray or malformed filename is skipped rather than
+    raised on: this is a read-only enumeration aid (Wave C's ``history``
+    command), not itself a trust boundary -- every id it returns is still
+    independently re-verified by :meth:`ContentAddressedStore.get_receipt`/
+    ``get_tuning_summary`` before any of its content is trusted.
+    """
+
+    root_fd = _open_or_create_absolute_directory(root)
+    kind_fd: int | None = None
+    try:
+        try:
+            kind_fd = _open_child_directory(root_fd, kind, create=False)
+        except FileNotFoundError:
+            return ()
+        identities: list[str] = []
+        for name in os.listdir(kind_fd):
+            if not name.endswith(".json"):
+                continue
+            candidate = name[: -len(".json")]
+            try:
+                identities.append(validate_sha256(candidate))
+            except ContractError:
+                continue
+        return tuple(sorted(identities))
+    finally:
         if kind_fd is not None:
             os.close(kind_fd)
         os.close(root_fd)
@@ -2225,6 +2282,116 @@ def _read_pointer(root: str | os.PathLike[str], name: str) -> str:
         os.close(root_fd)
 
 
+def _history_index_name(workload_hash: str, runtime_identity: str) -> str:
+    """A stable, content-addressed index filename for one (workload, runtime) pair.
+
+    Wave C (``auto-mlx tune``/``history``): tuning summaries are immutable,
+    content-addressed objects with no identity that names the workload or
+    runtime they came from, so a caller cannot enumerate "prior summaries
+    for workload X on this machine" from the summary store alone (exactly
+    like receipts -- see the module docstring).  This index is the one
+    piece of *mutable* state Wave C introduces: an append-only, atomically
+    replaced list of summary_ids, keyed by a hash of the (workload_hash,
+    runtime_identity) pair it belongs to -- deliberately mirroring
+    MetaSchedule's split between an immutable tuning record and a mutable
+    workload-identity-keyed index into those records.
+    """
+
+    validate_sha256(workload_hash)
+    validate_sha256(runtime_identity)
+    return sha256_hex({"workload_hash": workload_hash, "runtime_identity": runtime_identity})
+
+
+def _write_history_index(
+    root: str | os.PathLike[str],
+    index_name: str,
+    summary_ids: Sequence[str],
+    *,
+    durability: list[bool] | None = None,
+) -> Path:
+    validate_sha256(index_name)
+    for summary_id in summary_ids:
+        validate_sha256(summary_id)
+    payload = canonical_bytes(list(summary_ids))
+    if len(payload) > MAX_STORED_HISTORY_INDEX_BYTES:
+        raise ContractError("tuning history index exceeds its byte cap", code=FailureCode.IDENTITY_MISMATCH)
+    root_fd = _open_or_create_absolute_directory(root)
+    history_fd: int | None = None
+    tmp_name = f".{index_name}.{uuid.uuid4().hex}.tmp"
+    sync_error: OSError | None = None
+    try:
+        history_fd = _open_child_directory(root_fd, "tuning_history", create=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(tmp_name, flags, 0o644, dir_fd=history_fd)
+        try:
+            os.write(fd, payload)
+            try:
+                if durability is not None:
+                    durability[0] = durability[0] and _fsync(fd)
+                else:
+                    _fsync(fd)
+            except OSError as exc:
+                sync_error = exc
+        finally:
+            os.close(fd)
+        os.replace(tmp_name, f"{index_name}.json", src_dir_fd=history_fd, dst_dir_fd=history_fd)
+        try:
+            if durability is not None:
+                durability[0] = durability[0] and _fsync(history_fd)
+                durability[0] = durability[0] and _fsync(root_fd)
+            else:
+                _fsync(history_fd)
+                _fsync(root_fd)
+        except OSError as exc:
+            if sync_error is None:
+                sync_error = exc
+        if sync_error is not None:
+            raise sync_error
+        return Path(os.fspath(root)) / "tuning_history" / f"{index_name}.json"
+    finally:
+        if history_fd is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=history_fd)
+            except FileNotFoundError:
+                pass
+            os.close(history_fd)
+        os.close(root_fd)
+
+
+def _read_history_index(root: str | os.PathLike[str], index_name: str) -> tuple[str, ...]:
+    validate_sha256(index_name)
+    root_fd = _open_or_create_absolute_directory(root)
+    history_fd: int | None = None
+    fd: int | None = None
+    try:
+        history_fd = _open_child_directory(root_fd, "tuning_history", create=False)
+        flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
+        fd = os.open(f"{index_name}.json", flags, dir_fd=history_fd)
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = None
+            payload = handle.read(MAX_STORED_HISTORY_INDEX_BYTES + 1)
+            if len(payload) > MAX_STORED_HISTORY_INDEX_BYTES:
+                raise ContractError("tuning history index exceeds its byte cap", code=FailureCode.IDENTITY_MISMATCH)
+        parsed = strict_json_loads(payload)
+        if canonical_bytes(parsed) != payload:
+            raise ContractError("stored tuning history index is not canonical", code=FailureCode.IDENTITY_MISMATCH)
+        if type(parsed) is not list or any(type(item) is not str for item in parsed):
+            raise ContractError("stored tuning history index must be an array of strings", code=FailureCode.WRONG_TYPE)
+        for summary_id in parsed:
+            validate_sha256(summary_id)
+        return tuple(parsed)
+    except FileNotFoundError:
+        return ()
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if history_fd is not None:
+            os.close(history_fd)
+        os.close(root_fd)
+
+
 class ContentAddressedStore:
     """Filesystem store with immutable objects and atomic mutable pointers."""
 
@@ -2276,6 +2443,16 @@ class ContentAddressedStore:
 
     read_receipt = get_receipt
     load_receipt = get_receipt
+
+    def list_receipt_ids(self) -> tuple[str, ...]:
+        """Every receipt_id stored under this store's ``receipts`` kind.
+
+        Read-only enumeration for ``auto-mlx history`` (see
+        ``auto_mlx.tuning.list_tuning_history``); callers still independently
+        re-verify each entry through :meth:`get_receipt` before trusting it.
+        """
+
+        return _list_kind_ids(self.root, "receipts")
 
     def validate_stored_receipt(self, receipt_id: str, **kwargs: Any) -> ReceiptValidation:
         try:
@@ -2377,6 +2554,104 @@ class ContentAddressedStore:
 
     current_id = current_decision_id
 
+    def put_tuning_summary(self, summary: ContractMapping | Mapping[str, Any], *, require_durable: bool = False) -> Path:
+        """Store a Wave C tuning summary content-addressed, alongside receipts.
+
+        Imports :class:`auto_mlx.tune.TuningSummary` lazily -- the same
+        deliberate late-import used by ``put_decision``/``get_decision`` for
+        :class:`auto_mlx.promotion.PromotionDecision`, so this module never
+        gains a module-level dependency on the tuning layer built on top of
+        it.
+        """
+
+        data = summary.to_dict() if hasattr(summary, "to_dict") else dict(summary)
+        from .tuning import TuningSummary
+
+        parsed_summary = TuningSummary.from_dict(data)
+        data = parsed_summary.to_dict()
+        identity = data.get("summary_id")
+        if type(identity) is not str:
+            raise ContractError("tuning summary must expose summary_id", code=FailureCode.WRONG_TYPE)
+        body = dict(data)
+        body.pop("summary_id", None)
+        if identity != sha256_hex(body):
+            raise ContractError("cannot store tuning summary with a forged identity", code=FailureCode.IDENTITY_MISMATCH)
+        durability = [True]
+        try:
+            result = _write_exclusive_json(
+                self.root,
+                "tuning_summaries",
+                identity,
+                canonical_bytes(data),
+                durability=durability,
+            )
+        except FileExistsError:
+            raise
+        except OSError as exc:
+            raise self._durability_error() from exc
+        self._last_durable = durability[0]
+        if require_durable and not durability[0]:
+            raise self._durability_error()
+        return result
+
+    store_tuning_summary = put_tuning_summary
+    write_tuning_summary = put_tuning_summary
+
+    def get_tuning_summary(self, summary_id: str) -> dict[str, Any]:
+        payload = _read_existing(self.root, "tuning_summaries", summary_id)
+        parsed = strict_json_loads(payload)
+        if canonical_bytes(parsed) != payload:
+            raise ContractError("stored tuning summary is not canonical", code=FailureCode.IDENTITY_MISMATCH)
+        if not isinstance(parsed, dict) or parsed.get("summary_id") != summary_id:
+            raise ContractError("stored tuning summary identity does not match path", code=FailureCode.IDENTITY_MISMATCH)
+        body = dict(parsed)
+        body.pop("summary_id", None)
+        if sha256_hex(body) != summary_id:
+            raise ContractError("stored tuning summary hash does not match body", code=FailureCode.IDENTITY_MISMATCH)
+        from .tuning import TuningSummary
+
+        TuningSummary.from_dict(parsed)
+        return parsed
+
+    read_tuning_summary = get_tuning_summary
+    load_tuning_summary = get_tuning_summary
+
+    def list_tuning_summary_ids(self) -> tuple[str, ...]:
+        """Every summary_id stored under this store's ``tuning_summaries`` kind.
+
+        Read-only enumeration for ``auto-mlx history``; callers still
+        independently re-verify each entry through :meth:`get_tuning_summary`
+        before trusting it.
+        """
+
+        return _list_kind_ids(self.root, "tuning_summaries")
+
+    def append_tuning_history(self, workload_hash: str, runtime_identity: str, summary_id: str, *, require_durable: bool = False) -> Path:
+        """Append ``summary_id`` to the (workload, runtime) history index.
+
+        Read-modify-write over the small atomic-replace index (see
+        ``_write_history_index``/``_read_history_index`` above) -- adequate
+        for this store's local, single-operator scope (the same scope every
+        other mutable pointer in this module already assumes). A
+        already-present summary_id is not duplicated.
+        """
+
+        validate_sha256(summary_id)
+        index_name = _history_index_name(workload_hash, runtime_identity)
+        existing = _read_history_index(self.root, index_name)
+        if summary_id in existing:
+            return Path(os.fspath(self.root)) / "tuning_history" / f"{index_name}.json"
+        durability = [True]
+        result = _write_history_index(self.root, index_name, existing + (summary_id,), durability=durability)
+        self._last_durable = durability[0]
+        if require_durable and not durability[0]:
+            raise self._durability_error()
+        return result
+
+    def list_tuning_history(self, workload_hash: str, runtime_identity: str) -> tuple[str, ...]:
+        index_name = _history_index_name(workload_hash, runtime_identity)
+        return _read_history_index(self.root, index_name)
+
 
 def receipt_identity(value: Receipt | Mapping[str, Any]) -> str:
     receipt = value if isinstance(value, Receipt) else Receipt.from_dict(value)
@@ -2400,6 +2675,8 @@ __all__: Final = [
     "CLAIMS_WITHHELD",
     "ContentAddressedStore",
     "ContractMapping",
+    "MAX_STORED_HISTORY_INDEX_BYTES",
+    "MAX_STORED_TUNING_SUMMARY_BYTES",
     "NATIVE_FALLBACK",
     "RawSample",
     "RECEIPT_SCHEMA",

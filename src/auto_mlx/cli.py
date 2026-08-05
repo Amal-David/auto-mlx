@@ -60,6 +60,7 @@ from .runners import BASELINE_RUNNER_ID, CANDIDATE_RUNNER_ID, register_reference
 from .sandbox import LocalSandboxAuthority, LocalSandboxProvider
 from . import store_config
 from .supervisor import attest_receipt
+from . import tune as tune_module
 
 
 EXIT_OK: Final = 0
@@ -258,6 +259,60 @@ def _context_document_arguments(
         parser.add_argument("--bootstrap-resamples", type=int, help="override policy.bootstrap_resamples")
 
 
+def _tune_context_arguments(parser: argparse.ArgumentParser) -> None:
+    """Flags for ``tune``: like ``evaluate``'s context, but a provider grid, not one candidate."""
+
+    parser.add_argument("--workload", required=True, help="workload document path")
+    parser.add_argument(
+        "--provider", required=True, help="declarative provider document path (the knob grid to race)"
+    )
+    parser.add_argument("--policy", help="evaluation policy document path (defaults to policy defaults)")
+    parser.add_argument(
+        "--runtime",
+        help="runtime identity document path; if given, must match this host's current runtime identity "
+        "(defaults to this host's current runtime identity)",
+    )
+    parser.add_argument(
+        "--artifact-root",
+        required=True,
+        help="local root the evaluator reads and verifies workload artifacts against",
+    )
+    parser.add_argument(
+        "--store", help="receipt/decision/tuning-summary store root (defaults to AUTO_MLX_STORE or ./auto-mlx-store)"
+    )
+    parser.add_argument(
+        "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
+    )
+    parser.add_argument(
+        "--samples", type=int, dest="measurement_runs",
+        help="override policy.measurement_runs (starting/minimum blocks per racing rung)",
+    )
+    parser.add_argument("--warmup-runs", type=int, help="override policy.warmup_runs")
+    parser.add_argument("--timeout-seconds", type=int, help="override policy.timeout_seconds")
+    parser.add_argument("--max-output-bytes", type=int, help="override policy.max_output_bytes")
+    parser.add_argument("--k-repetitions", type=int, help="override policy.k_repetitions (in-runner timed iterations)")
+    parser.add_argument(
+        "--max-measurement-runs", type=int,
+        help="override policy.max_measurement_runs (per-candidate racing ladder cap)",
+    )
+    parser.add_argument(
+        "--min-effect-bps", type=int,
+        help="override policy.min_effect_bps (promotion and racing-futility threshold, basis points)",
+    )
+    parser.add_argument("--bootstrap-resamples", type=int, help="override policy.bootstrap_resamples")
+    parser.add_argument(
+        "--budget-measurements", type=int,
+        help="stop racing once this many total measurement blocks have been spent across all candidates",
+    )
+    parser.add_argument(
+        "--budget-seconds", type=int, help="stop racing once this many seconds have elapsed"
+    )
+    parser.add_argument(
+        "--max-candidates", type=int,
+        help="race at most this many pre-filtered candidates (kept in provider/warm-start order)",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = JSONArgumentParser(
         prog="auto-mlx",
@@ -341,6 +396,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rollback_parser.add_argument("--store", help="receipt/decision store root (defaults to AUTO_MLX_STORE or ./auto-mlx-store)")
     rollback_parser.add_argument(
+        "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
+    )
+
+    tune_parser = subparsers.add_parser(
+        "tune",
+        help="race a provider's declarative knob grid against the baseline and store a tuning summary",
+        description="Enumerate a declarative provider's candidate grid, pre-filter configs the workload's own "
+        "knob contract excludes, race surviving candidates against the baseline under statistical elimination, "
+        "and store a content-addressed tuning summary alongside a full attested receipt for every measured "
+        "candidate. Requires the local sandbox execution primitives; fails closed with exit code 4 otherwise.",
+        allow_abbrev=False,
+    )
+    _tune_context_arguments(tune_parser)
+
+    history_parser = subparsers.add_parser(
+        "history",
+        help="list prior tuning summaries for a workload identity on this runtime",
+        description="List content-addressed tuning summaries previously stored by `auto-mlx tune` for the "
+        "exact (workload, runtime identity) pair; a mismatched workload or runtime finds no history.",
+        allow_abbrev=False,
+    )
+    history_parser.add_argument("--workload", required=True, help="workload document path")
+    history_parser.add_argument(
+        "--runtime",
+        help="runtime identity document path; if given, must match this host's current runtime identity "
+        "(defaults to this host's current runtime identity)",
+    )
+    history_parser.add_argument(
+        "--store", help="receipt/decision/tuning-summary store root (defaults to AUTO_MLX_STORE or ./auto-mlx-store)"
+    )
+    history_parser.add_argument(
         "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
     )
 
@@ -1084,17 +1170,7 @@ def _load_evaluation_context(
     else:
         policy = EvaluationPolicy()
     policy = _apply_policy_overrides(policy, args)
-    if args.runtime is not None:
-        runtime_value = _read_document_json(args.runtime, kind="runtime")
-        runtime = _as_document("runtime", runtime_value, workload_value=None, artifact_root=None)
-        current = RuntimeIdentity.current()
-        if runtime.identity != current.identity:
-            raise ContractError(
-                "--runtime document does not match this host's current runtime identity",
-                code=FailureCode.IDENTITY_MISMATCH,
-            )
-    else:
-        runtime = RuntimeIdentity.current()
+    runtime = _resolve_current_runtime(args)
     return workload, candidate, policy, runtime
 
 
@@ -1293,6 +1369,159 @@ def _run_dispatch_command(args: argparse.Namespace) -> dict[str, Any]:
     return output
 
 
+def _load_tune_context(
+    args: argparse.Namespace,
+) -> tuple[FrozenWorkload, DeclarativeProvider, EvaluationPolicy, RuntimeIdentity]:
+    artifact_root = args.artifact_root
+    workload_value = _read_document_json(args.workload, kind="workload")
+    workload = _as_document("workload", workload_value, workload_value=None, artifact_root=artifact_root)
+    provider_value = _read_document_json(args.provider, kind="provider")
+    provider = _as_document("provider", provider_value, workload_value=None, artifact_root=None)
+    if args.policy is not None:
+        policy_value = _read_document_json(args.policy, kind="policy")
+        policy = _as_document("policy", policy_value, workload_value=None, artifact_root=None)
+    else:
+        policy = EvaluationPolicy()
+    policy = _apply_policy_overrides(policy, args)
+    runtime = _resolve_current_runtime(args)
+    return workload, provider, policy, runtime
+
+
+def _resolve_current_runtime(args: argparse.Namespace) -> RuntimeIdentity:
+    if args.runtime is not None:
+        runtime_value = _read_document_json(args.runtime, kind="runtime")
+        runtime = _as_document("runtime", runtime_value, workload_value=None, artifact_root=None)
+        current = RuntimeIdentity.current()
+        if runtime.identity != current.identity:
+            raise ContractError(
+                "--runtime document does not match this host's current runtime identity",
+                code=FailureCode.IDENTITY_MISMATCH,
+            )
+        return runtime
+    return RuntimeIdentity.current()
+
+
+def _run_tune_command(args: argparse.Namespace) -> dict[str, Any]:
+    workload, provider, policy, runtime = _load_tune_context(args)
+    artifact_root = args.artifact_root
+
+    registry = TrustedRunnerRegistry()
+    baseline_runner_id, candidate_runner_id = _resolve_workload_runners(workload, registry)
+
+    _require_local_sandbox(stage="G1")
+
+    legal, pruned = tune_module.prefilter_candidates(provider, workload)
+    considered = len(provider.configs)
+    ordered_capped, max_candidates_dropped = tune_module.apply_max_candidates(legal, args.max_candidates)
+
+    store = store_config.open_store(args.store, key_dir=args.key_dir)
+    ordered = tune_module.warm_start_order(
+        ordered_capped, store=store, workload_hash=workload.workload_hash, runtime_identity=runtime.identity
+    )
+
+    if ordered:
+        probe_execution_policy = _execution_policy_from_evaluation_policy(policy)
+        probe_plan = build_execution_plan(ordered[0], registry, baseline_runner_id, artifact_root)
+        probe_record = probe_plan.execute(
+            probe_execution_policy,
+            registry=registry,
+            provider=LocalSandboxProvider(),
+            authority=LocalSandboxAuthority(),
+        )
+        if probe_record.status is not ExecutionStatus.SUCCESS:
+            detail = probe_record.failure.message if probe_record.failure is not None else probe_record.status.value
+            raise ContractError(
+                f"baseline probe execution did not succeed: {detail}",
+                code=FailureCode.RUNTIME_FAILURE,
+            )
+        oracle = ExactOutputOracle(probe_record.stdout)
+        key = keys_module.ensure_attestation_key(key_dir=args.key_dir)
+
+        def run_rung(candidate: CandidateProposal, rung_policy: EvaluationPolicy):
+            rung_execution_policy = _execution_policy_from_evaluation_policy(rung_policy)
+            evaluator = Evaluator(
+                registry,
+                baseline_runner_id=baseline_runner_id,
+                candidate_runner_id=candidate_runner_id,
+                oracle=oracle,
+                artifact_root=artifact_root,
+                policy=rung_policy,
+                execution_policy=rung_execution_policy,
+                provider=LocalSandboxProvider(),
+                authority=LocalSandboxAuthority(),
+            )
+            return evaluator.evaluate(candidate)
+
+        def store_rung_receipt(bundle: Any, candidate: CandidateProposal, rung_policy: EvaluationPolicy) -> tuple[str, bool]:
+            receipt = Receipt.from_observation_bundle(
+                bundle, workload, candidate, rung_policy, oracle=oracle, created_at_ns=time.time_ns()
+            )
+            store.put_receipt(receipt, require_durable=True)
+            attested = False
+            try:
+                attest_receipt(receipt, key, artifact_root=artifact_root)
+                attested = True
+            except SupervisorRefusalError:
+                pass
+            return receipt.receipt_id, attested
+
+        outcome = tune_module.race_candidates(
+            candidates=ordered,
+            base_policy=policy,
+            run_rung=run_rung,
+            store_receipt=store_rung_receipt,
+            budget_measurements=args.budget_measurements,
+            budget_seconds=args.budget_seconds,
+        )
+    else:
+        outcome = tune_module.RaceOutcome(
+            entrants=(),
+            incumbent=None,
+            blocks_spent=0,
+            seconds_spent_ns=0,
+            budget_measurements=args.budget_measurements,
+            budget_seconds=args.budget_seconds,
+            budget_exhausted=False,
+        )
+
+    summary = tune_module.build_tuning_summary(
+        workload_hash=workload.workload_hash,
+        runtime=runtime,
+        provider_id=provider.provider_id,
+        base_policy=policy,
+        considered=considered,
+        pruned=pruned,
+        max_candidates=args.max_candidates,
+        max_candidates_dropped=max_candidates_dropped,
+        outcome=outcome,
+    )
+    store.put_tuning_summary(summary, require_durable=True)
+    store.append_tuning_history(workload.workload_hash, runtime.identity, summary.summary_id, require_durable=True)
+
+    result = summary.to_dict()
+    result["ok"] = True
+    result["command"] = "tune"
+    result["store"] = str(store.root)
+    return result
+
+
+def _run_history_command(args: argparse.Namespace) -> dict[str, Any]:
+    workload_value = _read_document_json(args.workload, kind="workload")
+    workload = _as_document("workload", workload_value, workload_value=None, artifact_root=None)
+    runtime = _resolve_current_runtime(args)
+    store = store_config.open_store(args.store, key_dir=args.key_dir)
+    summary_ids = store.list_tuning_history(workload.workload_hash, runtime.identity)
+    summaries = [store.get_tuning_summary(summary_id) for summary_id in summary_ids]
+    return {
+        "ok": True,
+        "command": "history",
+        "workload_hash": workload.workload_hash,
+        "runtime_id": runtime.identity,
+        "store": str(store.root),
+        "summaries": summaries,
+    }
+
+
 def _run_rollback_command(args: argparse.Namespace) -> dict[str, Any]:
     store = store_config.open_store(args.store, key_dir=args.key_dir)
     decision = rollback_decision(store, now_ns=time.time_ns())
@@ -1333,6 +1562,8 @@ _COMMAND_HANDLERS: Final[dict[str, Callable[[argparse.Namespace], dict[str, Any]
     "evaluate": _run_evaluate_command,
     "promote": _run_promote_command,
     "dispatch": _run_dispatch_command,
+    "tune": _run_tune_command,
+    "history": _run_history_command,
     "rollback": _run_rollback_command,
     "keys": _run_keys_command,
 }

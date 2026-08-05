@@ -47,6 +47,10 @@ class FailureCode(str, Enum):
     PROMOTION_REJECTED = "promotion_rejected"
     FALLBACK = "fallback"
     INPUT_TOO_LARGE = "input_too_large"
+    KEY_MATERIAL_MISSING = "key_material_missing"
+    KEY_MATERIAL_INVALID = "key_material_invalid"
+    SUPERVISOR_REFUSED = "supervisor_refused"
+    STORE_CONFIG_INVALID = "store_config_invalid"
 
 
 MAX_JSON_DEPTH: Final = 64
@@ -178,6 +182,38 @@ class UnsafePathError(ContractError):
 
 class ArtifactIntegrityError(ContractError):
     code = FailureCode.ARTIFACT_DIGEST_MISMATCH
+
+
+class KeyMaterialError(AutoMLXError):
+    """Raised when local attestation-key generation, storage, or loading fails closed.
+
+    Never carries or logs the key itself -- only ever a description of what
+    permission, symlink, or size check failed.  See ``auto_mlx.keys``.
+    """
+
+    code = FailureCode.KEY_MATERIAL_INVALID
+
+
+class SupervisorRefusalError(AutoMLXError):
+    """Raised when the local supervisor declines to attest a receipt.
+
+    See ``auto_mlx.supervisor.attest_receipt`` -- this is the ONLY code path
+    that mints a receipt attestation, and it raises this (never a silent
+    False) on any independent-recompute, identity, or evidence-chain
+    mismatch.
+    """
+
+    code = FailureCode.SUPERVISOR_REFUSED
+
+
+class StoreConfigError(AutoMLXError):
+    """Raised when the resolved receipt-store root and key directory conflict.
+
+    See ``auto_mlx.store_config`` -- the store root and the attestation key
+    directory must never nest inside one another.
+    """
+
+    code = FailureCode.STORE_CONFIG_INVALID
 
 
 # A short neutral name is useful to later runner/promotion code without making

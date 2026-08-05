@@ -1,88 +1,104 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 import re
 import sys
+from pathlib import Path
 import unittest
 
 try:
     import jsonschema
-except ImportError:  # pragma: no cover - the project itself has no test dependencies
+except ImportError:  # pragma: no cover - jsonschema is an optional test-time dependency
     jsonschema = None  # type: ignore[assignment]
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import validate_relative_posix_path
 from auto_mlx.errors import UnsafePathError
+from auto_mlx.schemas import schema_names, schema_text
+import json as _json
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_NO_JSONSCHEMA_REASON = "jsonschema is not installed; install it to exercise the live Draft 2020-12 validator"
+_SKIP_WITHOUT_JSONSCHEMA = unittest.skipIf(jsonschema is None, _NO_JSONSCHEMA_REASON)
+
+
+def _schema(name: str) -> dict[str, object]:
+    return _json.loads(schema_text(name))
 
 
 class SchemaParityTests(unittest.TestCase):
-    def _schema(self, name: str) -> dict[str, object]:
-        with (PROJECT_ROOT / "schemas" / name).open(encoding="utf-8") as handle:
-            return json.load(handle)
-
-    def test_checked_in_schemas_parse_and_are_valid_draft_2020_12_documents(self) -> None:
-        schema_paths = sorted((PROJECT_ROOT / "schemas").glob("*.json"))
-        self.assertTrue(schema_paths)
-        for path in schema_paths:
-            with self.subTest(schema=path.name):
-                schema = self._schema(path.name)
+    def test_checked_in_schemas_declare_draft_2020_12(self) -> None:
+        names = schema_names()
+        self.assertTrue(names)
+        for name in names:
+            with self.subTest(schema=name):
+                schema = _schema(name)
                 self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
-                if jsonschema is not None:
-                    jsonschema.Draft202012Validator.check_schema(schema)
 
-    def test_artifact_schema_rejects_surrogate_paths_and_python_matches(self) -> None:
-        schema = self._schema("artifact.json")
+    @_SKIP_WITHOUT_JSONSCHEMA
+    def test_checked_in_schemas_are_valid_draft_2020_12_documents(self) -> None:
+        for name in schema_names():
+            with self.subTest(schema=name):
+                jsonschema.Draft202012Validator.check_schema(_schema(name))
+
+    def test_artifact_schema_pattern_rejects_surrogate_paths_and_python_matches(self) -> None:
+        schema = _schema("artifact.json")
         path_schema = schema["properties"]["path"]  # type: ignore[index]
         invalid_path = "nested/model\ud800.bin"
-        instance = {"path": invalid_path, "sha256": "0" * 64, "size_bytes": 0}
-        if jsonschema is not None:
-            errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
-            self.assertTrue(any(error.validator == "not" for error in errors))
-        else:
-            self.assertIsNotNone(re.search(path_schema["not"]["pattern"], invalid_path))  # type: ignore[index]
+        self.assertIsNotNone(re.search(path_schema["not"]["pattern"], invalid_path))  # type: ignore[index]
         with self.assertRaises(UnsafePathError):
             validate_relative_posix_path(invalid_path)
 
-    def test_declarative_provider_schema_rejects_duplicate_normalized_configs(self) -> None:
-        schema = self._schema("declarative_provider.json")
+    @_SKIP_WITHOUT_JSONSCHEMA
+    def test_artifact_schema_live_validator_rejects_surrogate_paths(self) -> None:
+        schema = _schema("artifact.json")
+        invalid_path = "nested/model\ud800.bin"
+        instance = {"path": invalid_path, "sha256": "0" * 64, "size_bytes": 0}
+        errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
+        self.assertTrue(any(error.validator == "not" for error in errors))
+
+    def test_declarative_provider_schema_declares_unique_configs(self) -> None:
+        schema = _schema("declarative_provider.json")
+        self.assertTrue(schema["properties"]["configs"]["uniqueItems"])  # type: ignore[index]
+
+    @_SKIP_WITHOUT_JSONSCHEMA
+    def test_declarative_provider_schema_live_validator_rejects_duplicate_normalized_configs(self) -> None:
+        schema = _schema("declarative_provider.json")
         instance = {
             "provider_id": "grid",
             "configs": [{"mode": "a", "threads": 1}, {"threads": 1, "mode": "a"}],
         }
-        self.assertTrue(schema["properties"]["configs"]["uniqueItems"])  # type: ignore[index]
-        if jsonschema is not None:
-            errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
-            self.assertTrue(any(error.validator == "uniqueItems" for error in errors))
+        errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
+        self.assertTrue(any(error.validator == "uniqueItems" for error in errors))
 
-    def test_knob_schema_rejects_surrogate_enum_values(self) -> None:
-        schema = self._schema("knob.json")
+    def test_knob_schema_pattern_rejects_surrogate_enum_values(self) -> None:
+        schema = _schema("knob.json")
         instance = {"name": "mode", "type": "enum", "values": ["bad\ud800"], "minimum": None, "maximum": None}
-        if jsonschema is not None:
-            errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
-            self.assertTrue(any(error.validator == "not" for error in errors))
-        else:
-            pattern = schema["allOf"][0]["then"]["properties"]["values"]["items"]["not"]["pattern"]  # type: ignore[index]
-            self.assertIsNotNone(re.search(pattern, instance["values"][0]))  # type: ignore[arg-type]
+        pattern = schema["allOf"][0]["then"]["properties"]["values"]["items"]["not"]["pattern"]  # type: ignore[index]
+        self.assertIsNotNone(re.search(pattern, instance["values"][0]))  # type: ignore[arg-type]
+
+    @_SKIP_WITHOUT_JSONSCHEMA
+    def test_knob_schema_live_validator_rejects_surrogate_enum_values(self) -> None:
+        schema = _schema("knob.json")
+        instance = {"name": "mode", "type": "enum", "values": ["bad\ud800"], "minimum": None, "maximum": None}
+        errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
+        self.assertTrue(any(error.validator == "not" for error in errors))
 
     def test_all_schema_objects_have_reusable_no_surrogate_property_name_constraints(self) -> None:
-        for path in sorted((PROJECT_ROOT / "schemas").glob("*.json")):
-            with self.subTest(schema=path.name):
-                schema = self._schema(path.name)
+        for name in schema_names():
+            with self.subTest(schema=name):
+                schema = _schema(name)
                 self.assertEqual(schema["propertyNames"], {"$ref": "#/$defs/no_surrogate_string"})
                 self.assertIn("no_surrogate_string", schema["$defs"])
 
-        workload = self._schema("frozen_workload.json")
+        workload = _schema("frozen_workload.json")
         self.assertEqual(
             workload["$defs"]["json_value"]["oneOf"][5]["propertyNames"],
             {"$ref": "#/$defs/no_surrogate_string"},
         )
         self.assertEqual(workload["properties"]["knobs"]["maxItems"], 64)
 
+    @_SKIP_WITHOUT_JSONSCHEMA
     def test_live_draft_2020_12_validators_reject_surrogates_on_every_schema_surface(self) -> None:
         cases = (
             ("artifact.json", {"path": "model\ud800.bin", "sha256": "0" * 64, "size_bytes": 0}),
@@ -102,15 +118,12 @@ class SchemaParityTests(unittest.TestCase):
         )
         for schema_name, instance in cases:
             with self.subTest(schema=schema_name, instance=repr(instance)):
-                schema = self._schema(schema_name)
-                if jsonschema is not None:
-                    errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
-                    self.assertTrue(errors)
-                else:
-                    self.assertEqual(schema["propertyNames"], {"$ref": "#/$defs/no_surrogate_string"})
+                schema = _schema(schema_name)
+                errors = list(jsonschema.Draft202012Validator(schema).iter_errors(instance))
+                self.assertTrue(errors)
 
     def test_recursive_workload_schema_calls_out_to_loader_depth_gate(self) -> None:
-        schema = self._schema("frozen_workload.json")
+        schema = _schema("frozen_workload.json")
         self.assertIn("MAX_JSON_DEPTH=64", schema["$comment"])
         self.assertIn("recursive", schema["$comment"])
 

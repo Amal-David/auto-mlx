@@ -187,8 +187,21 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(make_promotion_decision(forged, attestation_key=self.key).action, NATIVE)
 
     def test_activation_requires_exact_receipt_in_immutable_store(self) -> None:
-        with tempfile.TemporaryDirectory() as store_root, tempfile.TemporaryDirectory() as artifact_root:
+        # Both roots must be resolved before use: macOS puts TemporaryDirectory
+        # paths under /var, a symlink to /private/var, and the descriptor-relative
+        # no-follow walk in paths.py._open_root_directory (exercised via
+        # validate_receipt's artifact_root check) correctly refuses to cross it.
+        # Left unresolved, validate_receipt would fail on that spurious
+        # ARTIFACT_SYMLINK before activate() ever reaches the store lookup this
+        # test means to exercise, and the assertion below would pass for the
+        # wrong reason.
+        with tempfile.TemporaryDirectory() as raw_store_root, tempfile.TemporaryDirectory() as raw_artifact_root:
+            store_root = str(Path(raw_store_root).resolve())
+            artifact_root = str(Path(raw_artifact_root).resolve())
             store = ContentAddressedStore(store_root)
+            # The receipt is deliberately never put into `store`, so a
+            # legitimately ACTIVATE-eligible decision must still be rejected
+            # once activate() tries to load it back from the immutable store.
             rejected = activate(
                 store,
                 self.validation(artifact_root),
@@ -197,11 +210,19 @@ class PromotionTests(unittest.TestCase):
                 now_ns=110,
             )
             self.assertEqual(rejected.action, NATIVE)
+            self.assertEqual(rejected.reason, f"activation_rejected:{FailureCode.ARTIFACT_MISSING.value}")
             self.assertEqual(store.current_decision_id(), "native_fallback")
 
     def test_fsync_failure_surfaces_and_leaves_native_pointer(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_root, tempfile.TemporaryDirectory() as artifact_root:
-            store = ContentAddressedStore(raw_root)
+        # See the resolve() note above: an unresolved artifact_root would make
+        # validate_receipt fail closed on a spurious symlink error, forcing
+        # make_promotion_decision to a NATIVE decision before activate() ever
+        # reaches the ACTIVATE branch (store.get_receipt + re-validation) this
+        # test means to exercise.
+        with tempfile.TemporaryDirectory() as raw_root, tempfile.TemporaryDirectory() as raw_artifact_root:
+            store_root = str(Path(raw_root).resolve())
+            artifact_root = str(Path(raw_artifact_root).resolve())
+            store = ContentAddressedStore(store_root)
             store.put_receipt(self.receipt)
             with patch("auto_mlx.receipts.os.fsync", side_effect=OSError(5, "I/O failure")):
                 with self.assertRaises(ContractError) as context:

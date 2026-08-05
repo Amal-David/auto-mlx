@@ -85,26 +85,33 @@ class DispatchTests(unittest.TestCase):
         )
 
     def test_missing_stale_and_tampered_state_always_falls_back(self) -> None:
+        # `.mode == NATIVE_MODE` alone would also be satisfied by an unrelated
+        # rejection (for example a spuriously unresolved artifact_root), so
+        # each case additionally asserts dispatch()'s specific `.reason`
+        # string to confirm the intended mechanism -- staleness, a tampered
+        # receipt, and an absent activation pointer -- is what actually fired.
         store, decision_id, artifact_root = self.active_store()
-        self.assertEqual(
-            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=1_000, max_age_ns=10).mode,
-            NATIVE_MODE,
-        )
+        stale = dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=1_000, max_age_ns=10)
+        self.assertEqual(stale.mode, NATIVE_MODE)
+        self.assertEqual(stale.reason, "activation_stale")
 
         receipt_path = Path(store.root) / "receipts" / f"{self.receipt.receipt_id}.json"
         tampered = self.receipt.to_dict()
         tampered["raw_samples"][0]["duration_ns"] = 999
+        # Writing with stdlib json.dumps (not canonical_json) means the tamper
+        # is caught even earlier than the raw-sample recompute: get_receipt's
+        # `canonical_bytes(parsed) != payload` check rejects the non-canonical
+        # bytes on disk with IDENTITY_MISMATCH, which dispatch()'s outer
+        # `except Exception` safety boundary reports as "dispatch_state_invalid".
         receipt_path.write_text(__import__("json").dumps(tampered), encoding="utf-8")
-        self.assertEqual(
-            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100).mode,
-            NATIVE_MODE,
-        )
+        tampered_result = dispatch(store, self.workload, self.candidate, self.policy, self.runtime, artifact_root=artifact_root, attestation_key=self.key, now_ns=120, max_age_ns=100)
+        self.assertEqual(tampered_result.mode, NATIVE_MODE)
+        self.assertEqual(tampered_result.reason, "dispatch_state_invalid")
 
         rollback(store, now_ns=130)
-        self.assertEqual(
-            dispatch(store, self.workload, self.candidate, self.policy, self.runtime, now_ns=140, max_age_ns=100).mode,
-            NATIVE_MODE,
-        )
+        missing = dispatch(store, self.workload, self.candidate, self.policy, self.runtime, now_ns=140, max_age_ns=100)
+        self.assertEqual(missing.mode, NATIVE_MODE)
+        self.assertEqual(missing.reason, "native_fallback_pointer")
         self.assertTrue(decision_id)
 
     def test_missing_pointer_is_native_fallback(self) -> None:

@@ -18,7 +18,7 @@
     }
   ],
   "parameters": {
-    "dtype": "float16",
-    "shape": [1, 128, 128]
+    "dtype": "float32",
+    "shape": [1, 3072, 3072]
   }
 }

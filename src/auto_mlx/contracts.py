@@ -512,12 +512,23 @@ class CandidateProposal:
         return cls.from_dict(strict_json_loads(value), workload)
 
 
+THERMAL_GATE_POLICIES: Final = frozenset({"tag", "refuse"})
+
+
 @dataclass(frozen=True, slots=True)
 class EvaluationPolicy:
     warmup_runs: int = 1
     measurement_runs: int = 3
     timeout_seconds: int = 300
     max_output_bytes: int = 1_048_576
+    # Decides what happens when the pre-block thermal preflight (see
+    # auto_mlx.thermal) still reports throttled after its one retry:
+    # "tag" proceeds with the block, annotating it thermally-suspect in the
+    # receipt; "refuse" skips the block's samples outright (they surface as
+    # ordinary missing-sample rejections downstream). Default is "tag" --
+    # never silently pooling a thermally-suspect block, never refusing by
+    # default either.
+    thermal_gate_policy: str = "tag"
 
     def __post_init__(self) -> None:
         _integer(self.warmup_runs, label="warmup_runs", minimum=0, maximum=MAX_WARMUP_RUNS, bound_code=FailureCode.INVALID_POLICY)
@@ -536,6 +547,11 @@ class EvaluationPolicy:
             maximum=MAX_POLICY_OUTPUT_BYTES,
             bound_code=FailureCode.INVALID_POLICY,
         )
+        if self.thermal_gate_policy not in THERMAL_GATE_POLICIES:
+            raise ContractError(
+                f"thermal_gate_policy must be one of {sorted(THERMAL_GATE_POLICIES)}",
+                code=FailureCode.INVALID_POLICY,
+            )
 
     @property
     def runs(self) -> int:
@@ -549,12 +565,13 @@ class EvaluationPolicy:
     def measurements(self) -> int:
         return self.measurement_runs
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "warmup_runs": self.warmup_runs,
             "measurement_runs": self.measurement_runs,
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,
+            "thermal_gate_policy": self.thermal_gate_policy,
         }
 
     def to_json(self) -> str:
@@ -563,8 +580,18 @@ class EvaluationPolicy:
     @classmethod
     def from_dict(cls, value: Any) -> "EvaluationPolicy":
         data = _object(value, label="evaluation policy")
-        _exact_fields(data, {"warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes"}, label="evaluation policy")
-        return cls(data["warmup_runs"], data["measurement_runs"], data["timeout_seconds"], data["max_output_bytes"])
+        _exact_fields(
+            data,
+            {"warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes", "thermal_gate_policy"},
+            label="evaluation policy",
+        )
+        return cls(
+            data["warmup_runs"],
+            data["measurement_runs"],
+            data["timeout_seconds"],
+            data["max_output_bytes"],
+            data["thermal_gate_policy"],
+        )
 
     @classmethod
     def from_json(cls, value: str | bytes | bytearray) -> "EvaluationPolicy":
@@ -645,6 +672,7 @@ __all__: Final = [
     "MAX_POLICY_OUTPUT_BYTES",
     "MAX_WARMUP_RUNS",
     "RuntimeIdentity",
+    "THERMAL_GATE_POLICIES",
     "canonical_contract",
     "validate_config",
 ]

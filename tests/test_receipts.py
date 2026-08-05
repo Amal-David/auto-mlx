@@ -28,6 +28,24 @@ from auto_mlx.receipts import (
     receipt_attestation,
     validate_receipt,
 )
+from auto_mlx.thermal import ThermalReading
+
+
+def _nominal_thermal_blocks(plan, *, policy: EvaluationPolicy) -> tuple[dict, ...]:
+    """Well-formed, nominal (never-throttled) thermal annotations for every block."""
+
+    reading = ThermalReading("nominal", 100, None, None, "").to_dict()
+    preflight = {"initial": reading, "final": reading, "retried": False, "thermally_suspect": False}
+    return tuple(
+        {
+            "block_id": block.block_id,
+            "block_index": block.block_index,
+            "policy": policy.thermal_gate_policy,
+            "preflight": preflight,
+            "refused": False,
+        }
+        for block in plan.blocks
+    )
 
 
 class _ReceiptIsolationProvider(IsolationProvider):
@@ -278,6 +296,7 @@ class ReceiptTests(unittest.TestCase):
                 runner_digest=runner_digest,
                 status=ExecutionStatus.SUCCESS,
                 parent_elapsed_ns=elapsed,
+                runner_elapsed_ns=elapsed,
                 observation_id=sample_id,
                 arm=arm,
                 returncode=0,
@@ -315,6 +334,7 @@ class ReceiptTests(unittest.TestCase):
             isolation_requirements=frozenset({"network_denial", "descendant_containment"}),
             warmups=warmups,
             measurements=measurements,
+            thermal_blocks=_nominal_thermal_blocks(plan, policy=self.policy),
             policy_digest=sha256_hex(self.policy.to_dict()),
             execution_policy_digest=_execution_policy_digest(_execution_policy_from_contract(self.policy)),
             measurement_block_count=self.policy.measurement_runs,
@@ -359,6 +379,122 @@ class ReceiptTests(unittest.TestCase):
             attestation_key=self.key,
         )
         self.assertNotEqual(decision.action, ACTIVATE)
+
+    def test_gain_math_uses_runner_span_not_full_sample_span(self) -> None:
+        """D1: downstream gain math must read runner_elapsed_ns, not parent_elapsed_ns.
+
+        Deliberately makes the two spans point in OPPOSITE directions per
+        arm (baseline: fast runner span / slow full-sample span; candidate:
+        the reverse).  A receipt whose gain math still used
+        parent_elapsed_ns would show the candidate as a large improvement;
+        reading the evidentiary runner_elapsed_ns instead correctly shows a
+        regression.
+        """
+
+        oracle = ExactOutputOracle(b"ok\n", label="receipt-oracle-runner-span")
+        provider = _ReceiptIsolationProvider()
+        authority = _ReceiptTestAuthority()
+        policy = EvaluationPolicy(warmup_runs=1, measurement_runs=1)
+        plan = PairedMeasurementPlan.create(
+            policy.measurement_runs,
+            candidate_id=self.candidate.candidate_id,
+            workload_hash=self.workload.workload_hash,
+            baseline_runner_id="baseline",
+            baseline_runner_digest="1" * 64,
+            candidate_runner_id="candidate",
+            candidate_runner_digest="2" * 64,
+            oracle=oracle,
+            isolation_provider_id=provider.provider_id,
+            isolation_identity=provider.identity,
+            isolation_verifier_id=authority.verifier_id,
+            isolation_verifier_identity=authority.identity,
+            isolation_requirements=frozenset({"network_denial", "descendant_containment"}),
+        )
+
+        # Full-sample span suggests baseline is slow and candidate is fast
+        # (a large apparent improvement); the runner span says the opposite.
+        parent_ns = {"baseline": 1_000_000, "candidate": 50_000}
+        runner_ns = {"baseline": 50_000, "candidate": 1_000_000}
+
+        def record(sample_id: str, arm: str) -> ExecutionRecord:
+            runner_id = "baseline" if arm == "baseline" else "candidate"
+            runner_digest = "1" * 64 if arm == "baseline" else "2" * 64
+            return ExecutionRecord(
+                candidate_id=self.candidate.candidate_id,
+                workload_hash=self.workload.workload_hash,
+                runner_id=runner_id,
+                runner_digest=runner_digest,
+                status=ExecutionStatus.SUCCESS,
+                parent_elapsed_ns=parent_ns[arm],
+                runner_elapsed_ns=runner_ns[arm],
+                observation_id=sample_id,
+                arm=arm,
+                returncode=0,
+                stdout=b"ok\n",
+                isolation=authority._attest(provider, provider._claim("d" * 64)),
+            )
+
+        warmups = tuple(
+            Observation(f"warmup-0001-{arm}", arm, record(f"warmup-0001-{arm}", arm), oracle.evaluate(b"ok\n"))
+            for arm in ("baseline", "candidate")
+        )
+        samples = []
+        for block in plan.blocks:
+            for slot in block.slots:
+                current = record(slot.sample_id, slot.arm)
+                samples.append(
+                    MeasurementSample(slot.sample_id, slot.block_id, slot.slot_index, slot.arm, current, oracle.evaluate(current.stdout))
+                )
+        measurements = assemble_measurement_bundle(plan, samples)
+        bundle = ObservationBundle(
+            candidate_id=self.candidate.candidate_id,
+            workload_hash=self.workload.workload_hash,
+            runtime=self.runtime,
+            baseline_runner_id="baseline",
+            baseline_runner_digest="1" * 64,
+            candidate_runner_id="candidate",
+            candidate_runner_digest="2" * 64,
+            isolation_provider_id=provider.provider_id,
+            isolation_identity=provider.identity,
+            isolation_verifier_id=authority.verifier_id,
+            isolation_verifier_identity=authority.identity,
+            isolation_requirements=frozenset({"network_denial", "descendant_containment"}),
+            warmups=warmups,
+            measurements=measurements,
+            thermal_blocks=_nominal_thermal_blocks(plan, policy=policy),
+            policy_digest=sha256_hex(policy.to_dict()),
+            execution_policy_digest=_execution_policy_digest(_execution_policy_from_contract(policy)),
+            measurement_block_count=policy.measurement_runs,
+            evaluation_policy=policy,
+            execution_policy=_execution_policy_from_contract(policy),
+            oracle=oracle,
+            oracle_descriptor=oracle.descriptor,
+        )
+        self.assertTrue(bundle.accepted)
+        receipt = Receipt.from_observation_bundle(
+            bundle, self.workload, self.candidate, policy, oracle=oracle, created_at_ns=100,
+        )
+        gain = receipt.metrics["gain"]
+        self.assertEqual(gain["baseline_sum_ns"], runner_ns["baseline"] * 2)
+        self.assertEqual(gain["candidate_sum_ns"], runner_ns["candidate"] * 2)
+        self.assertFalse(gain["improved"])  # runner span says the candidate regressed
+        self.assertLess(gain["delta_ns"], 0)
+        # Sanity: had parent_elapsed_ns leaked into the math instead, the
+        # sign would have flipped to a large apparent improvement.
+        parent_based_delta = parent_ns["baseline"] * 2 - parent_ns["candidate"] * 2
+        self.assertGreater(parent_based_delta, 0)
+
+        # Independent recomputation (the supervisor/CLI validation path)
+        # must reach the identical, runner-span-based verdict -- never
+        # silently re-deriving a different number.
+        validation = validate_receipt(
+            receipt, attestation=receipt_attestation(receipt, self.key), attestation_key=self.key,
+        )
+        self.assertTrue(validation.valid)
+        recomputed_gain = validation.recomputed["metrics"]["gain"]
+        self.assertEqual(recomputed_gain["baseline_sum_ns"], gain["baseline_sum_ns"])
+        self.assertEqual(recomputed_gain["candidate_sum_ns"], gain["candidate_sum_ns"])
+        self.assertEqual(recomputed_gain["improved"], gain["improved"])
 
     def test_actual_evaluator_slower_candidate_preserves_signed_regression(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

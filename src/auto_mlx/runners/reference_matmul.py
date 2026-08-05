@@ -50,6 +50,31 @@ sends a bad ``tile`` still fails closed -- but intentionally left
 uncomputed for now.  A future wave that wants tiling to actually change the
 result will need either an approximate oracle or per-tile expected outputs.
 
+Runner contract: one uncounted warmup before the measured run
+----------------------------------------------------------------
+
+``mx.compile`` has an OS-level (Metal shader cache) cold/warm state that
+persists across *processes*, not just within one: the first-ever compiled
+launch on a machine measured ~1151ms versus ~140ms once warm, while eager
+mode carries no such cost.  Because each evaluator sample is a fresh
+subprocess and the evaluator forces the baseline arm to always run eager,
+that cold tax previously landed asymmetrically on the compiled candidate
+arm alone -- a structural confound, not a real baseline-vs-candidate
+difference (see ``docs/measurement.md``).
+
+This runner now performs exactly one full, uncounted execution of the same
+computation (build inputs, run ``fn``, ``mx.eval``) immediately before the
+measured run, discarding its result.  The digest the oracle checks always
+comes from the *second* (measured) run; the warmup exists purely to pay
+compile/shader-cache/page-fault costs up front so the timed run is warm
+regardless of process cold-start state.  After the warmup completes, this
+runner prints a fixed marker line to stderr (never stdout -- stdout stays
+the oracle-sacred single digest line) so the evaluator can record an
+honest, non-evidentiary ``warm_state`` note in the receipt.  The marker
+string is intentionally duplicated in ``auto_mlx.receipts._WARMUP_MARKER``
+rather than imported, per this module's own no-``auto_mlx``-imports
+invariant above; keep the two literals identical if either changes.
+
 Device: CPU, deliberately
 --------------------------
 
@@ -87,6 +112,9 @@ ALLOWED_KEYS = frozenset({"mode", "tile"})
 ALLOWED_MODES = ("eager", "compiled")
 TILE_MINIMUM = 16
 TILE_MAXIMUM = 32
+# Must stay byte-identical to auto_mlx.receipts._WARMUP_MARKER (this module
+# cannot import auto_mlx -- see the module docstring).
+WARMUP_MARKER = "auto_mlx_runner_warmup_complete"
 
 
 class ConfigError(ValueError):
@@ -176,6 +204,14 @@ def run(mode: str, tile: int) -> str:
     mx.set_default_device(mx.cpu)
     a, b = _build_inputs(mx, MATRIX_SIZE)
     fn = mx.compile(_matmul) if mode == "compiled" else _matmul
+
+    # One uncounted warmup: see the module docstring's "Runner contract"
+    # section.  Same `fn`, same inputs, discarded result -- pays compile/
+    # shader-cache/page-fault cost before the measured, digested run.
+    warmup_result = fn(a, b)
+    mx.eval(warmup_result)
+    print(WARMUP_MARKER, file=sys.stderr, flush=True)
+
     result = fn(a, b)
     mx.eval(result)
     return _digest_result(result)

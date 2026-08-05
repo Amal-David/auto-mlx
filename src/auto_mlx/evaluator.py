@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -20,6 +21,7 @@ from .executor import (
 from .measurement import MeasurementSample, PairedMeasurementBundle, PairedMeasurementPlan, assemble_measurement_bundle
 from .oracle import ExactOutputOracle, OracleDescriptor, OracleResult
 from .paths import validate_sha256
+from .thermal import thermal_preflight as _default_thermal_preflight
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +65,7 @@ class ObservationBundle:
     isolation_verifier_identity: str | None
     warmups: tuple[Observation, ...]
     measurements: PairedMeasurementBundle
+    thermal_blocks: tuple[Mapping[str, Any], ...] = ()
     isolation_requirements: frozenset[str] | None = None
     policy_digest: str | None = None
     execution_policy_digest: str | None = None
@@ -269,10 +272,12 @@ class ObservationBundle:
                     "status": item.record.status.value,
                     "oracle_matched": item.oracle.matched,
                     "parent_elapsed_ns": item.record.parent_elapsed_ns,
+                    "runner_elapsed_ns": item.record.runner_elapsed_ns,
                 }
                 for item in self.warmups
             ],
             "measurements": self.measurements.to_dict(),
+            "thermal_blocks": [dict(item) for item in self.thermal_blocks],
         }
 
 
@@ -312,6 +317,7 @@ class Evaluator:
         provider: IsolationProvider | None = None,
         authority: IsolationAuthority | None = None,
         block_count: int | None = None,
+        thermal_preflight: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         if not isinstance(registry, TrustedRunnerRegistry):
             raise ContractError("evaluator requires a TrustedRunnerRegistry", code=FailureCode.PROVIDER_ERROR)
@@ -329,6 +335,8 @@ class Evaluator:
             raise ContractError("authority must be an evaluator-owned IsolationAuthority", code=FailureCode.SANDBOX_UNAVAILABLE)
         if block_count is not None and (type(block_count) is not int or block_count <= 0):
             raise ContractError("block_count must be a positive integer", code=FailureCode.INVALID_POLICY)
+        if thermal_preflight is not None and not callable(thermal_preflight):
+            raise ContractError("thermal_preflight must be callable", code=FailureCode.WRONG_TYPE)
         self._policy = policy or EvaluationPolicy()
         expected_execution_policy = _execution_policy_from_contract(self._policy)
         self._execution_policy = execution_policy or expected_execution_policy
@@ -359,6 +367,10 @@ class Evaluator:
         # VerifiedIsolation a real execution actually returns.
         self._provider = provider
         self._authority = authority
+        # Defaults to a real pmset -g therm preflight with a real 30s retry
+        # sleep (see auto_mlx.thermal.thermal_preflight); tests inject a
+        # fast, canned callable instead of waiting on real hardware/timing.
+        self._thermal_preflight = thermal_preflight or _default_thermal_preflight
 
     def _run(self, plan: ExecutionPlan, sample_id: str, arm: str) -> Observation:
         record = plan.execute(
@@ -418,7 +430,29 @@ class Evaluator:
             isolation_requirements=isolation_requirements,
         )
         samples: list[MeasurementSample] = []
+        thermal_blocks: list[dict[str, Any]] = []
         for block in measurement_plan.blocks:
+            # Preflight before this block's own samples, not once for the
+            # whole evaluate() call -- thermal state can change between
+            # blocks over a multi-minute evaluation.
+            preflight = dict(self._thermal_preflight())
+            thermally_suspect = bool(preflight.get("thermally_suspect"))
+            refused = thermally_suspect and self._policy.thermal_gate_policy == "refuse"
+            thermal_blocks.append(
+                {
+                    "block_id": block.block_id,
+                    "block_index": block.block_index,
+                    "policy": self._policy.thermal_gate_policy,
+                    "preflight": preflight,
+                    "refused": refused,
+                }
+            )
+            if refused:
+                # Skip this block's samples entirely; the measurement
+                # bundle's existing missing-sample handling rejects the
+                # block the same way it would for any other incomplete
+                # block -- no separate rejection code needed.
+                continue
             for slot in block.slots:
                 execution_plan = baseline_plan if slot.arm == "baseline" else candidate_plan
                 observation = self._run(execution_plan, slot.sample_id, slot.arm)
@@ -447,6 +481,7 @@ class Evaluator:
             isolation_verifier_identity=isolation_verifier_identity,
             warmups=tuple(warmups),
             measurements=measurements,
+            thermal_blocks=tuple(thermal_blocks),
             isolation_requirements=isolation_requirements,
             policy_digest=self._policy_digest,
             execution_policy_digest=self._execution_policy_digest,

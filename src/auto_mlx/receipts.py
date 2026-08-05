@@ -33,7 +33,15 @@ from .errors import ContractError, Failure, FailureCode, UnknownFieldError
 from .paths import _open_root_directory, validate_sha256, verify_artifact
 
 
-RECEIPT_SCHEMA: Final = "auto_mlx.receipt.v1"
+# v2 (Wave A measurement-integrity remediation): ExecutionRecord.record
+# wire gained a required runner_elapsed_ns (the evidentiary runner-subprocess
+# span, excluding authority-verification probe time); the evaluator_bundle
+# wire gained thermal_blocks (per-block pmset preflight annotations) and a
+# per-sample warm_state note.  v1 receipts do not carry these fields and are
+# rejected outright rather than silently reinterpreted -- this store is
+# local/experimental with no external v1 consumers yet, and a strictly
+# validated evidence format is safer without a dual-schema code path.
+RECEIPT_SCHEMA: Final = "auto_mlx.receipt.v2"
 NATIVE_FALLBACK: Final = "native_fallback"
 CLAIMS_WITHHELD: Final = "withheld_pending_external_attestation"
 _REQUIRED_ISOLATION: Final = frozenset({"network_denial", "descendant_containment"})
@@ -334,6 +342,12 @@ def recompute_receipt_fields(
         "observed_samples": observed,
         "compatible": observed == policy.measurement_runs
         and [sample.index for sample in raw_samples] == list(range(policy.measurement_runs)),
+        # The raw-sample lane predates thermal gating and carries no
+        # per-block preflight data of its own; the evaluator-bundle lane
+        # (the production path -- see _validate_evaluator_bundle_wire)
+        # populates these from real pmset preflights.
+        "thermal_blocks": [],
+        "thermal_gate_policy": None,
     }
     gain_numerator = baseline["sum_ns"] - candidate["sum_ns"]
     return {
@@ -382,6 +396,58 @@ def _validate_stats(value: Any, *, label: str) -> None:
         _integer(data[field], label=f"{label}.{field}", minimum=0)
 
 
+_THERMAL_STATES: Final = frozenset({"nominal", "throttled", "unknown"})
+
+
+def _validate_thermal_reading_shape(value: Any, *, label: str) -> None:
+    data = _object(value, label=label)
+    _exact(
+        data,
+        {"state", "cpu_speed_limit_percent", "cpu_scheduler_limit_percent", "thermal_pressure_level", "detail"},
+        label=label,
+    )
+    if data["state"] not in _THERMAL_STATES:
+        raise ContractError(f"{label}.state is not a closed thermal state", code=FailureCode.INVALID_VALUE)
+    for field in ("cpu_speed_limit_percent", "cpu_scheduler_limit_percent"):
+        if data[field] is not None:
+            _integer(data[field], label=f"{label}.{field}", minimum=0)
+    if data["thermal_pressure_level"] is not None:
+        _string(data["thermal_pressure_level"], label=f"{label}.thermal_pressure_level", non_empty=False)
+    _string(data["detail"], label=f"{label}.detail", non_empty=False)
+
+
+def _validate_thermal_block_shape(value: Any, *, label: str) -> dict[str, Any]:
+    """Structural-only validation: no policy/block-identity binding here.
+
+    Thermal readings have no raw evidence to recompute them from (they are
+    a point-in-time OS reading, not something a runner subprocess
+    produces), so this validator's job is to *tolerate and preserve* a
+    well-formed annotation, not to re-derive its numbers.  Identity/policy
+    binding is layered on top by ``_validate_evaluator_bundle_wire``, which
+    has the policy and block context this shape check does not.
+    """
+
+    data = _object(value, label=label)
+    _exact(data, {"block_id", "block_index", "policy", "preflight", "refused"}, label=label)
+    _string(data["block_id"], label=f"{label}.block_id")
+    _integer(data["block_index"], label=f"{label}.block_index", minimum=0)
+    if data["policy"] not in {"tag", "refuse"}:
+        raise ContractError(f"{label}.policy is not a closed thermal gate policy", code=FailureCode.INVALID_VALUE)
+    _boolean(data["refused"], label=f"{label}.refused")
+    preflight = _object(data["preflight"], label=f"{label}.preflight")
+    _exact(preflight, {"initial", "final", "retried", "thermally_suspect"}, label=f"{label}.preflight")
+    _boolean(preflight["retried"], label=f"{label}.preflight.retried")
+    _boolean(preflight["thermally_suspect"], label=f"{label}.preflight.thermally_suspect")
+    _validate_thermal_reading_shape(preflight["initial"], label=f"{label}.preflight.initial")
+    _validate_thermal_reading_shape(preflight["final"], label=f"{label}.preflight.final")
+    if data["refused"] and (data["policy"] != "refuse" or not preflight["thermally_suspect"]):
+        raise ContractError(
+            f"{label} cannot be refused without a matching suspect reading and refuse policy",
+            code=FailureCode.INVALID_VALUE,
+        )
+    return data
+
+
 def _validate_derived_fields(
     aggregates: Any,
     oracle: Any,
@@ -415,12 +481,18 @@ def _validate_derived_fields(
     compatibility_data = _object(compatibility, label="receipt.compatibility")
     _exact(
         compatibility_data,
-        {"warmup_runs", "measurement_runs", "observed_samples", "compatible"},
+        {"warmup_runs", "measurement_runs", "observed_samples", "compatible", "thermal_blocks", "thermal_gate_policy"},
         label="receipt.compatibility",
     )
     for field in ("warmup_runs", "measurement_runs", "observed_samples"):
         _integer(compatibility_data[field], label=f"receipt.compatibility.{field}", minimum=0)
     _boolean(compatibility_data["compatible"], label="receipt.compatibility.compatible")
+    if compatibility_data["thermal_gate_policy"] is not None and compatibility_data["thermal_gate_policy"] not in {"tag", "refuse"}:
+        raise ContractError("receipt.compatibility.thermal_gate_policy is not a closed thermal gate policy", code=FailureCode.INVALID_VALUE)
+    if type(compatibility_data["thermal_blocks"]) is not list:
+        raise ContractError("receipt.compatibility.thermal_blocks must be an array", code=FailureCode.WRONG_TYPE)
+    for index, entry in enumerate(compatibility_data["thermal_blocks"]):
+        _validate_thermal_block_shape(entry, label=f"receipt.compatibility.thermal_blocks[{index}]")
 
     metrics_data = _object(metrics, label="receipt.metrics")
     _exact(metrics_data, {"drift", "dispersion", "gain"}, label="receipt.metrics")
@@ -483,7 +555,44 @@ def _oracle_to_wire(oracle: Any | None) -> dict[str, Any] | None:
     return None if oracle is None else dict(oracle.to_dict())
 
 
-def _measurement_bundle_to_wire(measurements: Any) -> dict[str, Any]:
+# Must stay byte-identical to auto_mlx.runners.reference_matmul.WARMUP_MARKER
+# (that module cannot import auto_mlx -- see its own docstring).
+_WARMUP_MARKER: Final = b"auto_mlx_runner_warmup_complete"
+
+
+def _warm_state_for(stderr: bytes | None, *, arm: str, seen_arms: set) -> dict[str, Any]:
+    """Compute a diagnostic warm/cold note for one sample -- never gates acceptance.
+
+    Both fields are pure functions of already-evidentiary data: the marker
+    check reads the record's ``stderr`` bytes (immutable, hash-bound bytes
+    already part of the record on both the live ``ExecutionRecord`` and the
+    wire) and ``first_launch_of_config_in_evaluate`` is derived from
+    ``seen_arms``, the set of arms already observed earlier in this same
+    evaluator bundle's canonical order (warmups, then measurement blocks in
+    block/slot order).  Calling this identically at wire-build time (with
+    ``record.stderr``) and at validation time (with the decoded
+    ``stderr_b64`` bytes) -- over the same ordered iteration -- is what
+    makes ``warm_state`` independently recomputed, not merely stored.
+    """
+
+    first_launch = arm not in seen_arms
+    seen_arms.add(arm)
+    marker_present = stderr is not None and _WARMUP_MARKER in stderr
+    return {
+        "in_runner_warmup_marker_present": marker_present,
+        "first_launch_of_config_in_evaluate": first_launch,
+    }
+
+
+def _validate_warm_state_shape(value: Any, *, label: str) -> dict[str, Any]:
+    data = _object(value, label=label)
+    _exact(data, {"in_runner_warmup_marker_present", "first_launch_of_config_in_evaluate"}, label=label)
+    _boolean(data["in_runner_warmup_marker_present"], label=f"{label}.in_runner_warmup_marker_present")
+    _boolean(data["first_launch_of_config_in_evaluate"], label=f"{label}.first_launch_of_config_in_evaluate")
+    return data
+
+
+def _measurement_bundle_to_wire(measurements: Any, *, seen_arms: set) -> dict[str, Any]:
     blocks = []
     for observation in measurements.blocks:
         blocks.append(
@@ -501,6 +610,9 @@ def _measurement_bundle_to_wire(measurements: Any) -> dict[str, Any]:
                         "arm": sample.arm,
                         "record": None if sample.record is None else _record_to_wire(sample.record),
                         "oracle": _oracle_to_wire(sample.oracle),
+                        "warm_state": _warm_state_for(
+                            sample.record.stderr if sample.record else None, arm=sample.arm, seen_arms=seen_arms
+                        ),
                     }
                     for sample in observation.samples
                 ],
@@ -508,6 +620,9 @@ def _measurement_bundle_to_wire(measurements: Any) -> dict[str, Any]:
                     "ordered_parent_elapsed_ns": list(observation.dispersion_inputs.ordered_parent_elapsed_ns),
                     "baseline_elapsed_ns": list(observation.dispersion_inputs.baseline_elapsed_ns),
                     "candidate_elapsed_ns": list(observation.dispersion_inputs.candidate_elapsed_ns),
+                    "ordered_runner_elapsed_ns": list(observation.dispersion_inputs.ordered_runner_elapsed_ns),
+                    "baseline_runner_elapsed_ns": list(observation.dispersion_inputs.baseline_runner_elapsed_ns),
+                    "candidate_runner_elapsed_ns": list(observation.dispersion_inputs.candidate_runner_elapsed_ns),
                     "baseline_drift_ns": observation.baseline_drift_ns,
                 },
             }
@@ -583,8 +698,23 @@ def _observation_bundle_to_wire(
         validate_sha256(bundle.isolation_identity)
     if isolation_verifier_identity is not None:
         validate_sha256(isolation_verifier_identity)
+    thermal_blocks = getattr(bundle, "thermal_blocks", ())
+    if type(thermal_blocks) not in {tuple, list} or any(type(item) is not dict for item in thermal_blocks):
+        raise ContractError("observation bundle thermal_blocks must be an array of objects", code=FailureCode.WRONG_TYPE)
+    seen_arms: set = set()
+    warmups_wire = [
+        {
+            "sample_id": observation.sample_id,
+            "arm": observation.arm,
+            "record": _record_to_wire(observation.record),
+            "oracle": _oracle_to_wire(observation.oracle),
+            "warm_state": _warm_state_for(observation.record.stderr, arm=observation.arm, seen_arms=seen_arms),
+        }
+        for observation in bundle.warmups
+    ]
+    measurements_wire = _measurement_bundle_to_wire(measurements, seen_arms=seen_arms)
     return {
-        "schema": "auto_mlx.observation_bundle.v1",
+        "schema": "auto_mlx.observation_bundle.v2",
         "candidate_id": bundle.candidate_id,
         "workload_hash": bundle.workload_hash,
         "runtime": bundle.runtime.to_dict(),
@@ -604,16 +734,9 @@ def _observation_bundle_to_wire(
             "expected_size": oracle_descriptor.expected_size,
             "expected_b64": _encode_bytes(oracle.expected),
         },
-        "warmups": [
-            {
-                "sample_id": observation.sample_id,
-                "arm": observation.arm,
-                "record": _record_to_wire(observation.record),
-                "oracle": _oracle_to_wire(observation.oracle),
-            }
-            for observation in bundle.warmups
-        ],
-        "measurements": _measurement_bundle_to_wire(measurements),
+        "warmups": warmups_wire,
+        "measurements": measurements_wire,
+        "thermal_blocks": [dict(item) for item in thermal_blocks],
     }
 
 
@@ -621,9 +744,9 @@ def _validate_record_wire(value: Any, *, label: str) -> tuple[bytes, bytes, dict
     data = _object(value, label=label)
     expected = {
         "candidate_id", "workload_hash", "runner_id", "runner_digest", "status", "parent_elapsed_ns",
-        "observation_id", "arm", "returncode", "stdout_sha256", "stderr_sha256", "stdout_bytes",
-        "stderr_bytes", "stdout_truncated", "stderr_truncated", "output_truncated", "isolation",
-        "cleanup", "failure", "stdout_b64", "stderr_b64",
+        "runner_elapsed_ns", "observation_id", "arm", "returncode", "stdout_sha256", "stderr_sha256",
+        "stdout_bytes", "stderr_bytes", "stdout_truncated", "stderr_truncated", "output_truncated",
+        "isolation", "cleanup", "failure", "stdout_b64", "stderr_b64",
     }
     _exact(data, expected, label=label)
     validate_sha256(data["runner_digest"])
@@ -634,6 +757,10 @@ def _validate_record_wire(value: Any, *, label: str) -> tuple[bytes, bytes, dict
     if data["status"] not in {"success", "exit_failure", "crash", "timeout", "output_failure", "sandbox_unavailable", "start_failure", "artifact_failure"}:
         raise ContractError(f"{label}.status is not a closed execution status", code=FailureCode.INVALID_VALUE)
     elapsed = _integer(data["parent_elapsed_ns"], label=f"{label}.parent_elapsed_ns", minimum=0)
+    if data["runner_elapsed_ns"] is not None:
+        _integer(data["runner_elapsed_ns"], label=f"{label}.runner_elapsed_ns", minimum=1)
+    if data["status"] == "success" and data["runner_elapsed_ns"] is None:
+        raise ContractError(f"{label}.success requires a runner_elapsed_ns", code=FailureCode.INVALID_VALUE)
     if data["observation_id"] is not None:
         _string(data["observation_id"], label=f"{label}.observation_id")
     if data["arm"] is not None and data["arm"] not in {"baseline", "candidate"}:
@@ -732,17 +859,27 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             "schema", "candidate_id", "workload_hash", "runtime", "policy", "baseline_runner_id",
             "baseline_runner_digest", "candidate_runner_id", "candidate_runner_digest",
             "isolation_provider_id", "isolation_identity", "isolation_verifier_id", "isolation_verifier_identity",
-            "isolation_requirements", "oracle", "warmups", "measurements",
+            "isolation_requirements", "oracle", "warmups", "measurements", "thermal_blocks",
         },
         label="receipt.evaluator_bundle",
     )
-    if data["schema"] != "auto_mlx.observation_bundle.v1":
+    if data["schema"] != "auto_mlx.observation_bundle.v2":
         raise ContractError("evaluator bundle schema is incompatible", code=FailureCode.INVALID_VALUE)
     _string(data["candidate_id"], label="receipt.evaluator_bundle.candidate_id")
     validate_sha256(data["workload_hash"])
     RuntimeIdentity.from_dict(data["runtime"])
     if EvaluationPolicy.from_dict(data["policy"]) != policy:
         raise ContractError("evaluator bundle policy does not match receipt policy", code=FailureCode.INVALID_POLICY)
+    thermal_blocks_wire = data["thermal_blocks"]
+    if type(thermal_blocks_wire) is not list or len(thermal_blocks_wire) != policy.measurement_runs:
+        raise ContractError("evaluator bundle thermal_blocks do not match measurement policy", code=FailureCode.INVALID_POLICY)
+    for index, entry in enumerate(thermal_blocks_wire):
+        entry_data = _validate_thermal_block_shape(entry, label=f"receipt.evaluator_bundle.thermal_blocks[{index}]")
+        expected_block_id = f"block-{index + 1:04d}"
+        if entry_data["block_id"] != expected_block_id or entry_data["block_index"] != index:
+            raise ContractError("thermal block identity does not match measurement block order", code=FailureCode.IDENTITY_MISMATCH)
+        if entry_data["policy"] != policy.thermal_gate_policy:
+            raise ContractError("thermal block policy does not match evaluation policy", code=FailureCode.INVALID_POLICY)
     for name in ("baseline_runner_id", "candidate_runner_id"):
         _string(data[name], label=f"receipt.evaluator_bundle.{name}")
     for name in ("baseline_runner_digest", "candidate_runner_digest"):
@@ -798,9 +935,14 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
     if len(warmups) != policy.warmup_runs * 2:
         raise ContractError("evaluator bundle warmups are incomplete", code=FailureCode.INVALID_VALUE)
     warmup_success = True
+    seen_arms: set = set()
     for index, warmup in enumerate(warmups):
         warmup_data = _object(warmup, label=f"receipt.evaluator_bundle.warmups[{index}]")
-        _exact(warmup_data, {"sample_id", "arm", "record", "oracle"}, label=f"receipt.evaluator_bundle.warmups[{index}]")
+        _exact(
+            warmup_data,
+            {"sample_id", "arm", "record", "oracle", "warm_state"},
+            label=f"receipt.evaluator_bundle.warmups[{index}]",
+        )
         _string(warmup_data["sample_id"], label=f"receipt.evaluator_bundle.warmups[{index}].sample_id")
         expected_warmup_arm = "baseline" if index % 2 == 0 else "candidate"
         if warmup_data["arm"] != expected_warmup_arm:
@@ -808,7 +950,11 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         expected_warmup_id = f"warmup-{index // 2 + 1:04d}-{expected_warmup_arm}"
         if warmup_data["sample_id"] != expected_warmup_id:
             raise ContractError("warmup identity is not in evaluator order", code=FailureCode.IDENTITY_MISMATCH)
-        stdout, _, record_data = _validate_record_wire(warmup_data["record"], label=f"receipt.evaluator_bundle.warmups[{index}].record")
+        stdout, stderr, record_data = _validate_record_wire(warmup_data["record"], label=f"receipt.evaluator_bundle.warmups[{index}].record")
+        _validate_warm_state_shape(warmup_data["warm_state"], label=f"receipt.evaluator_bundle.warmups[{index}].warm_state")
+        expected_warm_state = _warm_state_for(stderr, arm=warmup_data["arm"], seen_arms=seen_arms)
+        if warmup_data["warm_state"] != expected_warm_state:
+            raise ContractError("warmup warm_state was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
         expected_runner = data["baseline_runner_id"] if warmup_data["arm"] == "baseline" else data["candidate_runner_id"]
         expected_digest = data["baseline_runner_digest"] if warmup_data["arm"] == "baseline" else data["candidate_runner_digest"]
         if (
@@ -836,7 +982,14 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             matched, expected_digest, _ = _validate_oracle_wire(warmup_data["oracle"], stdout, label=f"receipt.evaluator_bundle.warmups[{index}].oracle")
             if expected_digest != oracle_provenance["expected_digest"]:
                 raise ContractError("warmup oracle is not bound to bundle oracle", code=FailureCode.IDENTITY_MISMATCH)
-            if record_data["status"] != "success" or record_data["parent_elapsed_ns"] <= 0 or record_data["output_truncated"] or not matched:
+            runner_elapsed = record_data["runner_elapsed_ns"]
+            if (
+                record_data["status"] != "success"
+                or runner_elapsed is None
+                or runner_elapsed <= 0
+                or record_data["output_truncated"]
+                or not matched
+            ):
                 warmup_success = False
         else:
             raise ContractError("warmup oracle metadata is missing", code=FailureCode.ORACLE_MISMATCH)
@@ -901,16 +1054,39 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         if type(samples) is not list or len(samples) != 4:
             raise ContractError("every measurement block must retain four arm-specific slots", code=FailureCode.INVALID_VALUE)
         dispersion = _object(block_data["dispersion_inputs"], label=f"block[{block_index}].dispersion_inputs")
-        _exact(dispersion, {"ordered_parent_elapsed_ns", "baseline_elapsed_ns", "candidate_elapsed_ns", "baseline_drift_ns"}, label=f"block[{block_index}].dispersion_inputs")
-        for name in ("ordered_parent_elapsed_ns", "baseline_elapsed_ns", "candidate_elapsed_ns"):
+        _exact(
+            dispersion,
+            {
+                "ordered_parent_elapsed_ns", "baseline_elapsed_ns", "candidate_elapsed_ns", "baseline_drift_ns",
+                "ordered_runner_elapsed_ns", "baseline_runner_elapsed_ns", "candidate_runner_elapsed_ns",
+            },
+            label=f"block[{block_index}].dispersion_inputs",
+        )
+        for name in (
+            "ordered_parent_elapsed_ns", "baseline_elapsed_ns", "candidate_elapsed_ns",
+            "ordered_runner_elapsed_ns", "baseline_runner_elapsed_ns", "candidate_runner_elapsed_ns",
+        ):
             if type(dispersion[name]) is not list or any(value is not None and (type(value) is not int or value < 0) for value in dispersion[name]):
                 raise ContractError(f"block[{block_index}].dispersion_inputs.{name} is invalid", code=FailureCode.WRONG_TYPE)
         if len(dispersion["ordered_parent_elapsed_ns"]) != 4 or len(dispersion["baseline_elapsed_ns"]) != 2 or len(dispersion["candidate_elapsed_ns"]) != 2:
             raise ContractError("dispersion inputs do not retain all four arm-specific slots", code=FailureCode.INVALID_VALUE)
+        if (
+            len(dispersion["ordered_runner_elapsed_ns"]) != 4
+            or len(dispersion["baseline_runner_elapsed_ns"]) != 2
+            or len(dispersion["candidate_runner_elapsed_ns"]) != 2
+        ):
+            raise ContractError("runner dispersion inputs do not retain all four arm-specific slots", code=FailureCode.INVALID_VALUE)
         expected_baseline = [value for value, arm in zip(dispersion["ordered_parent_elapsed_ns"], sequence) if arm == "baseline"]
         expected_candidate = [value for value, arm in zip(dispersion["ordered_parent_elapsed_ns"], sequence) if arm == "candidate"]
         if dispersion["baseline_elapsed_ns"] != expected_baseline or dispersion["candidate_elapsed_ns"] != expected_candidate:
             raise ContractError("dispersion inputs do not match arm ordering", code=FailureCode.IDENTITY_MISMATCH)
+        expected_runner_baseline = [value for value, arm in zip(dispersion["ordered_runner_elapsed_ns"], sequence) if arm == "baseline"]
+        expected_runner_candidate = [value for value, arm in zip(dispersion["ordered_runner_elapsed_ns"], sequence) if arm == "candidate"]
+        if (
+            dispersion["baseline_runner_elapsed_ns"] != expected_runner_baseline
+            or dispersion["candidate_runner_elapsed_ns"] != expected_runner_candidate
+        ):
+            raise ContractError("runner dispersion inputs do not match arm ordering", code=FailureCode.IDENTITY_MISMATCH)
         if any(value is None for value in expected_baseline):
             block_drift = 0
         else:
@@ -920,7 +1096,11 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         drift_values.append(block_drift)
         for slot_index, sample in enumerate(samples):
             sample_data = _object(sample, label=f"block[{block_index}].samples[{slot_index}]")
-            _exact(sample_data, {"sample_id", "block_id", "slot_index", "arm", "record", "oracle"}, label=f"block[{block_index}].samples[{slot_index}]")
+            _exact(
+                sample_data,
+                {"sample_id", "block_id", "slot_index", "arm", "record", "oracle", "warm_state"},
+                label=f"block[{block_index}].samples[{slot_index}]",
+            )
             _string(sample_data["sample_id"], label=f"block[{block_index}].sample_id")
             expected_slot = expected_plan.blocks[block_index].slots[slot_index]
             if (
@@ -931,12 +1111,19 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
                 or sample_data["arm"] != sequence[slot_index]
             ):
                 raise ContractError("measurement slot identity does not match its ABBA/BAAB plan", code=FailureCode.IDENTITY_MISMATCH)
+            _validate_warm_state_shape(sample_data["warm_state"], label=f"block[{block_index}].samples[{slot_index}].warm_state")
             if sample_data["record"] is None or sample_data["oracle"] is None:
                 if sample_data["record"] is None and sample_data["oracle"] is not None:
                     raise ContractError("missing measurement record cannot carry oracle metadata", code=FailureCode.INVALID_VALUE)
+                expected_warm_state = _warm_state_for(None, arm=sample_data["arm"], seen_arms=seen_arms)
+                if sample_data["warm_state"] != expected_warm_state:
+                    raise ContractError("measurement warm_state was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
                 all_success = False
                 continue
-            stdout, _, record_data = _validate_record_wire(sample_data["record"], label=f"block[{block_index}].samples[{slot_index}].record")
+            stdout, stderr, record_data = _validate_record_wire(sample_data["record"], label=f"block[{block_index}].samples[{slot_index}].record")
+            expected_warm_state = _warm_state_for(stderr, arm=sample_data["arm"], seen_arms=seen_arms)
+            if sample_data["warm_state"] != expected_warm_state:
+                raise ContractError("measurement warm_state was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
             if (
                 record_data["candidate_id"] != data["candidate_id"]
                 or record_data["workload_hash"] != data["workload_hash"]
@@ -965,13 +1152,16 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
                 if not isolation_requirements.issubset(isolation_data["requirements"]):
                     raise ContractError("measurement isolation requirements do not match plan", code=FailureCode.IDENTITY_MISMATCH)
             status = record_data["status"]
-            elapsed = record_data["parent_elapsed_ns"]
-            if status != "success" or elapsed <= 0 or record_data["output_truncated"] or not matched:
+            # The evidentiary quantity for gain math is the runner span, not
+            # the full-sample span -- see auto_mlx.executor.execute_plan.
+            elapsed = record_data["runner_elapsed_ns"]
+            if status != "success" or elapsed is None or elapsed <= 0 or record_data["output_truncated"] or not matched:
                 all_success = False
-            if sample_data["arm"] == "baseline":
-                baseline_values.append(elapsed)
-            else:
-                candidate_values.append(elapsed)
+            if elapsed is not None:
+                if sample_data["arm"] == "baseline":
+                    baseline_values.append(elapsed)
+                else:
+                    candidate_values.append(elapsed)
             outcomes.append({
                 "index": all_slots,
                 "actual_sha256": hashlib.sha256(stdout).hexdigest(),
@@ -994,7 +1184,14 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
     return {
         "aggregates": {"candidate": candidate, "baseline": baseline},
         "oracle": {"sample_count": all_slots, "matches": matches, "mismatches": all_slots - matches, "all_match": all_slots == matches and all_slots == expected_slots, "outcomes": outcomes},
-        "compatibility": {"warmup_runs": policy.warmup_runs, "measurement_runs": policy.measurement_runs, "observed_samples": all_slots, "compatible": compatible},
+        "compatibility": {
+            "warmup_runs": policy.warmup_runs,
+            "measurement_runs": policy.measurement_runs,
+            "observed_samples": all_slots,
+            "compatible": compatible,
+            "thermal_blocks": thermal_blocks_wire,
+            "thermal_gate_policy": policy.thermal_gate_policy,
+        },
         "metrics": {
             "drift": {"count": len(drift_values), "sum": sum(drift_values), "min": min(drift_values) if drift_values else 0, "max": max(drift_values) if drift_values else 0},
             "dispersion": {"candidate": _mean_abs_deviation(candidate_values), "baseline": _mean_abs_deviation(baseline_values), "candidate_range_ns": candidate["range_ns"], "baseline_range_ns": baseline["range_ns"]},

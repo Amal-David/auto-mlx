@@ -356,11 +356,22 @@ class MeasurementSample:
 
 @dataclass(frozen=True, slots=True)
 class DispersionInputs:
-    """Raw timing vectors only; no universal estimator or pass threshold."""
+    """Raw timing vectors only; no universal estimator or pass threshold.
+
+    ``*_parent_elapsed_ns`` is the full-sample span (staging, launch, wait,
+    and authority verification) and is retained for diagnostics only.
+    ``*_runner_elapsed_ns`` is the evidentiary quantity -- the runner
+    subprocess's own launch-to-exit span, excluding verification probe time
+    (see ``execute_plan`` in ``auto_mlx.executor``) -- and is what all
+    downstream measurement/gain math must read.
+    """
 
     ordered_parent_elapsed_ns: tuple[int | None, ...]
     baseline_elapsed_ns: tuple[int | None, ...]
     candidate_elapsed_ns: tuple[int | None, ...]
+    ordered_runner_elapsed_ns: tuple[int | None, ...] = ()
+    baseline_runner_elapsed_ns: tuple[int | None, ...] = ()
+    candidate_runner_elapsed_ns: tuple[int | None, ...] = ()
 
     @property
     def baseline_drift_ns(self) -> int | None:
@@ -445,6 +456,7 @@ class PairedMeasurementBundle:
                             "status": sample.record.status.value if sample.record else None,
                             "oracle_matched": sample.oracle.matched if sample.oracle else None,
                             "parent_elapsed_ns": sample.record.parent_elapsed_ns if sample.record else None,
+                            "runner_elapsed_ns": sample.record.runner_elapsed_ns if sample.record else None,
                             "isolation": bool(sample.record and sample.record.isolation),
                         }
                         for sample in observation.samples
@@ -453,6 +465,9 @@ class PairedMeasurementBundle:
                         "ordered_parent_elapsed_ns": list(observation.dispersion_inputs.ordered_parent_elapsed_ns),
                         "baseline_elapsed_ns": list(observation.dispersion_inputs.baseline_elapsed_ns),
                         "candidate_elapsed_ns": list(observation.dispersion_inputs.candidate_elapsed_ns),
+                        "ordered_runner_elapsed_ns": list(observation.dispersion_inputs.ordered_runner_elapsed_ns),
+                        "baseline_runner_elapsed_ns": list(observation.dispersion_inputs.baseline_runner_elapsed_ns),
+                        "candidate_runner_elapsed_ns": list(observation.dispersion_inputs.candidate_runner_elapsed_ns),
                         "baseline_drift_ns": observation.baseline_drift_ns,
                     },
                 }
@@ -573,6 +588,8 @@ def assemble_measurement_bundle(
                         reasons.append(f"execution_failure:{slot.sample_id}:{sample.record.status.value}")
                     if sample.record.parent_elapsed_ns <= 0:
                         reasons.append(f"zero_duration:{slot.sample_id}")
+                    if sample.record.runner_elapsed_ns is None or sample.record.runner_elapsed_ns <= 0:
+                        reasons.append(f"zero_runner_duration:{slot.sample_id}")
                     if (
                         sample.record.stdout_truncated
                         or sample.record.stderr_truncated
@@ -597,12 +614,19 @@ def assemble_measurement_bundle(
         ordered = tuple(sample.record.parent_elapsed_ns if sample.record else None for sample in block_samples)
         baseline = tuple(sample.record.parent_elapsed_ns if sample.record else None for sample in block_samples if sample.arm == _BASELINE)
         candidate = tuple(sample.record.parent_elapsed_ns if sample.record else None for sample in block_samples if sample.arm == _CANDIDATE)
+        ordered_runner = tuple(sample.record.runner_elapsed_ns if sample.record else None for sample in block_samples)
+        baseline_runner = tuple(
+            sample.record.runner_elapsed_ns if sample.record else None for sample in block_samples if sample.arm == _BASELINE
+        )
+        candidate_runner = tuple(
+            sample.record.runner_elapsed_ns if sample.record else None for sample in block_samples if sample.arm == _CANDIDATE
+        )
         observation = BlockObservation(
             block=block,
             samples=tuple(block_samples),
             accepted=not reasons and plan.bound,
             rejection_reasons=tuple(reasons),
-            dispersion_inputs=DispersionInputs(ordered, baseline, candidate),
+            dispersion_inputs=DispersionInputs(ordered, baseline, candidate, ordered_runner, baseline_runner, candidate_runner),
         )
         observations.append(observation)
         bundle_reasons.extend(reasons)

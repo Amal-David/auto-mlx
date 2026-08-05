@@ -825,6 +825,7 @@ class ExecutionRecord:
     runner_digest: str
     status: ExecutionStatus
     parent_elapsed_ns: int
+    runner_elapsed_ns: int | None = None
     observation_id: str | None = None
     arm: str | None = None
     returncode: int | None = None
@@ -846,6 +847,10 @@ class ExecutionRecord:
             raise ContractError("status must be an ExecutionStatus", code=FailureCode.WRONG_TYPE)
         if type(self.parent_elapsed_ns) is not int or self.parent_elapsed_ns < 0:
             raise ContractError("parent_elapsed_ns must be a non-negative integer", code=FailureCode.WRONG_TYPE)
+        if self.runner_elapsed_ns is not None and (type(self.runner_elapsed_ns) is not int or self.runner_elapsed_ns <= 0):
+            raise ContractError("runner_elapsed_ns must be a positive integer or null", code=FailureCode.WRONG_TYPE)
+        if self.status is ExecutionStatus.SUCCESS and self.runner_elapsed_ns is None:
+            raise ContractError("successful execution must record a runner_elapsed_ns", code=FailureCode.INVALID_VALUE)
         if self.observation_id is not None:
             _non_empty_string(self.observation_id, label="observation_id")
         if self.arm is not None and self.arm not in {"baseline", "candidate"}:
@@ -876,7 +881,18 @@ class ExecutionRecord:
 
     @property
     def timing_ns(self) -> int:
-        return self.parent_elapsed_ns
+        """The evidentiary timing quantity: the runner subprocess's own span.
+
+        ``runner_elapsed_ns`` covers only launch-to-exit of the runner
+        subprocess and excludes authority verification (three sandbox probe
+        subprocesses, ~60ms) and artifact staging, both of which happen
+        outside this span (see ``execute_plan``).  Falls back to
+        ``parent_elapsed_ns`` (the full-sample diagnostic span) only when
+        ``runner_elapsed_ns`` is unavailable, e.g. on a failure that never
+        reached a real subprocess.
+        """
+
+        return self.runner_elapsed_ns if self.runner_elapsed_ns is not None else self.parent_elapsed_ns
 
     @property
     def output(self) -> bytes:
@@ -899,6 +915,8 @@ class ExecutionRecord:
         return (
             self.succeeded
             and self.parent_elapsed_ns > 0
+            and self.runner_elapsed_ns is not None
+            and self.runner_elapsed_ns > 0
             and self.failure is None
             and not self.stdout_truncated
             and not self.stderr_truncated
@@ -915,6 +933,7 @@ class ExecutionRecord:
             "runner_digest": self.runner_digest,
             "status": self.status.value,
             "parent_elapsed_ns": self.parent_elapsed_ns,
+            "runner_elapsed_ns": self.runner_elapsed_ns,
             "observation_id": self.observation_id,
             "arm": self.arm,
             "returncode": self.returncode,
@@ -1151,6 +1170,7 @@ def _record_failure(
     stdout_truncated: bool = False,
     stderr_truncated: bool = False,
     output_truncated: bool = False,
+    runner_elapsed_ns: int | None = None,
 ) -> ExecutionRecord:
     return ExecutionRecord(
         candidate_id=plan.candidate_id,
@@ -1159,6 +1179,7 @@ def _record_failure(
         runner_digest=plan.runner_digest,
         status=status,
         parent_elapsed_ns=max(1, elapsed_ns),
+        runner_elapsed_ns=runner_elapsed_ns,
         observation_id=observation_id,
         arm=arm,
         returncode=returncode,
@@ -1386,8 +1407,6 @@ def execute_plan(
     if arm is not None and arm not in {"baseline", "candidate"}:
         raise ContractError("arm must be baseline, candidate, or null", code=FailureCode.WRONG_TYPE)
     started_ns = time.monotonic_ns()
-    started_monotonic = time.monotonic()
-    handshake_deadline = started_monotonic + policy.timeout_seconds
 
     if not local_sandbox_primitives_available():
         return _record_failure(
@@ -1545,70 +1564,14 @@ def execute_plan(
             ]
             for reader in readers:
                 reader.start()
+            # The evidentiary timed span starts here (the runner subprocess
+            # is launched and its pipes are being drained) and ends the
+            # instant its exit is observed below.  Authority verification is
+            # deliberately run AFTER this span closes (see the comment near
+            # ``authority.verify`` below) so its ~3-probe, ~60ms cost never
+            # pollutes the measured quantity.
+            runner_started_ns = time.monotonic_ns()
 
-            try:
-                authority_timeout = min(
-                    policy.authority_timeout_seconds,
-                    max(0.01, handshake_deadline - time.monotonic()),
-                )
-                isolation = _call_bounded(
-                    lambda: authority.verify(provider, process, launched.claim),
-                    authority_timeout,
-                )
-            except Exception as exc:
-                cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                reader_failure = _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
-                stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.SANDBOX_UNAVAILABLE,
-                    _failure(
-                        FailureCode.TIMEOUT if isinstance(exc, _HandshakeTimeout) else FailureCode.SANDBOX_UNAVAILABLE,
-                        "isolation authority could not verify provider enforcement",
-                        error=type(exc).__name__,
-                        capture_errors=list(capture.errors),
-                        reader_failure=reader_failure,
-                    ),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                    cleanup=cleanup,
-                    stdout=stdout,
-                    stderr=stderr,
-                    stdout_truncated=stdout_truncated,
-                    stderr_truncated=stderr_truncated,
-                    output_truncated=output_truncated,
-                )
-            if (
-                not isinstance(isolation, VerifiedIsolation)
-                or isolation.provider_id != provider.provider_id
-                or isolation.identity != provider.identity
-                or isolation.verifier_id != authority.verifier_id
-                or isolation.verifier_identity != authority.identity
-                or not policy.required_isolation.issubset(isolation.requirements)
-            ):
-                cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
-                reader_failure = _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
-                stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
-                return _record_failure(
-                    plan,
-                    ExecutionStatus.SANDBOX_UNAVAILABLE,
-                    _failure(
-                        FailureCode.SANDBOX_UNAVAILABLE,
-                        "isolation authority returned mismatched evidence identity",
-                        capture_errors=list(capture.errors),
-                        reader_failure=reader_failure,
-                    ),
-                    time.monotonic_ns() - started_ns,
-                    observation_id=observation_id,
-                    arm=arm,
-                    cleanup=cleanup,
-                    stdout=stdout,
-                    stderr=stderr,
-                    stdout_truncated=stdout_truncated,
-                    stderr_truncated=stderr_truncated,
-                    output_truncated=output_truncated,
-                )
             deadline = time.monotonic() + policy.timeout_seconds
             while process.poll() is None:
                 if capture.output_event.is_set() or capture.failure_event.is_set():
@@ -1630,8 +1593,83 @@ def execute_plan(
                 except subprocess.TimeoutExpired:
                     cleanup = _terminate_process_group(process, policy.kill_grace_seconds)
                     returncode = process.poll()
+            # Runner span closes here: the process is confirmed exited
+            # (naturally, or terminated above), before authority
+            # verification's probe subprocesses run.  This is the sole
+            # evidentiary duration; downstream measurement/gain math must
+            # read ``runner_elapsed_ns``, never ``parent_elapsed_ns``.
+            runner_elapsed_ns = max(1, time.monotonic_ns() - runner_started_ns)
             reader_failure = _finish_capture(process, readers, capture, policy.reader_join_timeout_seconds)
             stdout, stderr, stdout_truncated, stderr_truncated, output_truncated = capture.result()
+
+            # Verification now runs after the runner's own subprocess
+            # lifetime, never overlapping the timed span above.
+            # ``LocalSandboxAuthority.verify`` (auto_mlx.sandbox) recovers
+            # the profile text from the immutable, already-set
+            # ``Popen.args`` attribute (valid before or after the process
+            # exits) and launches its own fresh probe subprocesses under
+            # that profile; it never reads live-process state (no stdout/
+            # stdin interaction, no reliance on the process still running).
+            # Moving the call here therefore changes nothing about the
+            # evidence it produces -- only when its cost is paid relative to
+            # the evidentiary clock.  A verification failure still
+            # unconditionally overrides any process-level outcome below,
+            # exactly as when verification ran first.
+            try:
+                isolation = _call_bounded(
+                    lambda: authority.verify(provider, process, launched.claim),
+                    policy.authority_timeout_seconds,
+                )
+            except Exception as exc:
+                return _record_failure(
+                    plan,
+                    ExecutionStatus.SANDBOX_UNAVAILABLE,
+                    _failure(
+                        FailureCode.TIMEOUT if isinstance(exc, _HandshakeTimeout) else FailureCode.SANDBOX_UNAVAILABLE,
+                        "isolation authority could not verify provider enforcement",
+                        error=type(exc).__name__,
+                        capture_errors=list(capture.errors),
+                        reader_failure=reader_failure,
+                    ),
+                    time.monotonic_ns() - started_ns,
+                    observation_id=observation_id,
+                    arm=arm,
+                    cleanup=cleanup,
+                    stdout=stdout,
+                    stderr=stderr,
+                    stdout_truncated=stdout_truncated,
+                    stderr_truncated=stderr_truncated,
+                    output_truncated=output_truncated,
+                    runner_elapsed_ns=runner_elapsed_ns,
+                )
+            if (
+                not isinstance(isolation, VerifiedIsolation)
+                or isolation.provider_id != provider.provider_id
+                or isolation.identity != provider.identity
+                or isolation.verifier_id != authority.verifier_id
+                or isolation.verifier_identity != authority.identity
+                or not policy.required_isolation.issubset(isolation.requirements)
+            ):
+                return _record_failure(
+                    plan,
+                    ExecutionStatus.SANDBOX_UNAVAILABLE,
+                    _failure(
+                        FailureCode.SANDBOX_UNAVAILABLE,
+                        "isolation authority returned mismatched evidence identity",
+                        capture_errors=list(capture.errors),
+                        reader_failure=reader_failure,
+                    ),
+                    time.monotonic_ns() - started_ns,
+                    observation_id=observation_id,
+                    arm=arm,
+                    cleanup=cleanup,
+                    stdout=stdout,
+                    stderr=stderr,
+                    stdout_truncated=stdout_truncated,
+                    stderr_truncated=stderr_truncated,
+                    output_truncated=output_truncated,
+                    runner_elapsed_ns=runner_elapsed_ns,
+                )
             elapsed_ns = max(1, time.monotonic_ns() - started_ns)
             common = {
                 "observation_id": observation_id,
@@ -1644,6 +1682,7 @@ def execute_plan(
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
                 "output_truncated": output_truncated,
+                "runner_elapsed_ns": runner_elapsed_ns,
             }
             if output_failed or output_truncated or reader_failure:
                 return _record_failure(
@@ -1697,6 +1736,7 @@ def execute_plan(
                 runner_digest=plan.runner_digest,
                 status=ExecutionStatus.SUCCESS,
                 parent_elapsed_ns=elapsed_ns,
+                runner_elapsed_ns=runner_elapsed_ns,
                 observation_id=observation_id,
                 arm=arm,
                 returncode=returncode,

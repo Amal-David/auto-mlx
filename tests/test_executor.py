@@ -390,6 +390,7 @@ while True: time.sleep(.02)
             runner_digest="4" * 64,
             status=ExecutionStatus.SUCCESS,
             parent_elapsed_ns=1,
+            runner_elapsed_ns=1,
             returncode=0,
             stdout=b"ok\n",
             isolation=isolation,

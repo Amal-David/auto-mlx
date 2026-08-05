@@ -61,9 +61,20 @@ class MeasurementTests(unittest.TestCase):
             isolation_requirements=frozenset({"network_denial", "descendant_containment"}),
         )
 
-    def _sample(self, slot, *, status: ExecutionStatus = ExecutionStatus.SUCCESS, elapsed: int = 100, output: bytes = b"ok\n", isolation=True):
+    def _sample(
+        self,
+        slot,
+        *,
+        status: ExecutionStatus = ExecutionStatus.SUCCESS,
+        elapsed: int = 100,
+        runner_elapsed: int | None = None,
+        output: bytes = b"ok\n",
+        isolation=True,
+    ):
         runner_id = self.baseline_runner_id if slot.arm == "baseline" else self.candidate_runner_id
         runner_digest = self.baseline_runner_digest if slot.arm == "baseline" else self.candidate_runner_digest
+        if runner_elapsed is None and status is ExecutionStatus.SUCCESS:
+            runner_elapsed = elapsed
         record = ExecutionRecord(
             candidate_id=self.candidate_id,
             workload_hash=self.workload_hash,
@@ -71,6 +82,7 @@ class MeasurementTests(unittest.TestCase):
             runner_digest=runner_digest,
             status=status,
             parent_elapsed_ns=elapsed,
+            runner_elapsed_ns=runner_elapsed,
             observation_id=slot.sample_id,
             arm=slot.arm,
             returncode=0 if status is ExecutionStatus.SUCCESS else 1,

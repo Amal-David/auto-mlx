@@ -3,5 +3,10 @@
   "measurement_runs": 3,
   "timeout_seconds": 300,
   "max_output_bytes": 1048576,
-  "thermal_gate_policy": "tag"
+  "thermal_gate_policy": "tag",
+  "k_repetitions": 50,
+  "max_measurement_runs": 20,
+  "min_effect_bps": 200,
+  "bootstrap_resamples": 10000,
+  "calibration": false
 }

@@ -20,6 +20,10 @@ MAX_CONFIG_ENTRIES: Final = 64
 MAX_WARMUP_RUNS: Final = 100
 MAX_MEASUREMENT_RUNS: Final = 100
 MAX_POLICY_OUTPUT_BYTES: Final = 8 * 1024 * 1024
+MAX_K_REPETITIONS: Final = 10_000
+MAX_BOOTSTRAP_RESAMPLES: Final = 1_000_000
+MIN_BOOTSTRAP_RESAMPLES: Final = 100
+MAX_MIN_EFFECT_BPS: Final = 10_000
 
 
 def _object(value: Any, *, label: str) -> dict[str, Any]:
@@ -529,6 +533,26 @@ class EvaluationPolicy:
     # never silently pooling a thermally-suspect block, never refusing by
     # default either.
     thermal_gate_policy: str = "tag"
+    # Wave B statistics fields (see docs/measurement.md and
+    # auto_mlx.statistics). ``k_repetitions`` is the count of in-runner,
+    # eval-fenced timed iterations the runner performs per launch after its
+    # one uncounted warmup (see auto_mlx.runners.reference_matmul);
+    # ``measurement_runs`` above is the STARTING/minimum paired-block count
+    # for sequential sampling, and ``max_measurement_runs`` is the cap it
+    # may extend to when the bootstrap verdict stays inconclusive.
+    # ``min_effect_bps`` is the minimum-effect promotion threshold in basis
+    # points (parts per 10,000) of the baseline point-estimate reference
+    # (default 200 = 2.00%; JSON forbids floats in this codebase, hence
+    # basis points rather than a fraction). ``bootstrap_resamples`` is the
+    # BCa bootstrap resample count. ``calibration`` marks an A/A
+    # (candidate == baseline) evaluation; calibration receipts are
+    # structurally valid evidence but are never promotable (see
+    # auto_mlx.promotion).
+    k_repetitions: int = 50
+    max_measurement_runs: int = 20
+    min_effect_bps: int = 200
+    bootstrap_resamples: int = 10_000
+    calibration: bool = False
 
     def __post_init__(self) -> None:
         _integer(self.warmup_runs, label="warmup_runs", minimum=0, maximum=MAX_WARMUP_RUNS, bound_code=FailureCode.INVALID_POLICY)
@@ -552,6 +576,29 @@ class EvaluationPolicy:
                 f"thermal_gate_policy must be one of {sorted(THERMAL_GATE_POLICIES)}",
                 code=FailureCode.INVALID_POLICY,
             )
+        _integer(self.k_repetitions, label="k_repetitions", minimum=1, maximum=MAX_K_REPETITIONS, bound_code=FailureCode.INVALID_POLICY)
+        _integer(
+            self.max_measurement_runs,
+            label="max_measurement_runs",
+            minimum=1,
+            maximum=MAX_MEASUREMENT_RUNS,
+            bound_code=FailureCode.INVALID_POLICY,
+        )
+        if self.max_measurement_runs < self.measurement_runs:
+            raise ContractError(
+                "max_measurement_runs must be >= measurement_runs",
+                code=FailureCode.INVALID_POLICY,
+            )
+        _integer(self.min_effect_bps, label="min_effect_bps", minimum=0, maximum=MAX_MIN_EFFECT_BPS, bound_code=FailureCode.INVALID_POLICY)
+        _integer(
+            self.bootstrap_resamples,
+            label="bootstrap_resamples",
+            minimum=MIN_BOOTSTRAP_RESAMPLES,
+            maximum=MAX_BOOTSTRAP_RESAMPLES,
+            bound_code=FailureCode.INVALID_POLICY,
+        )
+        if type(self.calibration) is not bool:
+            raise ContractError("calibration must be a boolean", code=FailureCode.INVALID_POLICY)
 
     @property
     def runs(self) -> int:
@@ -572,6 +619,11 @@ class EvaluationPolicy:
             "timeout_seconds": self.timeout_seconds,
             "max_output_bytes": self.max_output_bytes,
             "thermal_gate_policy": self.thermal_gate_policy,
+            "k_repetitions": self.k_repetitions,
+            "max_measurement_runs": self.max_measurement_runs,
+            "min_effect_bps": self.min_effect_bps,
+            "bootstrap_resamples": self.bootstrap_resamples,
+            "calibration": self.calibration,
         }
 
     def to_json(self) -> str:
@@ -582,7 +634,10 @@ class EvaluationPolicy:
         data = _object(value, label="evaluation policy")
         _exact_fields(
             data,
-            {"warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes", "thermal_gate_policy"},
+            {
+                "warmup_runs", "measurement_runs", "timeout_seconds", "max_output_bytes", "thermal_gate_policy",
+                "k_repetitions", "max_measurement_runs", "min_effect_bps", "bootstrap_resamples", "calibration",
+            },
             label="evaluation policy",
         )
         return cls(
@@ -591,6 +646,11 @@ class EvaluationPolicy:
             data["timeout_seconds"],
             data["max_output_bytes"],
             data["thermal_gate_policy"],
+            data["k_repetitions"],
+            data["max_measurement_runs"],
+            data["min_effect_bps"],
+            data["bootstrap_resamples"],
+            data["calibration"],
         )
 
     @classmethod

@@ -26,6 +26,8 @@ from auto_mlx.executor import (
 )
 from auto_mlx.oracle import ExactOutputOracle
 from auto_mlx.sandbox import LocalSandboxAuthority, LocalSandboxProvider
+from auto_mlx.thermal import ThermalReading
+from auto_mlx.thermal import thermal_preflight as _real_thermal_preflight
 
 
 class FixtureIsolationProvider(IsolationProvider):
@@ -113,14 +115,16 @@ class EvaluatorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _evaluator(self, *, provider=None, authority=None) -> Evaluator:
+    def _evaluator(self, *, provider=None, authority=None, policy=None, thermal_preflight=None) -> Evaluator:
         return Evaluator(
             self.registry,
             baseline_runner_id="baseline",
             candidate_runner_id="candidate",
             oracle=ExactOutputOracle(b"ok\n"),
             artifact_root=str(self.root),
-            policy=EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=1, max_output_bytes=4096),
+            policy=policy
+            or EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=1, max_output_bytes=4096),
+            thermal_preflight=thermal_preflight,
             execution_policy=ExecutionPolicy(
                 timeout_seconds=1,
                 max_stdout_bytes=4096,
@@ -148,6 +152,105 @@ class EvaluatorTests(unittest.TestCase):
         self.assertIsNone(bundle.isolation_requirements)
         self.assertIn("production_isolation_unavailable", bundle.measurements.rejection_reasons)
         self.assertFalse(bundle.promotion_eligible)
+
+    def _counting_preflight(self, *, thermally_suspect: bool):
+        """A fast, deterministic stand-in for the real ``pmset``-backed preflight.
+
+        Reuses ``auto_mlx.thermal.thermal_preflight`` itself (not a hand-rolled
+        dict) so the shape returned here is byte-identical to what a real
+        preflight produces; only the prober and the retry sleep are faked so
+        the test never touches real hardware state or waits 30s.
+        """
+
+        calls: list[None] = []
+        reading = ThermalReading("throttled" if thermally_suspect else "nominal", 50 if thermally_suspect else 100, None, None, "")
+
+        def preflight():
+            calls.append(None)
+            return _real_thermal_preflight(prober=lambda: reading, sleep=lambda seconds: None, retry_pause_seconds=30.0)
+
+        return preflight, calls
+
+    def test_thermal_preflight_runs_once_per_block_and_is_recorded(self) -> None:
+        preflight, calls = self._counting_preflight(thermally_suspect=False)
+        bundle = self._evaluator(thermal_preflight=preflight).evaluate(self.proposal)
+        # Two measurement blocks (measurement_runs=2 in _evaluator's default
+        # policy) -- the preflight must run once per block, not once for the
+        # whole evaluate() call, since thermal state can drift block to block.
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(bundle.thermal_blocks), 2)
+        for index, entry in enumerate(bundle.thermal_blocks):
+            with self.subTest(block_index=index):
+                self.assertEqual(entry["block_index"], index)
+                self.assertEqual(entry["block_id"], f"block-{index + 1:04d}")
+                self.assertEqual(entry["policy"], "tag")
+                self.assertFalse(entry["refused"])
+                self.assertFalse(entry["preflight"]["thermally_suspect"])
+        # Nominal thermal state changes nothing about sample collection.
+        self.assertEqual(len(bundle.measurements.raw_records), 8)
+
+    def test_thermal_gate_policy_tag_proceeds_with_suspect_block_tagged(self) -> None:
+        """Default policy ("tag"): a persistently throttled block still runs its samples."""
+
+        preflight, calls = self._counting_preflight(thermally_suspect=True)
+        bundle = self._evaluator(thermal_preflight=preflight).evaluate(self.proposal)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(not entry["refused"] for entry in bundle.thermal_blocks))
+        self.assertTrue(all(entry["preflight"]["thermally_suspect"] for entry in bundle.thermal_blocks))
+        self.assertTrue(all(entry["preflight"]["retried"] for entry in bundle.thermal_blocks))
+        # Tagging, not refusing: every slot still ran (same count as the
+        # nominal-thermal case) -- the block is annotated, never dropped.
+        self.assertEqual(len(bundle.measurements.raw_records), 8)
+
+    def test_thermal_gate_policy_refuse_skips_suspect_block_samples(self) -> None:
+        """"refuse" policy: a persistently throttled block's samples are never taken."""
+
+        preflight, calls = self._counting_preflight(thermally_suspect=True)
+        policy = EvaluationPolicy(
+            warmup_runs=1, measurement_runs=2, timeout_seconds=1, max_output_bytes=4096, thermal_gate_policy="refuse",
+        )
+        bundle = self._evaluator(policy=policy, thermal_preflight=preflight).evaluate(self.proposal)
+        # The preflight still runs for every block -- refusal is decided per
+        # block, not by short-circuiting the whole evaluate() call.
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(entry["refused"] for entry in bundle.thermal_blocks))
+        self.assertTrue(all(entry["policy"] == "refuse" for entry in bundle.thermal_blocks))
+        # No samples were taken for either block -- the evaluator loop
+        # `continue`s past a refused block's slots entirely.
+        self.assertEqual(len(bundle.measurements.raw_records), 0)
+        self.assertTrue(any(reason.startswith("missing:") for reason in bundle.measurements.rejection_reasons))
+        self.assertFalse(bundle.accepted)
+
+    def test_thermal_gate_only_refuses_the_specific_block_that_is_suspect(self) -> None:
+        """Per-block gating: one throttled block among several is refused; the rest are not."""
+
+        # Block 1's preflight makes one prober() call (nominal, no retry).
+        # Block 2's preflight makes two (throttled, then throttled again on
+        # retry) -- so the underlying prober must keep returning "throttled"
+        # once it starts, not just once.
+        nominal = ThermalReading("nominal", 100, None, None, "")
+        throttled = ThermalReading("throttled", 40, None, None, "")
+        prober_calls: list[None] = []
+
+        def prober() -> ThermalReading:
+            prober_calls.append(None)
+            return nominal if len(prober_calls) == 1 else throttled
+
+        calls: list[None] = []
+
+        def preflight():
+            calls.append(None)
+            return _real_thermal_preflight(prober=prober, sleep=lambda seconds: None, retry_pause_seconds=30.0)
+
+        policy = EvaluationPolicy(
+            warmup_runs=1, measurement_runs=2, timeout_seconds=1, max_output_bytes=4096, thermal_gate_policy="refuse",
+        )
+        bundle = self._evaluator(policy=policy, thermal_preflight=preflight).evaluate(self.proposal)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([entry["refused"] for entry in bundle.thermal_blocks], [False, True])
+        # Only the second block's four slots (2 baseline + 2 candidate) were skipped.
+        self.assertEqual(len(bundle.measurements.raw_records), 4)
+        self.assertTrue(all(record.arm is not None for record in bundle.measurements.raw_records))
 
     def test_evaluate_never_reads_external_isolation_metadata(self) -> None:
         bundle = self._evaluator(

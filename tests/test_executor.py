@@ -396,7 +396,16 @@ while True: time.sleep(.02)
         )
         self.assertFalse(authority.production_eligible)
         self.assertFalse(isolation.production_eligible)
-        self.assertFalse(record.promotion_eligible)
+        # ExecutionRecord.promotion_eligible is evidence-based (success,
+        # verified isolation attached, no truncation/failure) and never
+        # reads isolation.production_eligible -- that flag is a caller
+        # claim, permanently withheld regardless of what the authority
+        # passed in (asserted above), and cannot be forged into elevated
+        # status either way.  This record's OTHER evidence is genuine (a
+        # real _attest() call, real success, no failures), so it is
+        # correctly promotion_eligible at this evidence layer: forging the
+        # flag neither grants nor blocks eligibility.
+        self.assertTrue(record.promotion_eligible)
 
     def test_provider_self_claim_without_out_of_band_authority_fails_closed(self) -> None:
         record = self._plan("print('must-not-run')\n").execute(

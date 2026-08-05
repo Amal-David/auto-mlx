@@ -171,6 +171,7 @@ def _execution_policy_from_evaluation_policy(policy: EvaluationPolicy) -> Execut
         max_output_bytes=policy.max_output_bytes,
         require_network_denial=True,
         require_descendant_containment=True,
+        extra_environment={"AUTO_MLX_K_REPETITIONS": str(policy.k_repetitions)},
     )
 
 
@@ -242,11 +243,19 @@ def _context_document_arguments(
     )
     if policy_overrides:
         parser.add_argument(
-            "--samples", type=int, dest="measurement_runs", help="override policy.measurement_runs"
+            "--samples", type=int, dest="measurement_runs", help="override policy.measurement_runs (sequential sampling start)"
         )
         parser.add_argument("--warmup-runs", type=int, help="override policy.warmup_runs")
         parser.add_argument("--timeout-seconds", type=int, help="override policy.timeout_seconds")
         parser.add_argument("--max-output-bytes", type=int, help="override policy.max_output_bytes")
+        parser.add_argument("--k-repetitions", type=int, help="override policy.k_repetitions (in-runner timed iterations)")
+        parser.add_argument(
+            "--max-measurement-runs", type=int, help="override policy.max_measurement_runs (sequential sampling cap)"
+        )
+        parser.add_argument(
+            "--min-effect-bps", type=int, help="override policy.min_effect_bps (promotion threshold, basis points)"
+        )
+        parser.add_argument("--bootstrap-resamples", type=int, help="override policy.bootstrap_resamples")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -284,6 +293,14 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     _context_document_arguments(evaluate_parser, policy_overrides=True, artifact_root_required=True)
+    evaluate_parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="run an A/A (candidate == baseline) calibration evaluation instead of a real candidate evaluation: "
+        "forces policy.calibration=True and runs the baseline runner on both arms, so the resulting "
+        "receipt's statistics measure this policy's true noise floor rather than a real candidate effect. "
+        "Calibration receipts are structurally valid evidence but are never promotable (see auto_mlx.promotion).",
+    )
 
     promote_parser = subparsers.add_parser(
         "promote",
@@ -1016,16 +1033,27 @@ def _run_document_command(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _apply_policy_overrides(policy: EvaluationPolicy, args: argparse.Namespace) -> EvaluationPolicy:
-    overrides: dict[str, int] = {}
+    overrides: dict[str, Any] = {}
     for attribute, field_name in (
         ("measurement_runs", "measurement_runs"),
         ("warmup_runs", "warmup_runs"),
         ("timeout_seconds", "timeout_seconds"),
         ("max_output_bytes", "max_output_bytes"),
+        ("k_repetitions", "k_repetitions"),
+        ("max_measurement_runs", "max_measurement_runs"),
+        ("min_effect_bps", "min_effect_bps"),
+        ("bootstrap_resamples", "bootstrap_resamples"),
     ):
         value = getattr(args, attribute, None)
         if value is not None:
             overrides[field_name] = value
+    # --calibrate is the single source of truth for policy.calibration: it
+    # is equivalent to supplying a --policy document with calibration=true,
+    # and _run_evaluate_command reads policy.calibration (never args.calibrate
+    # directly) to decide whether to force the candidate arm onto the
+    # baseline runner -- so the two entry points stay self-consistent.
+    if getattr(args, "calibrate", False):
+        overrides["calibration"] = True
     if not overrides:
         return policy
     fields = policy.to_dict()
@@ -1088,6 +1116,13 @@ def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
     # every host, never gated behind sandbox availability.
     registry = TrustedRunnerRegistry()
     baseline_runner_id, candidate_runner_id = _resolve_workload_runners(workload, registry)
+    if policy.calibration:
+        # A/A calibration: both arms run the identical baseline runner, so
+        # the resulting receipt's statistics measure this policy's true
+        # noise floor rather than any real candidate effect.  policy.calibration
+        # is the single source of truth for this (see _apply_policy_overrides);
+        # --calibrate is just one way to set it.
+        candidate_runner_id = baseline_runner_id
 
     _require_local_sandbox(stage="G1")
 
@@ -1155,6 +1190,8 @@ def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_runner_id": candidate_runner_id,
         "isolation_tier": bundle.isolation_provider_id,
         "gain": receipt_wire["metrics"]["gain"],
+        "statistics": receipt_wire.get("statistics"),
+        "calibration": policy.calibration,
     }
     if attestation_refusal is not None:
         result["attestation_refusal"] = attestation_refusal
@@ -1180,6 +1217,7 @@ def _run_promote_command(args: argparse.Namespace) -> dict[str, Any]:
     activated = activate_decision(store, validation, artifact_root=artifact_root, attestation_key=key, now_ns=time.time_ns())
 
     gain = validation.recomputed.get("metrics", {}).get("gain", {}) if validation.recomputed else {}
+    statistics = validation.recomputed.get("statistics") if validation.recomputed else None
     result: dict[str, Any] = {
         "ok": True,
         "command": "promote",
@@ -1191,6 +1229,7 @@ def _run_promote_command(args: argparse.Namespace) -> dict[str, Any]:
         "current_decision_id": store.current_decision_id(),
         "store": str(store.root),
         "gain": gain,
+        "statistics": statistics,
     }
     if attestation_refusal is not None:
         result["attestation_refusal"] = attestation_refusal

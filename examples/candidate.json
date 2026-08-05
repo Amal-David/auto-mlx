@@ -1,0 +1,9 @@
+{
+  "provider_id": "declarative-example",
+  "workload_hash": "aeb16a1392821ba4b2e8ffcd0ec6afa56bccaded2816f80bf079ad3ace6fca9b",
+  "config": {
+    "mode": "compiled",
+    "tile": 32
+  },
+  "candidate_id": "6205d675ee038a8283493c9ebf2e25b3906ed7e40e34c1a527301eee200f643c"
+}

@@ -1,0 +1,7 @@
+{
+  "name": "tile",
+  "type": "integer",
+  "values": [],
+  "minimum": 16,
+  "maximum": 32
+}

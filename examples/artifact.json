@@ -1,0 +1,5 @@
+{
+  "path": "weights/toy-matmul.safetensors",
+  "sha256": "792ff3fe422aab022dda000ca75937b3710135e163d62a1fe18d720d65506359",
+  "size_bytes": 131072
+}

@@ -111,18 +111,33 @@ class MeasurementTests(unittest.TestCase):
             for index, slot in enumerate(block.slots)
         ]
         bundle = assemble_measurement_bundle(self.plan, samples)
-        self.assertFalse(bundle.accepted)
-        self.assertIn("production_isolation_unavailable", bundle.rejection_reasons)
-        self.assertTrue(all(not block.accepted for block in bundle.blocks))
-        self.assertTrue(all("production_isolation_unavailable" in block.rejection_reasons for block in bundle.blocks))
-        self.assertFalse(bundle.promotion_eligible)
+        # Every sample carries real, provider/authority-matched isolation
+        # evidence and the plan itself has bound isolation provenance, so
+        # production_isolation_unavailable must NOT fire: that reason means
+        # "isolation evidence was never bound," not "isolation was required."
+        # (Previously this bundle was rejected unconditionally regardless of
+        # evidence quality; assemble_measurement_bundle now only appends the
+        # reason when isolation evidence is actually absent.)
+        self.assertTrue(bundle.accepted)
+        self.assertNotIn("production_isolation_unavailable", bundle.rejection_reasons)
+        self.assertEqual(bundle.rejection_reasons, ())
+        self.assertTrue(all(block.accepted for block in bundle.blocks))
+        self.assertTrue(bundle.promotion_eligible)
         self.assertEqual(len(bundle.raw_samples), 8)
         self.assertEqual(len(bundle.raw_records), 8)
         self.assertEqual(bundle.blocks[0].dispersion_inputs.ordered_parent_elapsed_ns, (100, 101, 102, 103))
         self.assertEqual(bundle.blocks[0].baseline_drift_ns, 3)
         self.assertEqual(bundle.blocks[1].dispersion_inputs.candidate_elapsed_ns, (110, 113))
 
-    def test_forged_isolation_cannot_accept_required_measurement_blocks(self) -> None:
+    def test_forged_production_eligible_flag_has_no_effect_on_evidence_based_acceptance(self) -> None:
+        # A forged VerifiedIsolation.production_eligible=True is never read
+        # by assemble_measurement_bundle (that flag is permanently False by
+        # construction; see VerifiedIsolation.__init__), so it can neither
+        # grant nor block acceptance.  Previously this test coincidentally
+        # passed because every required-isolation bundle was rejected
+        # unconditionally regardless of evidence; now that the unconditional
+        # hold is gone, this otherwise-genuine evidence bundle is correctly
+        # accepted, and the forged flag demonstrably changed nothing.
         samples = [
             self._sample(slot)
             for block in self.plan.blocks
@@ -134,12 +149,9 @@ class MeasurementTests(unittest.TestCase):
 
         bundle = assemble_measurement_bundle(self.plan, samples)
 
-        self.assertFalse(bundle.accepted)
-        self.assertEqual(bundle.rejection_reasons, ("production_isolation_unavailable",))
-        self.assertEqual(
-            [(block.accepted, block.rejection_reasons) for block in bundle.blocks],
-            [(False, ("production_isolation_unavailable",))] * len(self.plan.blocks),
-        )
+        self.assertTrue(bundle.accepted)
+        self.assertEqual(bundle.rejection_reasons, ())
+        self.assertTrue(all(block.accepted for block in bundle.blocks))
 
     def test_missing_slot_is_rejected_and_retained_as_placeholder(self) -> None:
         samples = [self._sample(slot) for slot in self.plan.blocks[0].slots]

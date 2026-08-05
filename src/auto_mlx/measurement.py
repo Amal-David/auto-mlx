@@ -408,9 +408,17 @@ class PairedMeasurementBundle:
 
     @property
     def promotion_eligible(self) -> bool:
-        """G0 retains measurements for diagnosis but never promotes them."""
+        """Structurally complete, verified-isolation, correctness-matched evidence.
 
-        return False
+        This requires everything ``accepted`` requires (complete paired
+        samples, oracle match, no runtime failures) *and* that every raw
+        record carries verified isolation evidence.  The extra isolation
+        check matters when ``require_isolation`` was False on the plan:
+        ``accepted`` can be True for non-isolated raw measurements (kept for
+        diagnosis), but they are never promotion eligible.
+        """
+
+        return self.accepted and all(record.isolation is not None for record in self.raw_records)
 
     def require_complete(self) -> "PairedMeasurementBundle":
         if not self.accepted:
@@ -490,22 +498,28 @@ def assemble_measurement_bundle(
     sample_map, duplicate_ids = _sample_map(samples)
     expected_ids = set(plan.expected_sample_ids)
     unexpected = set(sample_map) - expected_ids
+    isolation_provenance_bound = all(
+        value is not None
+        for value in (
+            plan.isolation_provider_id,
+            plan.isolation_identity,
+            plan.isolation_verifier_id,
+            plan.isolation_verifier_identity,
+            plan.isolation_requirements,
+        )
+    )
     bundle_reasons: list[str] = []
     if not plan.bound:
         bundle_reasons.append("unbound_plan")
-    if plan.require_isolation:
+    if plan.require_isolation and not isolation_provenance_bound:
+        # The plan itself never bound isolation evidence, so production
+        # isolation is structurally unavailable regardless of any per-sample
+        # evidence.  When provenance IS bound, per-slot checks below
+        # (isolation_unverified/isolation_provider_mismatch/...)
+        # independently catch any real evidence problem; this reason is not
+        # appended a second time on top of them.
         bundle_reasons.append(_PRODUCTION_ISOLATION_UNAVAILABLE)
-        if not all(
-            value is not None
-            for value in (
-                plan.isolation_provider_id,
-                plan.isolation_identity,
-                plan.isolation_verifier_id,
-                plan.isolation_verifier_identity,
-                plan.isolation_requirements,
-            )
-        ):
-            bundle_reasons.append("unbound_isolation_provenance")
+        bundle_reasons.append("unbound_isolation_provenance")
     if duplicate_ids:
         bundle_reasons.append("duplicate_sample_ids:" + ",".join(sorted(set(duplicate_ids))))
     if unexpected:
@@ -514,7 +528,9 @@ def assemble_measurement_bundle(
     observations: list[BlockObservation] = []
     for block in plan.blocks:
         block_samples: list[MeasurementSample] = []
-        reasons: list[str] = [_PRODUCTION_ISOLATION_UNAVAILABLE] if plan.require_isolation else []
+        reasons: list[str] = (
+            [_PRODUCTION_ISOLATION_UNAVAILABLE] if plan.require_isolation and not isolation_provenance_bound else []
+        )
         for slot in block.slots:
             sample = sample_map.get(slot.sample_id)
             if sample is None:

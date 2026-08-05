@@ -1,6 +1,8 @@
 # Measurement contract
 
-There is no local MLX benchmark in this repository. No MLX speedup has been measured. G0 evaluator execution is intentionally unavailable: every external provider launch is rejected before invocation until a concrete checked-in supervisor and authority exist. The evaluator still retains raw rejected observations for offline diagnosis; CLI orchestration is deferred.
+`auto-mlx evaluate` runs a real, receipt-backed local measurement on the local sandbox tier (macOS `sandbox-exec`; see `docs/threat-model.md`). Without the local sandbox execution primitives, evaluator execution stays unavailable: every external provider launch is rejected before invocation, and `evaluate` reports a stable `unavailable` diagnostic rather than a result. The evaluator retains raw rejected observations for offline diagnosis even then.
+
+No general MLX speedup has been measured by this project. The one measurement that exists is the checked-in `toy-matmul` reference workload (`examples/workload.json`, driven by `auto_mlx.runners.reference_matmul`): on the Apple Silicon machine it was run on, the `mode="compiled"` candidate was not faster than the `mode="eager"` baseline, and `auto-mlx promote` correctly resolved that receipt to `native_fallback` (`gain_not_positive`). That is one honest, receipt-backed data point for one toy workload, not a general claim, and every requirement below still applies to any future workload's evidence.
 
 ## Required future record
 

@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - jsonschema is an optional test-time de
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from auto_mlx import validate_relative_posix_path
+from auto_mlx.contracts import EvaluationPolicy
 from auto_mlx.errors import UnsafePathError
 from auto_mlx.schemas import schema_names, schema_text
 import json as _json
@@ -126,6 +127,29 @@ class SchemaParityTests(unittest.TestCase):
         schema = _schema("frozen_workload.json")
         self.assertIn("MAX_JSON_DEPTH=64", schema["$comment"])
         self.assertIn("recursive", schema["$comment"])
+
+    @_SKIP_WITHOUT_JSONSCHEMA
+    def test_evaluation_policy_schema_live_validator_accepts_a_real_to_dict_instance(self) -> None:
+        """Guard against the checked-in schema drifting from the dataclass wire.
+
+        ``EvaluationPolicy.to_dict()``/``from_dict()`` are the actual wire
+        contract (see ``_exact_fields`` in ``auto_mlx.contracts``); the
+        checked-in JSON Schema is a separate, hand-maintained document that
+        nothing enforces stays in sync automatically.  Wave A's
+        ``thermal_gate_policy`` field once shipped in the dataclass without a
+        matching schema update -- an instance produced by the real
+        dataclass then failed live Draft 2020-12 validation
+        (``additionalProperties: false`` rejected the unlisted field).  This
+        round-trips a real, both-default and non-default instance through
+        the checked-in schema so that class of drift fails loudly here
+        instead of silently at a caller who happens to validate.
+        """
+
+        schema = _schema("evaluation_policy.json")
+        for policy in (EvaluationPolicy(), EvaluationPolicy(thermal_gate_policy="refuse")):
+            with self.subTest(thermal_gate_policy=policy.thermal_gate_policy):
+                errors = list(jsonschema.Draft202012Validator(schema).iter_errors(policy.to_dict()))
+                self.assertEqual(errors, [])
 
 
 if __name__ == "__main__":

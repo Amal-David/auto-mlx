@@ -2,5 +2,6 @@
   "warmup_runs": 1,
   "measurement_runs": 3,
   "timeout_seconds": 300,
-  "max_output_bytes": 1048576
+  "max_output_bytes": 1048576,
+  "thermal_gate_policy": "tag"
 }

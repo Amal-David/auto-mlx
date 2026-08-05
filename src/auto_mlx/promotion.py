@@ -357,21 +357,34 @@ def make_promotion_decision(
         reason = validation.failures[0].code.value if validation.failures else "supervisor_attestation_required"
         return _fallback_from_validation(validation, reason=reason, now_ns=now_ns)
     # A signed receipt is admissible evidence even when the candidate is
-    # slower.  Activation has the stricter policy-qualified gain gate and
-    # must use the independently recomputed values, never caller metrics.
-    gain = checked.recomputed.get("metrics", {}).get("gain", {})
-    if not (
-        gain.get("improved") is True
-        and type(gain.get("delta_ns")) is int
-        and gain["delta_ns"] > 0
-        and type(gain.get("baseline_sum_ns")) is int
-        and type(gain.get("candidate_sum_ns")) is int
-        and gain["baseline_sum_ns"] > gain["candidate_sum_ns"]
-        and gain.get("numerator") == gain["delta_ns"]
-        and type(gain.get("denominator")) is int
-        and gain["denominator"] > 0
+    # slower or the result is inconclusive.  Activation reads the
+    # independently recomputed Wave B statistics verdict -- never the bare
+    # gain sign, and never caller-supplied metrics.  Missing/unparseable
+    # statistical fields fail closed to not-promotable (never silently
+    # treated as a pass).
+    # checked.recomputed is frozen (see ReceiptValidation.__post_init__'s
+    # _freeze_json call), so nested objects are MappingProxyType, not dict
+    # -- isinstance(..., Mapping) is required here, not isinstance(..., dict).
+    statistics = checked.recomputed.get("statistics")
+    if not isinstance(statistics, Mapping):
+        return _fallback_from_validation(validation, reason="statistics_missing", now_ns=now_ns)
+    if statistics.get("calibration") is True:
+        # A/A calibration receipts are valid evidence of the measured noise
+        # floor, never a promotable candidate result -- see
+        # auto_mlx.statistics's calibration field and "auto-mlx evaluate
+        # --calibrate".
+        return _fallback_from_validation(validation, reason="calibration_receipt_not_promotable", now_ns=now_ns)
+    verdict = statistics.get("verdict")
+    if verdict == "regressed":
+        return _fallback_from_validation(validation, reason="regressed", now_ns=now_ns)
+    if verdict == "inconclusive":
+        return _fallback_from_validation(validation, reason="inconclusive", now_ns=now_ns)
+    if verdict != "improved" or not (
+        type(statistics.get("ci_lower_ns")) is int
+        and type(statistics.get("min_effect_ns")) is int
+        and statistics["ci_lower_ns"] > statistics["min_effect_ns"]
     ):
-        return _fallback_from_validation(validation, reason="gain_not_positive", now_ns=now_ns)
+        return _fallback_from_validation(validation, reason="statistics_missing", now_ns=now_ns)
     receipt = validation.receipt
     return PromotionDecision(
         source="validated_local_receipt",

@@ -281,19 +281,27 @@ def dispatch(
             return _native("receipt_validation_failed")
         if validation.attestation != decision.attestation or not validation.artifacts_verified:
             return _native("activation_proof_or_artifact_missing")
-        gain = validation.recomputed.get("metrics", {}).get("gain", {})
-        if not (
-            gain.get("improved") is True
-            and type(gain.get("delta_ns")) is int
-            and gain["delta_ns"] > 0
-            and type(gain.get("baseline_sum_ns")) is int
-            and type(gain.get("candidate_sum_ns")) is int
-            and gain["baseline_sum_ns"] > gain["candidate_sum_ns"]
-            and gain.get("numerator") == gain["delta_ns"]
-            and type(gain.get("denominator")) is int
-            and gain["denominator"] > 0
+        # Mirrors auto_mlx.promotion.make_promotion_decision's gate: read
+        # the independently recomputed Wave B statistics verdict, never the
+        # bare gain sign.  Fail closed on anything missing/unparseable.
+        # validation.recomputed is frozen (nested objects are
+        # MappingProxyType, not dict), so this must check Mapping, not dict.
+        statistics = validation.recomputed.get("statistics")
+        if not isinstance(statistics, Mapping):
+            return _native("statistics_missing")
+        if statistics.get("calibration") is True:
+            return _native("calibration_receipt_not_promotable")
+        verdict = statistics.get("verdict")
+        if verdict == "regressed":
+            return _native("regressed")
+        if verdict == "inconclusive":
+            return _native("inconclusive")
+        if verdict != "improved" or not (
+            type(statistics.get("ci_lower_ns")) is int
+            and type(statistics.get("min_effect_ns")) is int
+            and statistics["ci_lower_ns"] > statistics["min_effect_ns"]
         ):
-            return _native("gain_not_positive")
+            return _native("statistics_missing")
         timestamps = (receipt.created_at_ns, decision.created_at_ns)
         if any(current_time < timestamp or current_time - timestamp > max_age for timestamp in timestamps):
             return _native("activation_stale")

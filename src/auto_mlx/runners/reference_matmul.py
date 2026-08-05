@@ -65,15 +65,44 @@ difference (see ``docs/measurement.md``).
 This runner now performs exactly one full, uncounted execution of the same
 computation (build inputs, run ``fn``, ``mx.eval``) immediately before the
 measured run, discarding its result.  The digest the oracle checks always
-comes from the *second* (measured) run; the warmup exists purely to pay
-compile/shader-cache/page-fault costs up front so the timed run is warm
-regardless of process cold-start state.  After the warmup completes, this
-runner prints a fixed marker line to stderr (never stdout -- stdout stays
-the oracle-sacred single digest line) so the evaluator can record an
-honest, non-evidentiary ``warm_state`` note in the receipt.  The marker
-string is intentionally duplicated in ``auto_mlx.receipts._WARMUP_MARKER``
-rather than imported, per this module's own no-``auto_mlx``-imports
-invariant above; keep the two literals identical if either changes.
+comes from the *last* measured run (see "K in-runner timed iterations"
+below); the warmup exists purely to pay compile/shader-cache/page-fault
+costs up front so the timed runs are warm regardless of process cold-start
+state.  After the warmup completes, this runner prints a fixed marker line
+to stderr (never stdout -- stdout stays the oracle-sacred single digest
+line) so the evaluator can record an honest, non-evidentiary ``warm_state``
+note in the receipt.  The marker string is intentionally duplicated in
+``auto_mlx.receipts._WARMUP_MARKER`` rather than imported, per this
+module's own no-``auto_mlx``-imports invariant above; keep the two literals
+identical if either changes.
+
+Runner contract: K in-runner timed iterations (Wave B)
+----------------------------------------------------------------
+
+After the uncounted warmup above, this runner performs ``K`` additional
+eval-fenced executions of the same computation, timing each one with
+``time.perf_counter_ns()``.  ``K`` comes from the ``AUTO_MLX_K_REPETITIONS``
+environment variable the evaluator sets (see
+``auto_mlx.evaluator._execution_policy_from_contract``); it defaults to
+``DEFAULT_K_REPETITIONS`` below when the variable is absent (manual/ad-hoc
+invocations).  The oracle-sacred stdout digest still comes from exactly one
+line -- the digest of the *last* of the K measured iterations (the
+workload is deterministic, so every iteration's digest is identical; see
+"Why ``tile`` is validated but not applied" above).
+
+The per-iteration timings are reported on a second, non-oracle stderr line
+prefixed with ``ITER_TIMINGS_MARKER`` and followed by a single-line JSON
+object ``{"k": K, "iterations_ns": [...]}``.  This channel is
+self-reported and is not evidentiary on its own: the evaluator's parent
+process wall-clock span (``ExecutionRecord.runner_elapsed_ns``) remains the
+sole evidentiary timing anchor.  ``auto_mlx.statistics`` cross-checks the
+reported sum against that parent-observed span before trusting it at all
+(see ``auto_mlx.statistics.compute_sample_timing`` and its
+``forged_timing`` rejection); an untrusted report degrades the sample to
+K=1 semantics (the parent span alone), never silently accepted.  The marker
+string is intentionally duplicated in
+``auto_mlx.statistics._ITER_TIMINGS_MARKER`` rather than imported, for the
+same reason ``WARMUP_MARKER`` is duplicated above.
 
 Device: CPU, deliberately
 --------------------------
@@ -101,6 +130,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 
 
 # Hardcoded to match examples/workload.json's toy-matmul parameters:
@@ -115,6 +145,15 @@ TILE_MAXIMUM = 32
 # Must stay byte-identical to auto_mlx.receipts._WARMUP_MARKER (this module
 # cannot import auto_mlx -- see the module docstring).
 WARMUP_MARKER = "auto_mlx_runner_warmup_complete"
+# Must stay byte-identical to auto_mlx.statistics._ITER_TIMINGS_MARKER (this
+# module cannot import auto_mlx -- see the module docstring).
+ITER_TIMINGS_MARKER = "auto_mlx_runner_iter_timings_v1"
+# Used only when AUTO_MLX_K_REPETITIONS is absent (manual/ad-hoc
+# invocations); the evaluator always sets the environment variable
+# explicitly from EvaluationPolicy.k_repetitions (default also 50).
+DEFAULT_K_REPETITIONS = 50
+MAX_K_REPETITIONS = 10_000
+_K_REPETITIONS_ENV = "AUTO_MLX_K_REPETITIONS"
 
 
 class ConfigError(ValueError):
@@ -190,12 +229,35 @@ def _digest_result(result: object) -> str:
     return digest.hexdigest()
 
 
-def run(mode: str, tile: int) -> str:
+def _parse_k_repetitions(raw: str | None) -> int:
+    """Parse ``AUTO_MLX_K_REPETITIONS``; fail closed on anything malformed.
+
+    Absent -> :data:`DEFAULT_K_REPETITIONS`.  Present but not a positive
+    integer within ``[1, MAX_K_REPETITIONS]`` -> :class:`ConfigError`, same
+    fail-closed contract as every other input this runner parses.
+    """
+
+    if raw is None:
+        return DEFAULT_K_REPETITIONS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{_K_REPETITIONS_ENV} must be an integer, got {raw!r}") from exc
+    if not (1 <= value <= MAX_K_REPETITIONS):
+        raise ConfigError(f"{_K_REPETITIONS_ENV} must be within [1, {MAX_K_REPETITIONS}], got {value}")
+    return value
+
+
+def run(mode: str, tile: int, *, k_repetitions: int) -> str:
     """Execute the toy-matmul workload and return its canonical result digest.
 
     ``tile`` is accepted and was already bounds-checked by
     :func:`parse_config`; see the module docstring for why it is not
-    applied to the computation.
+    applied to the computation.  ``k_repetitions`` is the count of
+    additional, eval-fenced timed iterations run after the one uncounted
+    warmup (see the module docstring's "K in-runner timed iterations"
+    section); the returned digest always comes from the last of those K
+    iterations.
     """
 
     del tile  # validated, intentionally inert -- see module docstring
@@ -207,13 +269,27 @@ def run(mode: str, tile: int) -> str:
 
     # One uncounted warmup: see the module docstring's "Runner contract"
     # section.  Same `fn`, same inputs, discarded result -- pays compile/
-    # shader-cache/page-fault cost before the measured, digested run.
+    # shader-cache/page-fault cost before the measured, digested runs.
     warmup_result = fn(a, b)
     mx.eval(warmup_result)
     print(WARMUP_MARKER, file=sys.stderr, flush=True)
 
-    result = fn(a, b)
-    mx.eval(result)
+    # K eval-fenced timed iterations.  Each iteration is timed individually
+    # with a monotonic, high-resolution clock; the parent evaluator process
+    # never trusts this self-reported array on its own (see the module
+    # docstring and auto_mlx.statistics.compute_sample_timing) -- it is
+    # cross-checked against the parent-observed subprocess wall-clock span
+    # before being used for anything.
+    iterations_ns: list[int] = []
+    result = None
+    for _ in range(k_repetitions):
+        started = time.perf_counter_ns()
+        result = fn(a, b)
+        mx.eval(result)
+        iterations_ns.append(time.perf_counter_ns() - started)
+    timings_payload = json.dumps({"k": k_repetitions, "iterations_ns": iterations_ns}, separators=(",", ":"))
+    print(f"{ITER_TIMINGS_MARKER} {timings_payload}", file=sys.stderr, flush=True)
+
     return _digest_result(result)
 
 
@@ -252,7 +328,8 @@ def main(argv: list[str] | None = None) -> int:
         mode, tile = parse_config(raw)
         if force_mode is not None:
             mode = force_mode
-        digest = run(mode, tile)
+        k_repetitions = _parse_k_repetitions(os.environ.get(_K_REPETITIONS_ENV))
+        digest = run(mode, tile, k_repetitions=k_repetitions)
     except ConfigError as exc:
         print(f"invalid reference_matmul runner input: {exc}", file=sys.stderr)
         return 2

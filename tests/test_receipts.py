@@ -323,8 +323,15 @@ class ReceiptTests(unittest.TestCase):
             oracle=oracle,
             oracle_descriptor=oracle.descriptor,
         )
-        self.assertFalse(bundle.accepted)
-        self.assertFalse(bundle.promotion_eligible)
+        # Every warmup and sample here carries real, matched isolation
+        # evidence and a matching oracle, so the G1 evidence layer correctly
+        # accepts this bundle now that acceptance is evidence-based rather
+        # than an unconditional hold. G2 receipt/promotion activation is a
+        # SEPARATE, independent gate (receipts.py hardcodes
+        # status="failed" for every evaluator-bundle-derived receipt,
+        # unrelated to bundle.accepted) and is asserted unchanged below.
+        self.assertTrue(bundle.accepted)
+        self.assertTrue(bundle.promotion_eligible)
         receipt = Receipt.from_observation_bundle(
             bundle,
             self.workload,

@@ -13,8 +13,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from auto_mlx import CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob
 from auto_mlx.evaluator import Evaluator, ObservationBundle
 from auto_mlx.errors import ContractError, Failure, FailureCode
-from auto_mlx.executor import ExecutionPolicy, ExecutionStatus, IsolationAuthority, IsolationClaim, IsolationProvider, IsolatedProcess, TrustedRunner, TrustedRunnerRegistry
+from auto_mlx.executor import (
+    ExecutionPolicy,
+    ExecutionStatus,
+    IsolationAuthority,
+    IsolationClaim,
+    IsolationProvider,
+    IsolatedProcess,
+    TrustedRunner,
+    TrustedRunnerRegistry,
+    local_sandbox_primitives_available,
+)
 from auto_mlx.oracle import ExactOutputOracle
+from auto_mlx.sandbox import LocalSandboxAuthority, LocalSandboxProvider
 
 
 class FixtureIsolationProvider(IsolationProvider):
@@ -325,6 +336,105 @@ class EvaluatorTests(unittest.TestCase):
         ):
             with self.subTest(name=name):
                 self.assertFalse(forged.promotion_eligible)
+
+
+@unittest.skipUnless(
+    local_sandbox_primitives_available(),
+    "local sandbox-exec primitives (macOS + sandbox-exec) are unavailable on this host",
+)
+class EvaluatorLocalSandboxTests(unittest.TestCase):
+    """End-to-end: Evaluator -> execute_plan -> LocalSandboxProvider/Authority."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.workload = FrozenWorkload("evaluator-sandbox-fixture", knobs=(Knob("mode", "enum", values=("safe",)),))
+        self.proposal = CandidateProposal("fixture-provider", self.workload, {"mode": "safe"})
+        self.script = self.root / "runner.py"
+        self.script.write_text("print('ok')\n", encoding="utf-8")
+        baseline = TrustedRunner.from_command(
+            "baseline",
+            (sys.executable, str(self.script)),
+            artifact_paths=(str(self.script), str(Path(sys.executable).resolve())),
+        )
+        candidate = TrustedRunner.from_command(
+            "candidate",
+            (sys.executable, str(self.script)),
+            artifact_paths=(str(self.script), str(Path(sys.executable).resolve())),
+        )
+        self.registry = TrustedRunnerRegistry((baseline, candidate))
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_real_local_sandbox_evaluation_is_accepted_and_promotion_eligible(self) -> None:
+        evaluator = Evaluator(
+            self.registry,
+            baseline_runner_id="baseline",
+            candidate_runner_id="candidate",
+            oracle=ExactOutputOracle(b"ok\n"),
+            artifact_root=str(self.root),
+            policy=EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=5, max_output_bytes=4096),
+            execution_policy=ExecutionPolicy(
+                timeout_seconds=5,
+                max_stdout_bytes=4096,
+                max_stderr_bytes=4096,
+                max_output_bytes=4096,
+            ),
+            provider=LocalSandboxProvider(),
+            authority=LocalSandboxAuthority(),
+        )
+        bundle = evaluator.evaluate(self.proposal)
+        self.assertTrue(all(record.status is ExecutionStatus.SUCCESS for record in bundle.raw_records))
+        self.assertTrue(all(record.stdout == b"ok\n" for record in bundle.raw_records))
+        # Isolation identity is threaded from real execution evidence, not
+        # hardcoded None: it must reflect the LocalSandboxProvider/Authority
+        # actually used.
+        self.assertEqual(bundle.isolation_provider_id, "local-sandbox-exec")
+        self.assertEqual(bundle.isolation_verifier_id, "local-sandbox-authority")
+        self.assertIsNotNone(bundle.isolation_identity)
+        self.assertIsNotNone(bundle.isolation_verifier_identity)
+        self.assertEqual(bundle.isolation_requirements, frozenset({"network_denial", "descendant_containment"}))
+        self.assertNotIn("production_isolation_unavailable", bundle.measurements.rejection_reasons)
+        self.assertTrue(bundle.accepted)
+        self.assertTrue(bundle.promotion_eligible)
+        self.assertTrue(bundle.measurements.accepted)
+        self.assertTrue(bundle.measurements.promotion_eligible)
+
+    def test_evaluate_never_reads_local_sandbox_provider_or_authority_identity_directly(self) -> None:
+        # Same invariant as test_evaluate_never_reads_external_isolation_metadata,
+        # exercised against the real local sandbox provider/authority rather
+        # than a fixture: Evaluator must derive bundle-level isolation
+        # identity only from what real execution actually returned.
+        class ExplodingLocalSandboxProvider(LocalSandboxProvider):
+            @property
+            def provider_id(self):
+                raise AssertionError("evaluator must not read provider_id")
+
+            @property
+            def identity(self):
+                raise AssertionError("evaluator must not read provider identity")
+
+        evaluator = Evaluator(
+            self.registry,
+            baseline_runner_id="baseline",
+            candidate_runner_id="candidate",
+            oracle=ExactOutputOracle(b"ok\n"),
+            artifact_root=str(self.root),
+            policy=EvaluationPolicy(warmup_runs=1, measurement_runs=1, timeout_seconds=5, max_output_bytes=4096),
+            execution_policy=ExecutionPolicy(
+                timeout_seconds=5,
+                max_stdout_bytes=4096,
+                max_stderr_bytes=4096,
+                max_output_bytes=4096,
+            ),
+            provider=ExplodingLocalSandboxProvider(),
+            authority=LocalSandboxAuthority(),
+        )
+        bundle = evaluator.evaluate(self.proposal)
+        self.assertFalse(bundle.accepted)
+        self.assertIsNone(bundle.isolation_provider_id)
+        self.assertIsNone(bundle.isolation_identity)
 
 
 if __name__ == "__main__":

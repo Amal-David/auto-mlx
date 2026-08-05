@@ -163,15 +163,42 @@ class ObservationBundle:
 
     @property
     def accepted(self) -> bool:
-        """G0 withholds public acceptance until a supervisor exists."""
+        """Whether every warmup and measurement sample is genuine, bound evidence.
 
-        return False
+        Computed from real evidence -- warmup identity/isolation/oracle
+        binding plus a from-scratch recomputation of the measurement bundle
+        -- never from a caller-supplied summary.  Absent or malformed
+        evidence (unbound identity, missing isolation, forged provenance)
+        fails closed to False, exactly as before; this only stops being
+        unconditionally False once genuine evidence supports it.
+        """
+
+        if not self._warmups_are_bound():
+            return False
+        try:
+            measurements = self.recompute_measurements()
+        except ContractError:
+            return False
+        return measurements.accepted
 
     @property
     def promotion_eligible(self) -> bool:
-        """G0 holds all observations from production promotion."""
+        """Whether this bundle is complete, verified-isolation evidence.
 
-        return False
+        This is the G1 evidence layer's own judgment -- it is a necessary
+        input to, but not the same thing as, G2 production activation
+        (receipt validation and promotion decisions independently
+        recompute and gate on their own evidence; see
+        docs/evidence-and-promotion.md).
+        """
+
+        if not self._warmups_are_bound():
+            return False
+        try:
+            measurements = self.recompute_measurements()
+        except ContractError:
+            return False
+        return measurements.promotion_eligible
 
     def _bundle_identity_is_bound(self, execution_policy: ExecutionPolicy) -> bool:
         if type(self.candidate_id) is not str or type(self.workload_hash) is not str:
@@ -325,11 +352,20 @@ class Evaluator:
         self._execution_policy_digest = _execution_policy_digest(self._execution_policy)
         self._baseline_runner = registry.resolve(baseline_runner_id)
         self._candidate_runner = registry.resolve(candidate_runner_id)
+        # Held only to be forwarded into plan.execute(); evaluate() never
+        # reads a provider/authority's own identity properties directly
+        # (see test_evaluate_never_reads_external_isolation_metadata) --
+        # bundle-level isolation identity is derived exclusively from the
+        # VerifiedIsolation a real execution actually returns.
+        self._provider = provider
+        self._authority = authority
 
     def _run(self, plan: ExecutionPlan, sample_id: str, arm: str) -> Observation:
         record = plan.execute(
             self._execution_policy,
             registry=self._registry,
+            provider=self._provider,
+            authority=self._authority,
             observation_id=sample_id,
             arm=arm,
         )
@@ -345,6 +381,25 @@ class Evaluator:
             warmups.append(self._run(baseline_plan, f"warmup-{index + 1:04d}-baseline", "baseline"))
             warmups.append(self._run(candidate_plan, f"warmup-{index + 1:04d}-candidate", "candidate"))
 
+        # Isolation identity is derived exclusively from evidence a real
+        # execution actually returned (the first warmup's VerifiedIsolation,
+        # if any) -- never by reading provider/authority properties
+        # directly.  Absent real evidence, identity stays fully unbound and
+        # every downstream record is later rejected for missing isolation.
+        first_isolation = warmups[0].record.isolation if warmups else None
+        if first_isolation is not None:
+            isolation_provider_id = first_isolation.provider_id
+            isolation_identity = first_isolation.identity
+            isolation_verifier_id = first_isolation.verifier_id
+            isolation_verifier_identity = first_isolation.verifier_identity
+            isolation_requirements = self._execution_policy.required_isolation
+        else:
+            isolation_provider_id = None
+            isolation_identity = None
+            isolation_verifier_id = None
+            isolation_verifier_identity = None
+            isolation_requirements = None
+
         count = self._block_count
         measurement_plan = PairedMeasurementPlan.create(
             count,
@@ -356,6 +411,11 @@ class Evaluator:
             candidate_runner_digest=candidate_plan.runner_digest,
             oracle=self._oracle,
             require_isolation=True,
+            isolation_provider_id=isolation_provider_id,
+            isolation_identity=isolation_identity,
+            isolation_verifier_id=isolation_verifier_id,
+            isolation_verifier_identity=isolation_verifier_identity,
+            isolation_requirements=isolation_requirements,
         )
         samples: list[MeasurementSample] = []
         for block in measurement_plan.blocks:
@@ -381,13 +441,13 @@ class Evaluator:
             baseline_runner_digest=baseline_plan.runner_digest,
             candidate_runner_id=candidate_plan.runner_id,
             candidate_runner_digest=candidate_plan.runner_digest,
-            isolation_provider_id=None,
-            isolation_identity=None,
-            isolation_verifier_id=None,
-            isolation_verifier_identity=None,
+            isolation_provider_id=isolation_provider_id,
+            isolation_identity=isolation_identity,
+            isolation_verifier_id=isolation_verifier_id,
+            isolation_verifier_identity=isolation_verifier_identity,
             warmups=tuple(warmups),
             measurements=measurements,
-            isolation_requirements=None,
+            isolation_requirements=isolation_requirements,
             policy_digest=self._policy_digest,
             execution_policy_digest=self._execution_policy_digest,
             measurement_block_count=count,

@@ -1109,11 +1109,31 @@ def _receipt_from_observation_bundle(
                     0,
                 )
             )
-    failure = Failure(
-        FailureCode.RUNTIME_FAILURE,
-        "G0 evaluator observation bundle is rejected; production isolation is unavailable",
-        {"reasons": list(recomputed_measurements.rejection_reasons)},
-    )
+    # Status reflects the bundle's OWN, independently-recomputed evidence
+    # judgment (ObservationBundle.accepted / .promotion_eligible in
+    # evaluator.py) -- never an unconditional hold.  This is still only the
+    # G1 evidence layer's opinion: G2 promotion (make_promotion_decision)
+    # separately and independently re-derives everything from raw_samples,
+    # and activation additionally requires a real out-of-band supervisor
+    # attestation (see auto_mlx.supervisor) before a receipt can ever
+    # activate -- a "complete" status here is necessary, never sufficient.
+    bundle_accepted = bundle.accepted
+    bundle_promotion_eligible = bundle.promotion_eligible
+    if bundle_accepted and bundle_promotion_eligible:
+        status = "complete"
+        failure = None
+    else:
+        status = "failed"
+        reasons = list(recomputed_measurements.rejection_reasons)
+        if not bundle_accepted and not reasons:
+            reasons.append("bundle_not_accepted")
+        if bundle_accepted and not bundle_promotion_eligible:
+            reasons.append("bundle_not_promotion_eligible")
+        failure = Failure(
+            FailureCode.RUNTIME_FAILURE,
+            "G0 evaluator observation bundle is not accepted, promotion-eligible evidence",
+            {"reasons": reasons},
+        )
     return Receipt(
         frozen_workload,
         frozen_candidate,
@@ -1124,7 +1144,7 @@ def _receipt_from_observation_bundle(
         created_at_ns=created_at_ns,
         failure=failure,
         evaluator_bundle=evaluator_bundle,
-        status="failed",
+        status=status,
     )
 
 

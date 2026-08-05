@@ -326,10 +326,16 @@ class ReceiptTests(unittest.TestCase):
         # Every warmup and sample here carries real, matched isolation
         # evidence and a matching oracle, so the G1 evidence layer correctly
         # accepts this bundle now that acceptance is evidence-based rather
-        # than an unconditional hold. G2 receipt/promotion activation is a
-        # SEPARATE, independent gate (receipts.py hardcodes
-        # status="failed" for every evaluator-bundle-derived receipt,
-        # unrelated to bundle.accepted) and is asserted unchanged below.
+        # than an unconditional hold. receipts.py's status is now COMPUTED
+        # from that same real evidence (bundle.accepted and
+        # bundle.promotion_eligible), so this well-formed bundle now
+        # produces a "complete" receipt with no failure -- the previous
+        # unconditional status="failed" hold is gone. G2 promotion
+        # activation is still a SEPARATE, independent gate: this test's own
+        # validate_receipt() call below never supplies artifact_root, so
+        # validation.artifacts_verified stays False and make_promotion_decision
+        # still cannot ACTIVATE, exactly as asserted before -- that
+        # assertion is unchanged and still exercises the real gate.
         self.assertTrue(bundle.accepted)
         self.assertTrue(bundle.promotion_eligible)
         receipt = Receipt.from_observation_bundle(
@@ -340,8 +346,8 @@ class ReceiptTests(unittest.TestCase):
             oracle=oracle,
             created_at_ns=100,
         )
-        self.assertEqual(receipt.status, "failed")
-        self.assertIsNotNone(receipt.failure)
+        self.assertEqual(receipt.status, "complete")
+        self.assertIsNone(receipt.failure)
         validation = validate_receipt(
             receipt,
             attestation=receipt_attestation(receipt, self.key),

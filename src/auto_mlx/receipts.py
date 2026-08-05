@@ -31,17 +31,28 @@ from .contracts import (
 )
 from .errors import ContractError, Failure, FailureCode, UnknownFieldError
 from .paths import _open_root_directory, validate_sha256, verify_artifact
+from .statistics import VERDICT_INCONCLUSIVE, StatisticsVerdict, compute_sample_timing, compute_statistics_verdict
 
 
 # v2 (Wave A measurement-integrity remediation): ExecutionRecord.record
 # wire gained a required runner_elapsed_ns (the evidentiary runner-subprocess
 # span, excluding authority-verification probe time); the evaluator_bundle
 # wire gained thermal_blocks (per-block pmset preflight annotations) and a
-# per-sample warm_state note.  v1 receipts do not carry these fields and are
-# rejected outright rather than silently reinterpreted -- this store is
-# local/experimental with no external v1 consumers yet, and a strictly
+# per-sample warm_state note.
+#
+# v3 (Wave B statistical-decision remediation): the evaluator_bundle wire's
+# measurement_runs-sized block count became a variable, sequentially-
+# extended block_count_used (policy.measurement_runs is now the starting/
+# minimum count, policy.max_measurement_runs the cap); every warmup and
+# measurement sample gained a sample_timing note (in-runner K-repetition
+# min-of-K point estimate, or a forged_timing-degraded fallback -- see
+# auto_mlx.statistics); and the receipt gained a top-level, nullable
+# statistics field carrying the BCa-bootstrap verdict, CI bounds, seed, and
+# threshold.  Older receipts do not carry these fields and are rejected
+# outright rather than silently reinterpreted -- this store is
+# local/experimental with no external consumers yet, and a strictly
 # validated evidence format is safer without a dual-schema code path.
-RECEIPT_SCHEMA: Final = "auto_mlx.receipt.v2"
+RECEIPT_SCHEMA: Final = "auto_mlx.receipt.v3"
 NATIVE_FALLBACK: Final = "native_fallback"
 CLAIMS_WITHHELD: Final = "withheld_pending_external_attestation"
 _REQUIRED_ISOLATION: Final = frozenset({"network_denial", "descendant_containment"})
@@ -51,6 +62,14 @@ MAX_STORED_RECEIPT_BYTES: Final = 8 * 1024 * 1024
 MAX_STORED_DECISION_BYTES: Final = 1 * 1024 * 1024
 MAX_CURRENT_POINTER_BYTES: Final = 256
 _VALIDATION_TOKEN = object()
+# Unlike aggregates/oracle/compatibility/metrics (never legitimately null),
+# receipt.statistics IS legitimately null (raw-sample-lane receipts, or an
+# evaluator_bundle whose measurements were never accepted) -- so "the
+# caller did not pass statistics" needs a sentinel distinct from the real
+# value None, or Receipt.from_dict reconstructing a stored null would be
+# silently overwritten by a freshly recomputed non-null value instead of
+# preserving (and later flagging, precisely) the stored one.
+_MISSING_STATISTICS = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +367,10 @@ def recompute_receipt_fields(
         # populates these from real pmset preflights.
         "thermal_blocks": [],
         "thermal_gate_policy": None,
+        # The raw-sample lane predates Wave B sequential sampling too: it
+        # has no paired-block structure to extend, so its block count is
+        # always exactly policy.measurement_runs.
+        "block_count_used": policy.measurement_runs,
     }
     gain_numerator = baseline["sum_ns"] - candidate["sum_ns"]
     return {
@@ -360,6 +383,10 @@ def recompute_receipt_fields(
             "outcomes": outcomes,
         },
         "compatibility": compatibility,
+        # The raw-sample lane has no per-block/per-iteration evidence to
+        # derive a statistical verdict from -- see the evaluator_bundle
+        # lane (_validate_evaluator_bundle_wire) for the real computation.
+        "statistics": None,
         "metrics": {
             "drift": {
                 "count": len(drift_values),
@@ -453,6 +480,7 @@ def _validate_derived_fields(
     oracle: Any,
     compatibility: Any,
     metrics: Any,
+    statistics: Any = None,
 ) -> None:
     aggregate_data = _object(aggregates, label="receipt.aggregates")
     _exact(aggregate_data, {"candidate", "baseline"}, label="receipt.aggregates")
@@ -481,11 +509,15 @@ def _validate_derived_fields(
     compatibility_data = _object(compatibility, label="receipt.compatibility")
     _exact(
         compatibility_data,
-        {"warmup_runs", "measurement_runs", "observed_samples", "compatible", "thermal_blocks", "thermal_gate_policy"},
+        {
+            "warmup_runs", "measurement_runs", "observed_samples", "compatible", "thermal_blocks",
+            "thermal_gate_policy", "block_count_used",
+        },
         label="receipt.compatibility",
     )
     for field in ("warmup_runs", "measurement_runs", "observed_samples"):
         _integer(compatibility_data[field], label=f"receipt.compatibility.{field}", minimum=0)
+    _integer(compatibility_data["block_count_used"], label="receipt.compatibility.block_count_used", minimum=1)
     _boolean(compatibility_data["compatible"], label="receipt.compatibility.compatible")
     if compatibility_data["thermal_gate_policy"] is not None and compatibility_data["thermal_gate_policy"] not in {"tag", "refuse"}:
         raise ContractError("receipt.compatibility.thermal_gate_policy is not a closed thermal gate policy", code=FailureCode.INVALID_VALUE)
@@ -522,6 +554,12 @@ def _validate_derived_fields(
     _integer(gain["denominator"], label="receipt.metrics.gain.denominator", minimum=1)
     _integer(gain["delta_ns"], label="receipt.metrics.gain.delta_ns")
     _boolean(gain["improved"], label="receipt.metrics.gain.improved")
+
+    if statistics is not None:
+        try:
+            StatisticsVerdict.from_dict(statistics)
+        except ContractError as exc:
+            raise ContractError(f"receipt.statistics is malformed: {exc}", code=exc.code) from exc
 
 
 def _validate_stats_like_deviation(value: Any, *, label: str) -> None:
@@ -592,6 +630,55 @@ def _validate_warm_state_shape(value: Any, *, label: str) -> dict[str, Any]:
     return data
 
 
+def _sample_timing_for(*, runner_elapsed_ns: int | None, parent_elapsed_ns: int, stderr: bytes | None) -> dict[str, Any]:
+    """Wave B per-sample timing note; tolerant like ``_warm_state_for`` above.
+
+    Delegates the real trust-boundary work (forged-timing cross-check,
+    min-of-K reduction) to ``auto_mlx.statistics.compute_sample_timing``.
+    This wrapper only handles the cases that function deliberately refuses
+    to guess at: no usable ``runner_elapsed_ns`` at all (a failed sample, or
+    a missing measurement slot) degrades to a ``parent_elapsed_ns``-based
+    placeholder -- never a crash, and never treated as trusted evidence.
+    Calling this identically at wire-build time (from a live
+    ``ExecutionRecord``) and at validation time (from the decoded wire) is
+    what makes ``sample_timing`` independently recomputed, not merely
+    stored -- exactly the ``warm_state`` pattern above.
+    """
+
+    if runner_elapsed_ns is None or runner_elapsed_ns <= 0:
+        return {
+            "raw_iterations_ns": [],
+            "trusted": False,
+            "point_estimate_ns": max(1, parent_elapsed_ns),
+            "rejection_reason": None,
+        }
+    return compute_sample_timing(runner_elapsed_ns, stderr if stderr is not None else b"").to_dict()
+
+
+def _sample_timing_for_record(record: Any | None) -> dict[str, Any]:
+    if record is None:
+        return {"raw_iterations_ns": [], "trusted": False, "point_estimate_ns": 1, "rejection_reason": None}
+    return _sample_timing_for(runner_elapsed_ns=record.runner_elapsed_ns, parent_elapsed_ns=record.parent_elapsed_ns, stderr=record.stderr)
+
+
+def _validate_sample_timing_shape(value: Any, *, label: str) -> dict[str, Any]:
+    data = _object(value, label=label)
+    _exact(data, {"raw_iterations_ns", "trusted", "point_estimate_ns", "rejection_reason"}, label=label)
+    if type(data["raw_iterations_ns"]) is not list or any(
+        type(item) is not int or item <= 0 for item in data["raw_iterations_ns"]
+    ):
+        raise ContractError(f"{label}.raw_iterations_ns must be an array of positive integers", code=FailureCode.WRONG_TYPE)
+    _boolean(data["trusted"], label=f"{label}.trusted")
+    _integer(data["point_estimate_ns"], label=f"{label}.point_estimate_ns", minimum=1)
+    if data["rejection_reason"] is not None and data["rejection_reason"] != "forged_timing":
+        raise ContractError(f"{label}.rejection_reason must be null or forged_timing", code=FailureCode.INVALID_VALUE)
+    if data["trusted"] and data["rejection_reason"] is not None:
+        raise ContractError(f"{label} cannot be trusted and carry a rejection_reason", code=FailureCode.INVALID_VALUE)
+    if data["trusted"] and not data["raw_iterations_ns"]:
+        raise ContractError(f"{label} cannot be trusted without raw iterations", code=FailureCode.INVALID_VALUE)
+    return data
+
+
 def _measurement_bundle_to_wire(measurements: Any, *, seen_arms: set) -> dict[str, Any]:
     blocks = []
     for observation in measurements.blocks:
@@ -613,6 +700,7 @@ def _measurement_bundle_to_wire(measurements: Any, *, seen_arms: set) -> dict[st
                         "warm_state": _warm_state_for(
                             sample.record.stderr if sample.record else None, arm=sample.arm, seen_arms=seen_arms
                         ),
+                        "sample_timing": _sample_timing_for_record(sample.record),
                     }
                     for sample in observation.samples
                 ],
@@ -701,6 +789,9 @@ def _observation_bundle_to_wire(
     thermal_blocks = getattr(bundle, "thermal_blocks", ())
     if type(thermal_blocks) not in {tuple, list} or any(type(item) is not dict for item in thermal_blocks):
         raise ContractError("observation bundle thermal_blocks must be an array of objects", code=FailureCode.WRONG_TYPE)
+    statistics = getattr(bundle, "statistics", None)
+    if statistics is not None and type(statistics) is not dict and not isinstance(statistics, Mapping):
+        raise ContractError("observation bundle statistics must be an object or null", code=FailureCode.WRONG_TYPE)
     seen_arms: set = set()
     warmups_wire = [
         {
@@ -709,12 +800,13 @@ def _observation_bundle_to_wire(
             "record": _record_to_wire(observation.record),
             "oracle": _oracle_to_wire(observation.oracle),
             "warm_state": _warm_state_for(observation.record.stderr, arm=observation.arm, seen_arms=seen_arms),
+            "sample_timing": _sample_timing_for_record(observation.record),
         }
         for observation in bundle.warmups
     ]
     measurements_wire = _measurement_bundle_to_wire(measurements, seen_arms=seen_arms)
     return {
-        "schema": "auto_mlx.observation_bundle.v2",
+        "schema": "auto_mlx.observation_bundle.v3",
         "candidate_id": bundle.candidate_id,
         "workload_hash": bundle.workload_hash,
         "runtime": bundle.runtime.to_dict(),
@@ -737,6 +829,7 @@ def _observation_bundle_to_wire(
         "warmups": warmups_wire,
         "measurements": measurements_wire,
         "thermal_blocks": [dict(item) for item in thermal_blocks],
+        "statistics": None if statistics is None else dict(statistics),
     }
 
 
@@ -859,11 +952,11 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             "schema", "candidate_id", "workload_hash", "runtime", "policy", "baseline_runner_id",
             "baseline_runner_digest", "candidate_runner_id", "candidate_runner_digest",
             "isolation_provider_id", "isolation_identity", "isolation_verifier_id", "isolation_verifier_identity",
-            "isolation_requirements", "oracle", "warmups", "measurements", "thermal_blocks",
+            "isolation_requirements", "oracle", "warmups", "measurements", "thermal_blocks", "statistics",
         },
         label="receipt.evaluator_bundle",
     )
-    if data["schema"] != "auto_mlx.observation_bundle.v2":
+    if data["schema"] != "auto_mlx.observation_bundle.v3":
         raise ContractError("evaluator bundle schema is incompatible", code=FailureCode.INVALID_VALUE)
     _string(data["candidate_id"], label="receipt.evaluator_bundle.candidate_id")
     validate_sha256(data["workload_hash"])
@@ -871,7 +964,15 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
     if EvaluationPolicy.from_dict(data["policy"]) != policy:
         raise ContractError("evaluator bundle policy does not match receipt policy", code=FailureCode.INVALID_POLICY)
     thermal_blocks_wire = data["thermal_blocks"]
-    if type(thermal_blocks_wire) is not list or len(thermal_blocks_wire) != policy.measurement_runs:
+    if type(thermal_blocks_wire) is not list:
+        raise ContractError("evaluator bundle thermal_blocks must be an array", code=FailureCode.WRONG_TYPE)
+    # Wave B sequential sampling: the actual block count varies between
+    # policy.measurement_runs (the starting/minimum count) and
+    # policy.max_measurement_runs (the cap).  One thermal preflight entry
+    # exists per block regardless of outcome (see Evaluator.evaluate), so
+    # its length is the real, evidentiary block count for this receipt.
+    block_count = len(thermal_blocks_wire)
+    if not (policy.measurement_runs <= block_count <= policy.max_measurement_runs):
         raise ContractError("evaluator bundle thermal_blocks do not match measurement policy", code=FailureCode.INVALID_POLICY)
     for index, entry in enumerate(thermal_blocks_wire):
         entry_data = _validate_thermal_block_shape(entry, label=f"receipt.evaluator_bundle.thermal_blocks[{index}]")
@@ -940,7 +1041,7 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         warmup_data = _object(warmup, label=f"receipt.evaluator_bundle.warmups[{index}]")
         _exact(
             warmup_data,
-            {"sample_id", "arm", "record", "oracle", "warm_state"},
+            {"sample_id", "arm", "record", "oracle", "warm_state", "sample_timing"},
             label=f"receipt.evaluator_bundle.warmups[{index}]",
         )
         _string(warmup_data["sample_id"], label=f"receipt.evaluator_bundle.warmups[{index}].sample_id")
@@ -955,6 +1056,12 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         expected_warm_state = _warm_state_for(stderr, arm=warmup_data["arm"], seen_arms=seen_arms)
         if warmup_data["warm_state"] != expected_warm_state:
             raise ContractError("warmup warm_state was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
+        _validate_sample_timing_shape(warmup_data["sample_timing"], label=f"receipt.evaluator_bundle.warmups[{index}].sample_timing")
+        expected_sample_timing = _sample_timing_for(
+            runner_elapsed_ns=record_data["runner_elapsed_ns"], parent_elapsed_ns=record_data["parent_elapsed_ns"], stderr=stderr
+        )
+        if warmup_data["sample_timing"] != expected_sample_timing:
+            raise ContractError("warmup sample_timing was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
         expected_runner = data["baseline_runner_id"] if warmup_data["arm"] == "baseline" else data["candidate_runner_id"]
         expected_digest = data["baseline_runner_digest"] if warmup_data["arm"] == "baseline" else data["candidate_runner_digest"]
         if (
@@ -1002,7 +1109,7 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         if type(measurements[name]) is not list or any(type(item) is not str for item in measurements[name]):
             raise ContractError(f"receipt.evaluator_bundle.measurements.{name} must be string arrays", code=FailureCode.WRONG_TYPE)
     blocks = measurements["blocks"]
-    if type(blocks) is not list or len(blocks) != policy.measurement_runs:
+    if type(blocks) is not list or len(blocks) != block_count:
         raise ContractError("evaluator bundle blocks do not match measurement policy", code=FailureCode.INVALID_POLICY)
     from .oracle import ExactOutputOracle
     from .measurement import PairedMeasurementPlan
@@ -1038,6 +1145,8 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
     outcomes: list[dict[str, Any]] = []
     all_slots = 0
     all_success = True
+    block_baseline_points: list[list[int]] = []
+    block_candidate_points: list[list[int]] = []
     for block_index, block in enumerate(blocks):
         block_data = _object(block, label=f"receipt.evaluator_bundle.measurements.blocks[{block_index}]")
         _exact(block_data, {"block_id", "block_index", "sequence", "accepted", "rejection_reasons", "samples", "dispersion_inputs"}, label=f"receipt.evaluator_bundle.measurements.blocks[{block_index}]")
@@ -1094,11 +1203,13 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
         if dispersion["baseline_drift_ns"] != (expected_baseline[1] - expected_baseline[0] if all(value is not None for value in expected_baseline) else None):
             raise ContractError("baseline drift was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
         drift_values.append(block_drift)
+        block_baseline_this: list[int] = []
+        block_candidate_this: list[int] = []
         for slot_index, sample in enumerate(samples):
             sample_data = _object(sample, label=f"block[{block_index}].samples[{slot_index}]")
             _exact(
                 sample_data,
-                {"sample_id", "block_id", "slot_index", "arm", "record", "oracle", "warm_state"},
+                {"sample_id", "block_id", "slot_index", "arm", "record", "oracle", "warm_state", "sample_timing"},
                 label=f"block[{block_index}].samples[{slot_index}]",
             )
             _string(sample_data["sample_id"], label=f"block[{block_index}].sample_id")
@@ -1112,18 +1223,27 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             ):
                 raise ContractError("measurement slot identity does not match its ABBA/BAAB plan", code=FailureCode.IDENTITY_MISMATCH)
             _validate_warm_state_shape(sample_data["warm_state"], label=f"block[{block_index}].samples[{slot_index}].warm_state")
+            _validate_sample_timing_shape(sample_data["sample_timing"], label=f"block[{block_index}].samples[{slot_index}].sample_timing")
             if sample_data["record"] is None or sample_data["oracle"] is None:
                 if sample_data["record"] is None and sample_data["oracle"] is not None:
                     raise ContractError("missing measurement record cannot carry oracle metadata", code=FailureCode.INVALID_VALUE)
                 expected_warm_state = _warm_state_for(None, arm=sample_data["arm"], seen_arms=seen_arms)
                 if sample_data["warm_state"] != expected_warm_state:
                     raise ContractError("measurement warm_state was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
+                expected_sample_timing = _sample_timing_for(runner_elapsed_ns=None, parent_elapsed_ns=1, stderr=None)
+                if sample_data["sample_timing"] != expected_sample_timing:
+                    raise ContractError("measurement sample_timing was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
                 all_success = False
                 continue
             stdout, stderr, record_data = _validate_record_wire(sample_data["record"], label=f"block[{block_index}].samples[{slot_index}].record")
             expected_warm_state = _warm_state_for(stderr, arm=sample_data["arm"], seen_arms=seen_arms)
             if sample_data["warm_state"] != expected_warm_state:
                 raise ContractError("measurement warm_state was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
+            expected_sample_timing = _sample_timing_for(
+                runner_elapsed_ns=record_data["runner_elapsed_ns"], parent_elapsed_ns=record_data["parent_elapsed_ns"], stderr=stderr
+            )
+            if sample_data["sample_timing"] != expected_sample_timing:
+                raise ContractError("measurement sample_timing was not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
             if (
                 record_data["candidate_id"] != data["candidate_id"]
                 or record_data["workload_hash"] != data["workload_hash"]
@@ -1160,8 +1280,10 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             if elapsed is not None:
                 if sample_data["arm"] == "baseline":
                     baseline_values.append(elapsed)
+                    block_baseline_this.append(sample_data["sample_timing"]["point_estimate_ns"])
                 else:
                     candidate_values.append(elapsed)
+                    block_candidate_this.append(sample_data["sample_timing"]["point_estimate_ns"])
             outcomes.append({
                 "index": all_slots,
                 "actual_sha256": hashlib.sha256(stdout).hexdigest(),
@@ -1169,18 +1291,54 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
                 "match": matched,
             })
             all_slots += 1
-    expected_slots = policy.measurement_runs * 4
+        block_baseline_points.append(block_baseline_this)
+        block_candidate_points.append(block_candidate_this)
+    expected_slots = block_count * 4
     compatible = (
         warmup_success
         and all_success
         and all_slots == expected_slots
-        and len(baseline_values) == policy.measurement_runs * 2
-        and len(candidate_values) == policy.measurement_runs * 2
+        and len(baseline_values) == block_count * 2
+        and len(candidate_values) == block_count * 2
     )
     candidate = _stats(candidate_values)
     baseline = _stats(baseline_values)
     matches = sum(1 for outcome in outcomes if outcome["match"])
     gain = baseline["sum_ns"] - candidate["sum_ns"]
+
+    if compatible:
+        if data["statistics"] is None:
+            raise ContractError("evaluator bundle statistics is missing for a compatible measurement set", code=FailureCode.INVALID_VALUE)
+        stored_statistics = StatisticsVerdict.from_dict(data["statistics"])
+        expected_statistics = compute_statistics_verdict(
+            block_baseline_points=block_baseline_points,
+            block_candidate_points=block_candidate_points,
+            k_repetitions=policy.k_repetitions,
+            measurement_runs=policy.measurement_runs,
+            max_measurement_runs=policy.max_measurement_runs,
+            min_effect_bps=policy.min_effect_bps,
+            bootstrap_resamples=policy.bootstrap_resamples,
+            bootstrap_seed=stored_statistics.bootstrap_seed,
+            calibration=policy.calibration,
+        )
+        if expected_statistics.to_dict() != data["statistics"]:
+            raise ContractError("evaluator bundle statistics were not independently recomputed", code=FailureCode.IDENTITY_MISMATCH)
+        # Legitimacy of stopping: an inconclusive verdict is only a
+        # legitimate stopping point at the sequential sampling cap --
+        # otherwise sequential extension should have continued (see
+        # Evaluator.evaluate).  A decisive verdict may stop at any block
+        # count in [measurement_runs, max_measurement_runs].
+        if expected_statistics.verdict == VERDICT_INCONCLUSIVE and block_count != policy.max_measurement_runs:
+            raise ContractError(
+                "evaluation stopped on an inconclusive verdict before reaching the sequential sampling cap",
+                code=FailureCode.INVALID_VALUE,
+            )
+        statistics_out: dict[str, Any] | None = dict(data["statistics"])
+    elif data["statistics"] is not None:
+        raise ContractError("evaluator bundle statistics must be null for an incomplete measurement set", code=FailureCode.INVALID_VALUE)
+    else:
+        statistics_out = None
+
     return {
         "aggregates": {"candidate": candidate, "baseline": baseline},
         "oracle": {"sample_count": all_slots, "matches": matches, "mismatches": all_slots - matches, "all_match": all_slots == matches and all_slots == expected_slots, "outcomes": outcomes},
@@ -1191,7 +1349,9 @@ def _validate_evaluator_bundle_wire(value: Mapping[str, Any], policy: Evaluation
             "compatible": compatible,
             "thermal_blocks": thermal_blocks_wire,
             "thermal_gate_policy": policy.thermal_gate_policy,
+            "block_count_used": block_count,
         },
+        "statistics": statistics_out,
         "metrics": {
             "drift": {"count": len(drift_values), "sum": sum(drift_values), "min": min(drift_values) if drift_values else 0, "max": max(drift_values) if drift_values else 0},
             "dispersion": {"candidate": _mean_abs_deviation(candidate_values), "baseline": _mean_abs_deviation(baseline_values), "candidate_range_ns": candidate["range_ns"], "baseline_range_ns": baseline["range_ns"]},
@@ -1364,6 +1524,7 @@ _RECEIPT_FIELDS: Final = {
     "oracle",
     "compatibility",
     "metrics",
+    "statistics",
     "failure",
     "evaluator_bundle",
     "receipt_id",
@@ -1386,6 +1547,7 @@ class Receipt:
     oracle: Mapping[str, Any]
     compatibility: Mapping[str, Any]
     metrics: Mapping[str, Any]
+    statistics: Mapping[str, Any] | None
     failure: Failure | None
     evaluator_bundle: Mapping[str, Any] | None
     receipt_id: str
@@ -1405,6 +1567,10 @@ class Receipt:
         oracle: Mapping[str, Any] | None = None,
         compatibility: Mapping[str, Any] | None = None,
         metrics: Mapping[str, Any] | None = None,
+        # Sentinel default (not None -- see _MISSING_STATISTICS above):
+        # distinguishes "caller omitted this" (use the recomputed value,
+        # which may itself legitimately be None) from "caller passed None".
+        statistics: Any = _MISSING_STATISTICS,
         status: str | None = None,
         evaluator_bundle: Mapping[str, Any] | None = None,
         receipt_id: str | None = None,
@@ -1431,6 +1597,9 @@ class Receipt:
         body_oracle = dict(computed["oracle"] if oracle is None else oracle)
         body_compatibility = dict(computed["compatibility"] if compatibility is None else compatibility)
         body_metrics = dict(computed["metrics"] if metrics is None else metrics)
+        body_statistics = computed["statistics"] if statistics is _MISSING_STATISTICS else statistics
+        if body_statistics is not None:
+            body_statistics = dict(body_statistics)
         if status is None:
             body_status = "failed" if frozen_failure is not None else "complete"
         else:
@@ -1444,13 +1613,16 @@ class Receipt:
             ("metrics", body_metrics),
         ):
             _json_value(value, label=label)
-        _validate_derived_fields(body_aggregates, body_oracle, body_compatibility, body_metrics)
+        if body_statistics is not None:
+            _json_value(body_statistics, label="statistics")
+        _validate_derived_fields(body_aggregates, body_oracle, body_compatibility, body_metrics, body_statistics)
         if evaluator_bundle is not None:
             _json_value(evaluator_bundle, label="receipt.evaluator_bundle")
         frozen_aggregates = _freeze_json(body_aggregates, path="receipt.aggregates")
         frozen_oracle = _freeze_json(body_oracle, path="receipt.oracle")
         frozen_compatibility = _freeze_json(body_compatibility, path="receipt.compatibility")
         frozen_metrics = _freeze_json(body_metrics, path="receipt.metrics")
+        frozen_statistics = None if body_statistics is None else _freeze_json(body_statistics, path="receipt.statistics")
         object.__setattr__(self, "workload", frozen_workload)
         object.__setattr__(self, "candidate", frozen_candidate)
         object.__setattr__(self, "policy", frozen_policy)
@@ -1463,6 +1635,7 @@ class Receipt:
         object.__setattr__(self, "oracle", frozen_oracle)
         object.__setattr__(self, "compatibility", frozen_compatibility)
         object.__setattr__(self, "metrics", frozen_metrics)
+        object.__setattr__(self, "statistics", frozen_statistics)
         object.__setattr__(self, "failure", frozen_failure)
         object.__setattr__(self, "evaluator_bundle", None if evaluator_bundle is None else _freeze_json(evaluator_bundle, path="receipt.evaluator_bundle"))
         expected_id = sha256_hex(self._body_dict())
@@ -1490,6 +1663,7 @@ class Receipt:
             "oracle": _thaw_json(self.oracle),
             "compatibility": _thaw_json(self.compatibility),
             "metrics": _thaw_json(self.metrics),
+            "statistics": None if self.statistics is None else _thaw_json(self.statistics),
             "failure": self.failure.to_dict() if self.failure is not None else None,
             "evaluator_bundle": None if self.evaluator_bundle is None else _thaw_json(self.evaluator_bundle),
         }
@@ -1541,6 +1715,7 @@ class Receipt:
             oracle=data["oracle"],
             compatibility=data["compatibility"],
             metrics=data["metrics"],
+            statistics=data["statistics"],
             status=data["status"],
             evaluator_bundle=data["evaluator_bundle"],
             receipt_id=data["receipt_id"],
@@ -1693,8 +1868,8 @@ def validate_receipt(
         failures.append(Failure(exc.code, str(exc)))
         recomputed = {}
     else:
-        for field in ("aggregates", "oracle", "compatibility", "metrics"):
-            if _thaw_json(getattr(receipt, field)) != recomputed[field]:
+        for field in ("aggregates", "oracle", "compatibility", "metrics", "statistics"):
+            if _thaw_json(getattr(receipt, field)) != recomputed.get(field):
                 failures.append(_failure(FailureCode.IDENTITY_MISMATCH, f"receipt {field} was not recomputed from raw samples"))
         if receipt.evaluator_bundle is not None and not _raw_samples_match_evaluator_bundle(
             receipt.raw_samples, _thaw_json(receipt.evaluator_bundle)
@@ -1706,13 +1881,26 @@ def validate_receipt(
         expected_indices = list(range(receipt.policy.measurement_runs))
         samples_complete = indices == expected_indices and len(indices) == receipt.policy.measurement_runs
     else:
-        expected_indices = list(range(receipt.policy.measurement_runs * 4))
-        samples_complete = (
-            indices == expected_indices
-            and len(indices) == receipt.policy.measurement_runs * 4
-            and bool(recomputed)
-            and recomputed.get("compatibility", {}).get("compatible") is True
+        # Wave B: the real block count varies with sequential sampling
+        # (policy.measurement_runs is only the starting/minimum count), so
+        # the expected sample count comes from the independently recomputed
+        # compatibility.block_count_used, not the policy field directly.
+        block_count_used = recomputed.get("compatibility", {}).get("block_count_used") if recomputed else None
+        block_count_in_range = (
+            type(block_count_used) is int
+            and receipt.policy.measurement_runs <= block_count_used <= receipt.policy.max_measurement_runs
         )
+        if not block_count_in_range:
+            expected_indices = []
+            samples_complete = False
+        else:
+            expected_indices = list(range(block_count_used * 4))
+            samples_complete = (
+                indices == expected_indices
+                and len(indices) == block_count_used * 4
+                and bool(recomputed)
+                and recomputed.get("compatibility", {}).get("compatible") is True
+            )
     if not samples_complete:
         failures.append(
             _failure(

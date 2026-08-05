@@ -37,12 +37,13 @@ class DispatchTests(unittest.TestCase):
     def active_store(self) -> tuple[ContentAddressedStore, str, str]:
         raw_root = tempfile.TemporaryDirectory()
         self.addCleanup(raw_root.cleanup)
-        store = ContentAddressedStore(raw_root.name)
+        artifact_root = str(Path(raw_root.name).resolve())
+        store = ContentAddressedStore(artifact_root)
         store.put_receipt(self.receipt)
         tag = receipt_attestation(self.receipt, self.key)
-        validation = validate_receipt(self.receipt, artifact_root=raw_root.name, attestation=tag, attestation_key=self.key)
-        decision = activate(store, validation, artifact_root=raw_root.name, attestation_key=self.key, now_ns=110)
-        return store, decision.decision_id, raw_root.name
+        validation = validate_receipt(self.receipt, artifact_root=artifact_root, attestation=tag, attestation_key=self.key)
+        decision = activate(store, validation, artifact_root=artifact_root, attestation_key=self.key, now_ns=110)
+        return store, decision.decision_id, artifact_root
 
     def test_dispatch_requires_exact_workload_candidate_policy_runtime_and_artifacts(self) -> None:
         store, _, artifact_root = self.active_store()

@@ -88,8 +88,11 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(receipt.aggregates["candidate"]["sum_ns"], 210)
         self.assertEqual(receipt.metrics["gain"]["delta_ns"], 40)
         with tempfile.TemporaryDirectory() as raw_root:
+            artifact_root = str(Path(raw_root).resolve())
             tag = receipt_attestation(receipt, self.key)
-            self.assertTrue(validate_receipt(receipt, artifact_root=raw_root, attestation=tag, attestation_key=self.key).ok)
+            self.assertTrue(
+                validate_receipt(receipt, artifact_root=artifact_root, attestation=tag, attestation_key=self.key).ok
+            )
 
         tampered = receipt.to_dict()
         tampered["aggregates"]["candidate"]["sum_ns"] = 999

@@ -116,7 +116,7 @@ class CLITests(unittest.TestCase):
     def test_surrogate_object_key_has_stable_cli_diagnostic_and_exit_code(self) -> None:
         raw = '{"name":"cli-toy","artifacts":[],"knobs":[],"parameters":{"\\ud800":1}}'
         with tempfile.TemporaryDirectory() as raw_directory:
-            path = Path(raw_directory) / "surrogate-key.json"
+            path = Path(raw_directory).resolve() / "surrogate-key.json"
             path.write_text(raw, encoding="ascii")
             status, stdout, stderr = self._run("validate", "workload", str(path))
         self.assertEqual(status, EXIT_CONTRACT)

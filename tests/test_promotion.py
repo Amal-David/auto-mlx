@@ -46,7 +46,8 @@ class PromotionTests(unittest.TestCase):
         return validate_receipt(self.receipt, artifact_root=artifact_root, attestation=tag, attestation_key=self.key)
 
     def test_only_complete_validated_local_receipt_can_activate(self) -> None:
-        with tempfile.TemporaryDirectory() as artifact_root:
+        with tempfile.TemporaryDirectory() as raw_root:
+            artifact_root = str(Path(raw_root).resolve())
             validation = self.validation(artifact_root)
             decision = make_promotion_decision(validation, now_ns=110, attestation_key=self.key)
         self.assertEqual(decision.action, ACTIVATE)
@@ -78,7 +79,8 @@ class PromotionTests(unittest.TestCase):
             )
 
     def test_activation_is_persisted_and_rollback_only_moves_pointer(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_root:
+        with tempfile.TemporaryDirectory() as unresolved_root:
+            raw_root = str(Path(unresolved_root).resolve())
             store = ContentAddressedStore(raw_root)
             store.put_receipt(self.receipt)
             validation = self.validation(raw_root)
@@ -97,7 +99,8 @@ class PromotionTests(unittest.TestCase):
             PromotionDecision.from_dict({**decision.to_dict(), "claims": {"public": "proven", "performance": "proven"}})
 
     def test_self_authored_receipt_without_supervisor_proof_clears_stale_activation(self) -> None:
-        with tempfile.TemporaryDirectory() as raw_root:
+        with tempfile.TemporaryDirectory() as unresolved_root:
+            raw_root = str(Path(unresolved_root).resolve())
             store = ContentAddressedStore(raw_root)
             store.put_receipt(self.receipt)
             active = activate(store, self.validation(raw_root), artifact_root=raw_root, attestation_key=self.key, now_ns=110)
@@ -140,7 +143,8 @@ class PromotionTests(unittest.TestCase):
             ),
             created_at_ns=100,
         )
-        with tempfile.TemporaryDirectory() as raw_root:
+        with tempfile.TemporaryDirectory() as unresolved_root:
+            raw_root = str(Path(unresolved_root).resolve())
             store = ContentAddressedStore(raw_root)
             store.put_receipt(slower)
             tag = receipt_attestation(slower, self.key)
@@ -153,7 +157,8 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(store.current_decision_id(), "native_fallback")
 
     def test_promotion_recomputes_hmac_instead_of_trusting_validation_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as artifact_root:
+        with tempfile.TemporaryDirectory() as raw_root:
+            artifact_root = str(Path(raw_root).resolve())
             validation = self.validation(artifact_root)
             self.assertEqual(
                 make_promotion_decision(validation, attestation_key=b"wrong").action,

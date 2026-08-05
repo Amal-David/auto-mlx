@@ -65,7 +65,7 @@ class OracleTests(unittest.TestCase):
 
     def test_expected_artifact_is_read_from_a_verified_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             expected = root / "expected.bin"
             expected.write_bytes(b"artifact-output")
             artifact = Artifact.from_file(str(root), "expected.bin")
@@ -77,7 +77,7 @@ class OracleTests(unittest.TestCase):
 
     def test_oracle_artifact_symlink_is_rejected_before_lexical_read(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             target = root / "target.bin"
             target.write_bytes(b"secret")
             link = root / "expected.bin"
@@ -90,7 +90,7 @@ class OracleTests(unittest.TestCase):
 
     def test_oracle_descriptor_read_stops_at_declared_size_before_accumulating_extra_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             expected = root / "expected.bin"
             expected.write_bytes(b"a" + b"x" * (2 * 1024 * 1024))
             artifact = Artifact("expected.bin", hashlib.sha256(b"a").hexdigest(), 1)

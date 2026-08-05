@@ -1,0 +1,16 @@
+# The sdist is the release's ground truth: everything a checkout needs to
+# rebuild, re-verify, or re-read the project must be present here regardless
+# of what setuptools' default sdist rules would infer from package discovery.
+include LICENSE
+include README.md
+include CONTRIBUTING.md
+include ROADMAP.md
+include SECURITY.md
+include MANIFEST.in
+graft src/auto_mlx
+graft examples
+graft docs
+graft tests
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store

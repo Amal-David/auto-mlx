@@ -28,7 +28,7 @@ from .contracts import (
     Knob,
     RuntimeIdentity,
 )
-from .errors import AutoMLXError, ContractError, FailureCode
+from .errors import AutoMLXError, CanonicalJSONError, ContractError, FailureCode
 from .providers import DeclarativeProvider
 from .receipts import Receipt, validate_receipt
 
@@ -444,6 +444,26 @@ def _read_json(path_value: str) -> Any:
     return strict_json_loads(raw)
 
 
+def _read_document_json(path_value: str, *, kind: str) -> Any:
+    """Read JSON input for a document command.
+
+    The schema-free ``document`` kind promises only that its input is valid
+    canonical JSON, so every structural JSON failure it can hit -- too deep,
+    an unpaired surrogate, a duplicate key -- is reported as the single
+    stable ``invalid_json`` diagnostic, regardless of which specific rule
+    caught it. Schema-bearing kinds (workload, receipt, ...) keep the
+    precise failure code so callers can tell a bad field apart from
+    unparseable input.
+    """
+
+    try:
+        return _read_json(path_value)
+    except CanonicalJSONError as exc:
+        if kind != "document":
+            raise
+        raise CanonicalJSONError(str(exc)) from exc
+
+
 def _resolve_path(args: argparse.Namespace) -> str:
     paths = [value for value in (args.path, args.input_option) if value is not None]
     if len(paths) != 1:
@@ -796,8 +816,8 @@ def _run_document_command(args: argparse.Namespace) -> dict[str, Any]:
     if args.artifact_root is not None and kind not in {"candidate", "receipt", "workload"}:
         raise CLIUsageError("--artifact-root is only valid for workload, candidate, or receipt documents")
     input_path = _resolve_path(args)
-    value = _read_json(input_path)
-    workload_value = _read_json(args.workload) if args.workload is not None else None
+    value = _read_document_json(input_path, kind=kind)
+    workload_value = _read_document_json(args.workload, kind=kind) if args.workload is not None else None
     document = _as_document(kind, value, workload_value=workload_value, artifact_root=args.artifact_root)
     document_value = _to_dict(document)
     canonical = canonical_json(document_value)

@@ -6,3 +6,4 @@ build/
 *.egg-info/
 .coverage
 .pytest_cache/
+/auto-mlx-workload.json

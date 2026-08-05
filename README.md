@@ -36,6 +36,8 @@ PYTHONPATH=src python3 -m auto_mlx validate provider --input examples/provider.j
 PYTHONPATH=src python3 -m auto_mlx validate workload examples/workload.json --output ./auto-mlx-workload.json
 ```
 
+`--output` uses a descriptor-relative, no-follow walk, so it only accepts a path anchored at the working directory or one with no symlinked ancestor component; an absolute path through a symlinked prefix (for example a `mktemp -d` result on macOS, where `/var` is a symlink) fails closed. `auto-mlx-workload.json` is listed in `.gitignore` so running this command from a checkout does not dirty `git status`.
+
 Output creation uses a private unpredictable staging name and a descriptor-relative no-follow hard link. The final
 destination is absent or a complete `0600` payload; it is never visible while being written and existing output paths
 are never replaced. Ordinary pre-publication failures leave no final name. Post-publication failures attempt an
@@ -48,7 +50,7 @@ The evaluator, receipt, promotion, and dispatch libraries are implemented and ex
 
 No MLX speedup has been measured by this project. CLI orchestration, compiler search, and custom Metal kernels remain deferred. External MLX documentation and research are design inputs, not local benchmark evidence.
 
-Read [the architecture](docs/architecture.md), [the threat model](docs/threat-model.md), [the measurement contract](docs/measurement.md), [evidence and promotion](docs/evidence-and-promotion.md), and [the research landscape](docs/research-landscape.md) before proposing a new lane.
+Read [the architecture](docs/architecture.md), [the CLI reference](docs/cli.md), [the threat model](docs/threat-model.md), [the measurement contract](docs/measurement.md), [evidence and promotion](docs/evidence-and-promotion.md), and [the research landscape](docs/research-landscape.md) before proposing a new lane.
 
 ## License
 

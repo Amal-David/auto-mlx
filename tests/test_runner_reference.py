@@ -43,6 +43,7 @@ from auto_mlx.runners import (
     reference_matmul_script_path,
     register_reference_matmul_runners,
 )
+from auto_mlx.runners.reference_matmul import WARMUP_MARKER
 from auto_mlx.sandbox import LocalSandboxAuthority, LocalSandboxProvider
 
 
@@ -182,6 +183,45 @@ class ReferenceMatmulRunnerDeterminismTests(unittest.TestCase):
             self._execute(CANDIDATE_RUNNER_ID, low_tile),
             self._execute(CANDIDATE_RUNNER_ID, high_tile),
         )
+
+    def _execute_record(self, runner_id: str, proposal: CandidateProposal):
+        plan = build_execution_plan(proposal, self.registry, runner_id, str(self.root))
+        record = plan.execute(
+            ExecutionPolicy(timeout_seconds=60, max_output_bytes=4096),
+            registry=self.registry,
+            provider=self.provider,
+            authority=self.authority,
+        )
+        self.assertIs(record.status, ExecutionStatus.SUCCESS, record.failure)
+        return record
+
+    def test_runner_emits_warmup_marker_on_stderr_and_leaves_stdout_oracle_sacred(self) -> None:
+        """Runner contract (see reference_matmul's module docstring): one
+        uncounted warmup runs before the measured run; its completion is
+        announced only on stderr, and stdout stays exactly the one
+        oracle-sacred digest line the warmup never touches.
+        """
+
+        proposal = CandidateProposal("test-provider", self.workload, {"mode": "eager", "tile": 16})
+        record = self._execute_record(CANDIDATE_RUNNER_ID, proposal)
+        marker = WARMUP_MARKER.encode("utf-8")
+        self.assertEqual(record.stderr.count(marker), 1, record.stderr)
+        stdout_lines = record.stdout.splitlines()
+        self.assertEqual(len(stdout_lines), 1, record.stdout)
+        self.assertNotIn(marker, record.stdout)
+
+    def test_runner_elapsed_ns_excludes_authority_verification_probe_time(self) -> None:
+        """The evidentiary runner span must be strictly shorter than the
+        full-sample span on a real run, since the full span additionally
+        pays the real ``LocalSandboxAuthority``'s three probe subprocesses
+        plus artifact staging (see ``execute_plan`` in ``auto_mlx.executor``).
+        """
+
+        proposal = CandidateProposal("test-provider", self.workload, {"mode": "eager", "tile": 16})
+        record = self._execute_record(CANDIDATE_RUNNER_ID, proposal)
+        self.assertIsNotNone(record.runner_elapsed_ns)
+        self.assertGreater(record.runner_elapsed_ns, 0)
+        self.assertLess(record.runner_elapsed_ns, record.parent_elapsed_ns)
 
 
 @unittest.skipUnless(_RUN_REAL, _SKIP_REASON)
@@ -327,6 +367,50 @@ class ReferenceMatmulEvaluatorLoopTests(unittest.TestCase):
             # not a performance benchmark.
             self.assertGreater(sample.duration_ns, 0)
             self.assertLess(sample.duration_ns, 60_000_000_000)
+
+        # Wave A receipt fields, populated from a real evaluate() call (not
+        # synthetic wire data): thermal annotations, one per measurement
+        # block, and a warm_state note derived from real runner stderr.
+        self.assertIsNotNone(receipt.evaluator_bundle)
+        thermal_blocks = receipt.evaluator_bundle["thermal_blocks"]
+        self.assertEqual(len(thermal_blocks), policy.measurement_runs)
+        for entry in thermal_blocks:
+            self.assertIn(entry["preflight"]["initial"]["state"], {"nominal", "throttled", "unknown"})
+            self.assertIn(entry["preflight"]["final"]["state"], {"nominal", "throttled", "unknown"})
+            self.assertEqual(entry["policy"], "tag")
+
+        measurement_samples = [
+            sample
+            for block in receipt.evaluator_bundle["measurements"]["blocks"]
+            for sample in block["samples"]
+        ]
+        self.assertTrue(measurement_samples)
+        # Every real successful sample carries a runner_elapsed_ns strictly
+        # less than parent_elapsed_ns -- the real authority.verify() probe
+        # cost (three sandbox-exec subprocesses) landed outside the
+        # evidentiary span, not inside it.
+        runner_spans = []
+        for sample in measurement_samples:
+            record = sample["record"]
+            self.assertIsNotNone(record)
+            self.assertEqual(record["status"], "success")
+            self.assertIsNotNone(record["runner_elapsed_ns"])
+            self.assertGreater(record["runner_elapsed_ns"], 0)
+            self.assertLess(record["runner_elapsed_ns"], record["parent_elapsed_ns"])
+            runner_spans.append(record["runner_elapsed_ns"])
+        # The in-runner warmup ran on at least one real sample this call --
+        # the marker was emitted on real stderr and independently detected.
+        self.assertTrue(
+            any(sample["warm_state"]["in_runner_warmup_marker_present"] for sample in measurement_samples)
+        )
+        self.assertTrue(
+            any(warmup["warm_state"]["in_runner_warmup_marker_present"] for warmup in receipt.evaluator_bundle["warmups"])
+        )
+        # Gain math reads the runner span, not the full-sample span: the
+        # receipt's reported sums must equal the sum of the real
+        # runner_elapsed_ns values recomputed here independently.
+        gain = receipt.metrics["gain"]
+        self.assertEqual(gain["baseline_sum_ns"] + gain["candidate_sum_ns"], sum(runner_spans))
 
 
 if __name__ == "__main__":

@@ -561,7 +561,18 @@ class Evaluator:
                 calibration=self._policy.calibration,
             )
             statistics_result = verdict.to_dict()
-            if verdict.verdict != VERDICT_INCONCLUSIVE or count >= self._policy.max_measurement_runs:
+            # Wave C (auto_mlx.tuning): a policy explicitly marked
+            # ``racing`` may also stop an otherwise-inconclusive sequential
+            # procedure early once the CI upper bound has fallen below the
+            # min-effect threshold -- this candidate cannot become a winner
+            # no matter how many further blocks are measured, so there is
+            # nothing left to resolve by continuing to the cap. False for
+            # every non-racing policy (the default), so this is a no-op for
+            # evaluate/promote/dispatch; see
+            # auto_mlx.receipts._validate_evaluator_bundle_wire for the
+            # matching, independently-reverified receipt-wire exception.
+            racing_eliminable = self._policy.racing and verdict.ci_upper_ns < verdict.min_effect_ns
+            if verdict.verdict != VERDICT_INCONCLUSIVE or count >= self._policy.max_measurement_runs or racing_eliminable:
                 break
             count += 1
 

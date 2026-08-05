@@ -17,6 +17,9 @@ auto-mlx dispatch --workload FILE --candidate FILE [--policy FILE] [--runtime FI
                    [--store DIR] [--key-dir DIR] [--execute]
 auto-mlx rollback [--store DIR] [--key-dir DIR]
 auto-mlx keys ensure [--key-dir DIR]
+auto-mlx tune --workload FILE --provider FILE [--policy FILE] [--runtime FILE] --artifact-root DIR
+                   [--store DIR] [--key-dir DIR] [--budget-measurements N] [--budget-seconds N] [--max-candidates N]
+auto-mlx history --workload FILE [--store DIR]
 ```
 
 `KIND` is one of `artifact`, `candidate`, `knob`, `policy`, `provider`, `receipt`, `runtime`, `workload`, or `document`. A positional path is accepted in place of `--input`; exactly one spelling is required. Irrelevant options and ambiguous long-option abbreviations are rejected as usage errors.
@@ -238,3 +241,63 @@ No command in this CLI ever prints raw attestation key bytes, on success or fail
 | 4 | The command requires the local sandbox execution primitives, which are unavailable on this host (`evaluate`, `dispatch --execute`) |
 | 5 | Filesystem, input-file, or output failure |
 | 70 | Unexpected internal failure |
+
+## Searching a knob grid: `tune` and `history`
+
+`tune` enumerates a declarative provider's candidate grid, prunes configs the workload's own knob
+contract excludes, and races the survivors against the baseline under the same statistical
+machinery `evaluate` uses. It needs the local sandbox primitives and fails closed with exit code 4
+otherwise, exactly like `evaluate`.
+
+Racing properties, all of which the tests pin:
+
+- The **baseline is a permanent, unremovable entrant**. A race concludes "keep baseline" unless a
+  candidate reaches a decisive `improved` verdict; there is no configuration in which tuning can
+  remove the fallback floor.
+- A candidate is **only ever eliminated on statistical evidence**, never on a single noisy delta.
+  The two terminal eliminations are `eliminated_futile` (the recomputed CI upper bound is already
+  below the min-effect threshold, so no additional blocks could make this candidate a winner) and
+  `decisive_regressed`.
+- Each racing rung is a **self-contained evaluation** at `measurement_runs == max_measurement_runs`
+  blocks, so every rung's receipt stops exactly at its own cap and the Wave B stop rule (an
+  `inconclusive` verdict is only legitimate at the cap) holds unchanged.
+- **Every measured candidate produces a full attested receipt** through the ordinary pipeline. There
+  is no shortcut evidence lane for search.
+- Budgets (`--budget-measurements`, `--budget-seconds`, `--max-candidates`) are honored strictly,
+  and the summary reports whether the budget was exhausted with candidates still unresolved.
+
+The run emits a content-addressed `auto_mlx.tuning_summary.v1` document — stored alongside receipts
+and echoed on stdout — carrying the ranked entrants with their CI bounds and verdicts, elimination
+reasons and block counts, pre-filter counts, budget accounting, and the workload plus runtime
+identity. `history --workload FILE` reads those summaries back for one workload identity; a
+tune seeds its candidate ordering from a prior winner only when both the workload hash *and* the
+runtime identity match, and ignores prior data entirely otherwise.
+
+```bash
+auto-mlx tune --workload examples/workload.json --provider examples/provider.json \
+  --artifact-root ./artifacts --store ./auto-mlx-store \
+  --max-candidates 2 --budget-measurements 6 --max-measurement-runs 3
+auto-mlx history --workload examples/workload.json --store ./auto-mlx-store
+```
+
+### Measured result on the checked-in example
+
+Racing the checked-in provider grid against `toy-matmul` on an Apple M4 Pro (MLX 0.32.0) took ~47 s
+and produced **no winner**: both entrants ended `eliminated_futile`, and the baseline was retained.
+That is the correct result rather than a limitation of the search, and the reason is a property of
+the example workload itself — the `tile` knob is validated but deliberately inert (real tiling would
+change float accumulation order and break the runner's byte-exact digest parity), so the grid is
+effectively only two configurations wide, and `mode=eager` versus `mode=compiled` is not
+distinguishable on this workload at this host's measured noise floor. A knob space with no real
+effect in it has no optimum to find, and the tool reports that plainly instead of manufacturing one.
+
+### A note on `EvaluationPolicy.racing`
+
+`EvaluationPolicy` carries a `racing` flag that permits stopping on an `inconclusive` verdict before
+the sequential-sampling cap when the independently recomputed CI upper bound has already fallen
+below the min-effect threshold. **No production code path currently sets it.** The rung-based search
+above makes it unnecessary, because each rung already terminates at its own cap. The flag defaults
+to `false`, is re-verified from recomputed statistics rather than trusted from a stored receipt, and
+is covered by tests proving the relaxation cannot apply to ordinary non-racing receipts. It is
+retained as a tested, opt-in mechanism for a future incremental-extension search; treat it as unused
+today rather than as load-bearing.

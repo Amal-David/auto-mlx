@@ -2565,7 +2565,7 @@ class ContentAddressedStore:
         """
 
         data = summary.to_dict() if hasattr(summary, "to_dict") else dict(summary)
-        from .tuning import TuningSummary
+        from .tune import TuningSummary
 
         parsed_summary = TuningSummary.from_dict(data)
         data = parsed_summary.to_dict()
@@ -2608,7 +2608,7 @@ class ContentAddressedStore:
         body.pop("summary_id", None)
         if sha256_hex(body) != summary_id:
             raise ContractError("stored tuning summary hash does not match body", code=FailureCode.IDENTITY_MISMATCH)
-        from .tuning import TuningSummary
+        from .tune import TuningSummary
 
         TuningSummary.from_dict(parsed)
         return parsed

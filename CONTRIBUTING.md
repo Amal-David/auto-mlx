@@ -25,4 +25,4 @@ Do not add remote model execution, arbitrary code generation, shell execution, s
 
 ## Documentation and review
 
-Keep `SKILL.md`-style guidance compact and put architecture detail in `docs/`. Every research-derived recommendation must name its primary source, label the claim as an architecture lesson or empirical evidence, and state the missing validation gate. CI must remain standard Python plus the offline unittest suite.
+Keep `SKILL.md`-style guidance compact and put architecture detail in `docs/`. Every research-derived recommendation must name its primary source, label the claim as an architecture lesson or empirical evidence, and state the missing validation gate. CI runs two jobs: an offline unittest matrix with no network access, and a package-certification job that installs `build`/`setuptools`/`wheel` (and `jsonschema` for the live schema-validator assertions) from PyPI to build and smoke-test the sdist and wheel.

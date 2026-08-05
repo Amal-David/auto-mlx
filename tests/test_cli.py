@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import auto_mlx
 import auto_mlx.cli as cli
 from auto_mlx import CandidateProposal, EvaluationPolicy, FrozenWorkload, Knob, RuntimeIdentity, canonical_json
-from auto_mlx.cli import EXIT_CONTRACT, EXIT_IO, EXIT_UNAVAILABLE, EXIT_USAGE, MAX_JSON_INPUT_BYTES, main
+from auto_mlx.cli import EXIT_CONTRACT, EXIT_IO, EXIT_USAGE, MAX_JSON_INPUT_BYTES, main
 from auto_mlx.errors import ContractError, Failure, FailureCode
 from auto_mlx.receipts import RawSample, Receipt
 
@@ -448,27 +448,25 @@ class CLITests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout.strip(), str(MAX_JSON_INPUT_BYTES))
 
-    def test_deferred_commands_fail_closed_and_do_not_claim_success(self) -> None:
-        expected_stages = {"evaluate": "G1", "promote": "G2", "dispatch": "G2"}
+    def test_bare_evaluate_promote_dispatch_are_usage_errors_without_required_flags(self) -> None:
+        # evaluate/promote/dispatch are real, wired commands now (see
+        # tests/test_cli_loop.py for their full behavior); calling them with
+        # no flags at all is an ordinary missing-required-argument usage
+        # error, exactly like any other subcommand in this CLI.
         for command in ("evaluate", "promote", "dispatch"):
             with self.subTest(command=command):
                 status, stdout, stderr = self._run(command)
-                self.assertEqual(status, EXIT_UNAVAILABLE)
+                self.assertEqual(status, EXIT_USAGE)
                 self.assertEqual(stdout, "")
-                diagnostic = json.loads(stderr)
-                self.assertEqual(diagnostic["error"]["code"], "unavailable")
-                self.assertEqual(diagnostic["error"]["details"]["status"], "deferred")
-                self.assertEqual(diagnostic["error"]["details"]["stage"], expected_stages[command])
-                self.assertEqual(diagnostic["error"]["details"]["surface"], "cli_orchestration")
-                self.assertIn("library exists", diagnostic["error"]["message"])
+                self.assertEqual(json.loads(stderr)["error"]["code"], "usage_error")
 
-    def test_help_describes_deferred_cli_wiring_without_stale_library_claims(self) -> None:
+    def test_help_describes_the_real_command_surface(self) -> None:
         status, stdout, stderr = self._run("--help")
         self.assertEqual(status, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("CLI orchestration is deferred", stdout)
-        self.assertIn("evaluator", stdout)
-        self.assertIn("library exists", stdout)
+        for command in ("validate", "inspect", "evaluate", "promote", "dispatch", "rollback", "keys"):
+            self.assertIn(command, stdout)
+        self.assertNotIn("deferred", stdout)
         self.assertNotIn("not implemented", stdout)
 
     def test_documented_example_commands_are_fresh_checkout_safe(self) -> None:

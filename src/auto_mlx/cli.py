@@ -1,23 +1,34 @@
-"""Dry-run-first, MLX-free command line interface for Auto MLX G0.
+"""MLX-free command line interface for Auto MLX.
 
-The CLI validates declarative documents and inspects identities.  Evaluator,
-receipt, promotion, and dispatch libraries are available separately; their
-CLI orchestration remains explicitly deferred until the required evidence and
-activation boundaries are proven.
+The CLI validates declarative documents and inspects identities without ever
+importing MLX itself.  ``evaluate``, ``promote``, ``dispatch``, ``rollback``,
+and ``keys ensure`` wire the real local evidence-gated loop -- sandboxed
+execution, receipt construction, local supervisor attestation, promotion
+decisions, and dispatch -- through the local sandbox tier
+(:mod:`auto_mlx.sandbox`).  On a host without the local sandbox execution
+primitives (non-macOS, no ``sandbox-exec``, ...), ``evaluate`` and
+``dispatch --execute`` fail closed with a stable ``unavailable`` diagnostic
+and exit code 4, identical in kind to every other fail-closed boundary in
+this codebase; ``promote``, plain ``dispatch``, ``rollback``, and
+``keys ensure`` never need the sandbox and always run.  Real production
+(G3) activation remains a separate, later gate -- see
+``docs/evidence-and-promotion.md``.
 """
 
 from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 from importlib.metadata import PackageNotFoundError, version as distribution_version
 import os
 import secrets
 import stat
 import sys
+import time
 import tomllib
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Callable, Final
 
 from .canonical import canonical_json, sha256_hex, strict_json_loads
 from .contracts import (
@@ -28,9 +39,27 @@ from .contracts import (
     Knob,
     RuntimeIdentity,
 )
-from .errors import AutoMLXError, CanonicalJSONError, ContractError, FailureCode
+from .dispatch import CANDIDATE_MODE, DEFAULT_MAX_AGE_NS, NATIVE_MODE
+from .dispatch import dispatch as run_dispatch
+from .errors import AutoMLXError, CanonicalJSONError, ContractError, FailureCode, KeyMaterialError, SupervisorRefusalError
+from .evaluator import Evaluator
+from .executor import (
+    ExecutionPolicy,
+    ExecutionStatus,
+    TrustedRunnerRegistry,
+    build_execution_plan,
+    local_sandbox_primitives_available,
+)
+from . import keys as keys_module
+from .oracle import ExactOutputOracle
+from .promotion import activate as activate_decision
+from .promotion import rollback as rollback_decision
 from .providers import DeclarativeProvider
 from .receipts import Receipt, validate_receipt
+from .runners import BASELINE_RUNNER_ID, CANDIDATE_RUNNER_ID, register_reference_matmul_runners
+from .sandbox import LocalSandboxAuthority, LocalSandboxProvider
+from . import store_config
+from .supervisor import attest_receipt
 
 
 EXIT_OK: Final = 0
@@ -72,21 +101,6 @@ _CONTRACT_KINDS: Final = (
     "workload",
     "document",
 )
-_DEFERRED_COMMANDS: Final = {
-    "evaluate": (
-        "CLI orchestration is deferred; the evaluator library exists, but production evaluation may fail closed "
-        "until real isolation and supervisor proof are provided"
-    ),
-    "promote": (
-        "CLI orchestration is deferred; the promotion library exists, but activation remains gated on later "
-        "evidence and activation proof"
-    ),
-    "dispatch": (
-        "CLI orchestration is deferred; the dispatch library exists, but activation remains gated on later "
-        "evidence and activation proof"
-    ),
-}
-_DEFERRED_STAGES: Final = {"evaluate": "G1", "promote": "G2", "dispatch": "G2"}
 
 
 class CLIUsageError(Exception):
@@ -95,6 +109,69 @@ class CLIUsageError(Exception):
 
 class CLIIOError(Exception):
     """An input/output failure at the CLI boundary."""
+
+
+class CLIUnavailableError(Exception):
+    """A recognized, real command that cannot run on this host right now.
+
+    Raised only for the local-sandbox-primitives gate (see
+    :func:`auto_mlx.executor.local_sandbox_primitives_available`) -- never for
+    a command that is merely unimplemented.  Renders as the same stable
+    ``unavailable`` JSON diagnostic and exit code 4 that this CLI has always
+    used for a recognized-but-unrunnable command.
+    """
+
+    def __init__(self, message: str, *, stage: str, surface: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.surface = surface
+
+
+# Workload name -> a CLI-owned function that registers that workload's
+# trusted runner(s) into a fresh registry and returns
+# ``(baseline_runner_id, candidate_runner_id)``.  This binding is CLI-owned
+# and closed: a candidate proposal's config never selects a runner or
+# command, only knob values within a workload the CLI already knows how to
+# run.  An unrecognized workload name is a typed, fail-closed diagnostic
+# (see ``_resolve_workload_runners``), never a generic fallback runner.
+def _register_toy_matmul_runners(registry: TrustedRunnerRegistry) -> tuple[str, str]:
+    register_reference_matmul_runners(registry)
+    return BASELINE_RUNNER_ID, CANDIDATE_RUNNER_ID
+
+
+_WORKLOAD_RUNNERS: Final[dict[str, Callable[[TrustedRunnerRegistry], tuple[str, str]]]] = {
+    "toy-matmul": _register_toy_matmul_runners,
+}
+
+
+def _resolve_workload_runners(workload: FrozenWorkload, registry: TrustedRunnerRegistry) -> tuple[str, str]:
+    registrar = _WORKLOAD_RUNNERS.get(workload.name)
+    if registrar is None:
+        raise ContractError(
+            f"no trusted runner is registered for workload {workload.name!r}",
+            code=FailureCode.PROVIDER_ERROR,
+        )
+    return registrar(registry)
+
+
+def _execution_policy_from_evaluation_policy(policy: EvaluationPolicy) -> ExecutionPolicy:
+    """Mirror :func:`auto_mlx.evaluator._execution_policy_from_contract`.
+
+    Duplicated (not imported) because that helper is a private, evaluator-
+    internal symbol; this CLI-owned copy is used for the one-off baseline
+    probe and ``dispatch --execute`` runs that happen outside an
+    :class:`auto_mlx.evaluator.Evaluator` instance.  ``Evaluator`` itself
+    still derives and checks its own execution policy independently.
+    """
+
+    return ExecutionPolicy(
+        timeout_seconds=float(policy.timeout_seconds),
+        max_stdout_bytes=policy.max_output_bytes,
+        max_stderr_bytes=policy.max_output_bytes,
+        max_output_bytes=policy.max_output_bytes,
+        require_network_denial=True,
+        require_descendant_containment=True,
+    )
 
 
 class JSONArgumentParser(argparse.ArgumentParser):
@@ -135,10 +212,48 @@ def _package_version() -> str:
         return "unknown"
 
 
+def _context_document_arguments(
+    parser: argparse.ArgumentParser, *, policy_overrides: bool, artifact_root_required: bool
+) -> None:
+    """Flags shared by ``evaluate`` and ``dispatch`` for their evaluation context."""
+
+    parser.add_argument("--workload", required=True, help="workload document path")
+    parser.add_argument("--candidate", required=True, help="candidate proposal document path")
+    parser.add_argument("--policy", help="evaluation policy document path (defaults to policy defaults)")
+    parser.add_argument(
+        "--runtime",
+        help="runtime identity document path; if given, must match this host's current runtime identity "
+        "(defaults to this host's current runtime identity)",
+    )
+    if artifact_root_required:
+        parser.add_argument(
+            "--artifact-root",
+            required=True,
+            help="local root the evaluator reads and verifies workload artifacts against",
+        )
+    else:
+        parser.add_argument(
+            "--artifact-root",
+            help="local root used to verify workload artifacts, and to run --execute (defaults to the current directory)",
+        )
+    parser.add_argument("--store", help="receipt/decision store root (defaults to AUTO_MLX_STORE or ./auto-mlx-store)")
+    parser.add_argument(
+        "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
+    )
+    if policy_overrides:
+        parser.add_argument(
+            "--samples", type=int, dest="measurement_runs", help="override policy.measurement_runs"
+        )
+        parser.add_argument("--warmup-runs", type=int, help="override policy.warmup_runs")
+        parser.add_argument("--timeout-seconds", type=int, help="override policy.timeout_seconds")
+        parser.add_argument("--max-output-bytes", type=int, help="override policy.max_output_bytes")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = JSONArgumentParser(
         prog="auto-mlx",
-        description="Validate canonical Auto MLX documents and inspect their identities without MLX.",
+        description="Validate canonical Auto MLX documents, inspect their identities, and run the local "
+        "evidence-gated evaluate/promote/dispatch loop -- without MLX at import time.",
         allow_abbrev=False,
     )
     parser.add_argument("--version", action="version", version=f"auto-mlx {_package_version()}")
@@ -159,8 +274,69 @@ def build_parser() -> argparse.ArgumentParser:
             allow_abbrev=False,
         )
         _kind_arguments(command_parser, command=command)
-    for command, reason in _DEFERRED_COMMANDS.items():
-        subparsers.add_parser(command, help=f"deferred: {reason}", allow_abbrev=False)
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help="run a real local evaluation and store an attested receipt",
+        description="Evaluate a candidate against its workload's baseline under the local sandbox tier, "
+        "then store and attempt to attest the resulting receipt. Requires the local sandbox execution "
+        "primitives (macOS, sandbox-exec on PATH); fails closed with exit code 4 otherwise.",
+        allow_abbrev=False,
+    )
+    _context_document_arguments(evaluate_parser, policy_overrides=True, artifact_root_required=True)
+
+    promote_parser = subparsers.add_parser(
+        "promote",
+        help="independently re-attest a stored receipt and decide activation",
+        description="Load a stored receipt, independently re-verify and attest its evidence chain through "
+        "the local supervisor, decide activation, and persist the resulting decision and pointer.",
+        allow_abbrev=False,
+    )
+    promote_parser.add_argument("--receipt", required=True, dest="receipt_id", help="receipt_id to promote")
+    promote_parser.add_argument("--store", help="receipt/decision store root (defaults to AUTO_MLX_STORE or ./auto-mlx-store)")
+    promote_parser.add_argument(
+        "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
+    )
+    promote_parser.add_argument(
+        "--artifact-root",
+        help="local root used to verify declared artifacts at activation time (defaults to the current directory)",
+    )
+
+    dispatch_parser = subparsers.add_parser(
+        "dispatch",
+        help="resolve (and optionally run) the currently active candidate or native fallback",
+        description="Match the current activation decision against the given evaluation context and report "
+        "candidate or native_fallback. With --execute, actually run the selected side under the local "
+        "sandbox tier and report its output digest and duration.",
+        allow_abbrev=False,
+    )
+    _context_document_arguments(dispatch_parser, policy_overrides=False, artifact_root_required=False)
+    dispatch_parser.add_argument(
+        "--execute", action="store_true", help="actually run the selected side under the local sandbox tier"
+    )
+
+    rollback_parser = subparsers.add_parser(
+        "rollback",
+        help="force dispatch back to native fallback",
+        description="Write an immutable rollback decision and point dispatch at native code, regardless of "
+        "the prior activation decision.",
+        allow_abbrev=False,
+    )
+    rollback_parser.add_argument("--store", help="receipt/decision store root (defaults to AUTO_MLX_STORE or ./auto-mlx-store)")
+    rollback_parser.add_argument(
+        "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
+    )
+
+    keys_parser = subparsers.add_parser("keys", help="manage the local attestation key", allow_abbrev=False)
+    keys_subparsers = keys_parser.add_subparsers(dest="keys_command", required=True, parser_class=JSONArgumentParser)
+    keys_ensure_parser = keys_subparsers.add_parser(
+        "ensure",
+        help="create the local attestation key if missing, and report its path and fingerprint",
+        allow_abbrev=False,
+    )
+    keys_ensure_parser.add_argument(
+        "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
+    )
     return parser
 
 
@@ -839,28 +1015,298 @@ def _run_document_command(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def _apply_policy_overrides(policy: EvaluationPolicy, args: argparse.Namespace) -> EvaluationPolicy:
+    overrides: dict[str, int] = {}
+    for attribute, field_name in (
+        ("measurement_runs", "measurement_runs"),
+        ("warmup_runs", "warmup_runs"),
+        ("timeout_seconds", "timeout_seconds"),
+        ("max_output_bytes", "max_output_bytes"),
+    ):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            overrides[field_name] = value
+    if not overrides:
+        return policy
+    fields = policy.to_dict()
+    fields.update(overrides)
+    return EvaluationPolicy.from_dict(fields)
+
+
+def _load_evaluation_context(
+    args: argparse.Namespace,
+) -> tuple[FrozenWorkload, CandidateProposal, EvaluationPolicy, RuntimeIdentity]:
+    """Load workload/candidate/policy/runtime through the same contract layer ``validate`` uses.
+
+    ``--workload`` and ``--candidate`` are always read and validated;
+    ``--policy`` and ``--runtime`` default (evaluation-policy defaults and
+    this host's current runtime identity) when omitted.  A given
+    ``--runtime`` document must match this host's actual current runtime
+    identity -- it is never used to impersonate a different host.
+    """
+
+    artifact_root = args.artifact_root
+    workload_value = _read_document_json(args.workload, kind="workload")
+    workload = _as_document("workload", workload_value, workload_value=None, artifact_root=artifact_root)
+    candidate_value = _read_document_json(args.candidate, kind="candidate")
+    candidate = _as_document("candidate", candidate_value, workload_value=workload_value, artifact_root=artifact_root)
+    if args.policy is not None:
+        policy_value = _read_document_json(args.policy, kind="policy")
+        policy = _as_document("policy", policy_value, workload_value=None, artifact_root=None)
+    else:
+        policy = EvaluationPolicy()
+    policy = _apply_policy_overrides(policy, args)
+    if args.runtime is not None:
+        runtime_value = _read_document_json(args.runtime, kind="runtime")
+        runtime = _as_document("runtime", runtime_value, workload_value=None, artifact_root=None)
+        current = RuntimeIdentity.current()
+        if runtime.identity != current.identity:
+            raise ContractError(
+                "--runtime document does not match this host's current runtime identity",
+                code=FailureCode.IDENTITY_MISMATCH,
+            )
+    else:
+        runtime = RuntimeIdentity.current()
+    return workload, candidate, policy, runtime
+
+
+def _require_local_sandbox(*, stage: str) -> None:
+    if not local_sandbox_primitives_available():
+        raise CLIUnavailableError(
+            "this command requires the local sandbox execution primitives (macOS, sandbox-exec on PATH, "
+            "and descriptor-relative artifact access), which are not available on this host",
+            stage=stage,
+            surface="local_sandbox",
+        )
+
+
+def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
+    workload, candidate, policy, _runtime = _load_evaluation_context(args)
+    artifact_root = args.artifact_root
+
+    # Host-independent: an unrecognized workload is a typed diagnostic on
+    # every host, never gated behind sandbox availability.
+    registry = TrustedRunnerRegistry()
+    baseline_runner_id, candidate_runner_id = _resolve_workload_runners(workload, registry)
+
+    _require_local_sandbox(stage="G1")
+
+    execution_policy = _execution_policy_from_evaluation_policy(policy)
+
+    # The source-of-truth oracle comes from one real baseline execution, not
+    # a hardcoded literal -- matching tests/test_supervisor.py's E2E chain.
+    probe_plan = build_execution_plan(candidate, registry, baseline_runner_id, artifact_root)
+    probe_record = probe_plan.execute(
+        execution_policy,
+        registry=registry,
+        provider=LocalSandboxProvider(),
+        authority=LocalSandboxAuthority(),
+    )
+    if probe_record.status is not ExecutionStatus.SUCCESS:
+        detail = probe_record.failure.message if probe_record.failure is not None else probe_record.status.value
+        raise ContractError(
+            f"baseline probe execution did not succeed: {detail}",
+            code=FailureCode.RUNTIME_FAILURE,
+        )
+    oracle = ExactOutputOracle(probe_record.stdout)
+
+    evaluator = Evaluator(
+        registry,
+        baseline_runner_id=baseline_runner_id,
+        candidate_runner_id=candidate_runner_id,
+        oracle=oracle,
+        artifact_root=artifact_root,
+        policy=policy,
+        execution_policy=execution_policy,
+        provider=LocalSandboxProvider(),
+        authority=LocalSandboxAuthority(),
+    )
+    bundle = evaluator.evaluate(candidate)
+    receipt = Receipt.from_observation_bundle(
+        bundle, workload, candidate, policy, oracle=oracle, created_at_ns=time.time_ns()
+    )
+
+    store = store_config.open_store(args.store, key_dir=args.key_dir)
+    store.put_receipt(receipt, require_durable=True)
+
+    # Auto-ensure the local attestation key on first use, then attempt
+    # supervisor attestation -- never key material in any returned value.
+    key = keys_module.ensure_attestation_key(key_dir=args.key_dir)
+    attested = False
+    attestation_refusal: str | None = None
+    try:
+        attest_receipt(receipt, key, artifact_root=artifact_root)
+        attested = True
+    except SupervisorRefusalError as exc:
+        attestation_refusal = str(exc)
+
+    receipt_wire = receipt.to_dict()
+    result: dict[str, Any] = {
+        "ok": True,
+        "command": "evaluate",
+        "receipt_id": receipt.receipt_id,
+        "status": receipt.status,
+        "attested": attested,
+        "store": str(store.root),
+        "candidate_id": candidate.candidate_id,
+        "workload_hash": workload.workload_hash,
+        "workload_name": workload.name,
+        "baseline_runner_id": baseline_runner_id,
+        "candidate_runner_id": candidate_runner_id,
+        "isolation_tier": bundle.isolation_provider_id,
+        "gain": receipt_wire["metrics"]["gain"],
+    }
+    if attestation_refusal is not None:
+        result["attestation_refusal"] = attestation_refusal
+    return result
+
+
+def _run_promote_command(args: argparse.Namespace) -> dict[str, Any]:
+    store = store_config.open_store(args.store, key_dir=args.key_dir)
+    receipt = store.get_receipt(args.receipt_id)
+    # Strict, non-generating load: promote never silently mints a fresh key
+    # for a receipt it did not itself just evaluate.
+    key = keys_module.load_attestation_key(key_dir=args.key_dir)
+    artifact_root = args.artifact_root if args.artifact_root is not None else str(Path.cwd())
+
+    attestation: str | None = None
+    attestation_refusal: str | None = None
+    try:
+        attestation = attest_receipt(receipt, key, artifact_root=artifact_root)
+    except SupervisorRefusalError as exc:
+        attestation_refusal = str(exc)
+
+    validation = validate_receipt(receipt, artifact_root=artifact_root, attestation=attestation, attestation_key=key)
+    activated = activate_decision(store, validation, artifact_root=artifact_root, attestation_key=key, now_ns=time.time_ns())
+
+    gain = validation.recomputed.get("metrics", {}).get("gain", {}) if validation.recomputed else {}
+    result: dict[str, Any] = {
+        "ok": True,
+        "command": "promote",
+        "receipt_id": receipt.receipt_id,
+        "action": activated.action,
+        "reason": activated.reason,
+        "decision_id": activated.decision_id,
+        "attested": attestation is not None,
+        "current_decision_id": store.current_decision_id(),
+        "store": str(store.root),
+        "gain": gain,
+    }
+    if attestation_refusal is not None:
+        result["attestation_refusal"] = attestation_refusal
+    return result
+
+
+def _run_dispatch_command(args: argparse.Namespace) -> dict[str, Any]:
+    if args.artifact_root is None:
+        args.artifact_root = str(Path.cwd())
+    workload, candidate, policy, runtime = _load_evaluation_context(args)
+    artifact_root = args.artifact_root
+
+    store = store_config.open_store(args.store, key_dir=args.key_dir)
+    try:
+        key: bytes | None = keys_module.load_attestation_key(key_dir=args.key_dir)
+    except KeyMaterialError:
+        # Dispatch is a safety boundary: a missing/invalid local key means
+        # activation can never be independently verified, so this degrades
+        # to native fallback rather than crashing the CLI command.
+        key = None
+
+    result = run_dispatch(
+        store,
+        workload,
+        candidate,
+        policy,
+        runtime,
+        artifact_root=artifact_root,
+        attestation_key=key,
+        now_ns=time.time_ns(),
+        max_age_ns=DEFAULT_MAX_AGE_NS,
+    )
+    output: dict[str, Any] = {
+        "ok": True,
+        "command": "dispatch",
+        "dispatch": result.to_dict(),
+        "store": str(store.root),
+    }
+    if args.execute:
+        _require_local_sandbox(stage="G2")
+        registry = TrustedRunnerRegistry()
+        baseline_runner_id, candidate_runner_id = _resolve_workload_runners(workload, registry)
+        runner_id = candidate_runner_id if result.mode == CANDIDATE_MODE else baseline_runner_id
+        execution_policy = _execution_policy_from_evaluation_policy(policy)
+        plan = build_execution_plan(candidate, registry, runner_id, artifact_root)
+        record = plan.execute(
+            execution_policy,
+            registry=registry,
+            provider=LocalSandboxProvider(),
+            authority=LocalSandboxAuthority(),
+        )
+        if record.status is not ExecutionStatus.SUCCESS:
+            detail = record.failure.message if record.failure is not None else record.status.value
+            raise ContractError(f"dispatch --execute run did not succeed: {detail}", code=FailureCode.RUNTIME_FAILURE)
+        output["execution"] = {
+            "mode": result.mode,
+            "runner_id": runner_id,
+            "digest": hashlib.sha256(record.stdout).hexdigest(),
+            "duration_ns": record.parent_elapsed_ns,
+        }
+    return output
+
+
+def _run_rollback_command(args: argparse.Namespace) -> dict[str, Any]:
+    store = store_config.open_store(args.store, key_dir=args.key_dir)
+    decision = rollback_decision(store, now_ns=time.time_ns())
+    return {
+        "ok": True,
+        "command": "rollback",
+        "action": decision.action,
+        "reason": decision.reason,
+        "decision_id": decision.decision_id,
+        "current_decision_id": store.current_decision_id(),
+        "store": str(store.root),
+    }
+
+
+def _run_keys_command(args: argparse.Namespace) -> dict[str, Any]:
+    if args.keys_command != "ensure":  # pragma: no cover - argparse restricts to known subcommands
+        raise CLIUsageError(f"unknown keys subcommand: {args.keys_command}")
+    resolved_dir = keys_module.resolve_key_dir(args.key_dir)
+    key = keys_module.ensure_attestation_key(key_dir=args.key_dir)
+    fingerprint = hashlib.sha256(key).hexdigest()[:16]
+    return {
+        "ok": True,
+        "command": "keys",
+        "subcommand": "ensure",
+        "key_dir": str(resolved_dir),
+        "key_path": str(resolved_dir / keys_module.KEY_FILE_NAME),
+        "fingerprint_sha256_16": fingerprint,
+    }
+
+
 def _exit_for_error(error: AutoMLXError) -> int:
     return EXIT_CONTRACT
+
+
+_COMMAND_HANDLERS: Final[dict[str, Callable[[argparse.Namespace], dict[str, Any]]]] = {
+    "validate": _run_document_command,
+    "inspect": _run_document_command,
+    "evaluate": _run_evaluate_command,
+    "promote": _run_promote_command,
+    "dispatch": _run_dispatch_command,
+    "rollback": _run_rollback_command,
+    "keys": _run_keys_command,
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         parser = build_parser()
         args = parser.parse_args(argv)
-        if args.command in _DEFERRED_COMMANDS:
-            _write_diagnostic(
-                _diagnostic(
-                    "unavailable",
-                    f"{args.command} is deferred: {_DEFERRED_COMMANDS[args.command]}",
-                    details={
-                        "status": "deferred",
-                        "stage": _DEFERRED_STAGES[args.command],
-                        "surface": "cli_orchestration",
-                    },
-                )
-            )
-            return EXIT_UNAVAILABLE
-        result = _run_document_command(args)
+        handler = _COMMAND_HANDLERS.get(args.command)
+        if handler is None:  # pragma: no cover - argparse restricts to known commands
+            raise CLIUsageError(f"unknown command: {args.command}")
+        result = handler(args)
         _write_stdout(canonical_json(result) + "\n")
         return EXIT_OK
     except SystemExit as exc:
@@ -873,6 +1319,15 @@ def main(argv: list[str] | None = None) -> int:
     except CLIIOError as exc:
         _write_diagnostic(_diagnostic("io_error", str(exc)))
         return EXIT_IO
+    except CLIUnavailableError as exc:
+        _write_diagnostic(
+            _diagnostic(
+                "unavailable",
+                str(exc),
+                details={"status": "unavailable", "stage": exc.stage, "surface": exc.surface},
+            )
+        )
+        return EXIT_UNAVAILABLE
     except BrokenPipeError as exc:
         _quieten_broken_stdout()
         _write_diagnostic(_diagnostic("io_error", "cannot write command output"))

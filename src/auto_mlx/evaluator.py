@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
@@ -21,6 +22,7 @@ from .executor import (
 from .measurement import MeasurementSample, PairedMeasurementBundle, PairedMeasurementPlan, assemble_measurement_bundle
 from .oracle import ExactOutputOracle, OracleDescriptor, OracleResult
 from .paths import validate_sha256
+from .statistics import VERDICT_INCONCLUSIVE, compute_sample_timing, compute_statistics_verdict
 from .thermal import thermal_preflight as _default_thermal_preflight
 
 
@@ -74,6 +76,11 @@ class ObservationBundle:
     execution_policy: ExecutionPolicy | None = None
     oracle: ExactOutputOracle | None = None
     oracle_descriptor: OracleDescriptor | None = None
+    # Wave B: the sequential BCa-bootstrap verdict computed over
+    # ``measurements`` (see auto_mlx.statistics.compute_statistics_verdict).
+    # ``None`` only when ``measurements`` never reached an accepted state
+    # (no valid evidence to compute a verdict from) -- see ``evaluate()``.
+    statistics: Mapping[str, Any] | None = None
 
     def _canonical_measurement_plan(self) -> PairedMeasurementPlan:
         policy = self.evaluation_policy
@@ -87,7 +94,16 @@ class ObservationBundle:
             raise ContractError("observation bundle execution policy is not bound", code=FailureCode.INVALID_POLICY)
         if self.execution_policy_digest != _execution_policy_digest(execution_policy):
             raise ContractError("observation bundle execution policy digest is not bound", code=FailureCode.IDENTITY_MISMATCH)
-        if type(self.measurement_block_count) is not int or self.measurement_block_count != policy.measurement_runs:
+        # The actual block count varies with Wave B sequential extension
+        # (policy.measurement_runs is the starting/minimum count,
+        # policy.max_measurement_runs the cap); any count in that closed
+        # range is legitimate here -- the stronger "did it stop for a good
+        # reason" proof (decisive verdict, or hit the cap) lives with the
+        # statistics verdict itself, not this identity binding.
+        if (
+            type(self.measurement_block_count) is not int
+            or not (policy.measurement_runs <= self.measurement_block_count <= policy.max_measurement_runs)
+        ):
             raise ContractError("observation bundle block count is not bound", code=FailureCode.INVALID_POLICY)
         if type(self.oracle) is not ExactOutputOracle or type(self.oracle_descriptor) is not OracleDescriptor:
             raise ContractError("observation bundle oracle provenance is missing", code=FailureCode.ORACLE_MISMATCH)
@@ -278,6 +294,7 @@ class ObservationBundle:
             ],
             "measurements": self.measurements.to_dict(),
             "thermal_blocks": [dict(item) for item in self.thermal_blocks],
+            "statistics": None if self.statistics is None else dict(self.statistics),
         }
 
 
@@ -289,6 +306,12 @@ def _execution_policy_from_contract(policy: EvaluationPolicy) -> ExecutionPolicy
         max_output_bytes=policy.max_output_bytes,
         require_network_denial=True,
         require_descendant_containment=True,
+        # Wave B: tells the runner subprocess how many in-runner timed
+        # iterations to perform (see auto_mlx.runners.reference_matmul and
+        # auto_mlx.statistics).  Part of ExecutionPolicy.to_dict(), so
+        # changing k_repetitions changes the execution policy digest --
+        # correctly binding K into the evaluation's identity chain.
+        extra_environment={"AUTO_MLX_K_REPETITIONS": str(policy.k_repetitions)},
     )
 
 
@@ -299,6 +322,36 @@ def _execution_policy_digest(policy: ExecutionPolicy) -> str:
     for name in ("timeout_seconds", "kill_grace_seconds", "launch_timeout_seconds", "authority_timeout_seconds", "reader_join_timeout_seconds"):
         values[name] = format(values[name], ".17g")
     return sha256_hex(values)
+
+
+def _block_point_estimates(measurements: PairedMeasurementBundle) -> tuple[list[list[int]], list[list[int]]]:
+    """Per-block, per-arm point estimates for an ACCEPTED measurement bundle.
+
+    Requires ``measurements.accepted`` (every block's four samples carry a
+    successful record) -- callers must check that first.  Each sample's
+    point estimate is computed purely from its own evidence (see
+    ``auto_mlx.statistics.compute_sample_timing``): trusted min-of-K when
+    the runner's self-reported iteration array survives the forged-timing
+    cross-check, otherwise the parent-observed ``runner_elapsed_ns`` alone.
+    """
+
+    baseline_points: list[list[int]] = []
+    candidate_points: list[list[int]] = []
+    for block in measurements.blocks:
+        block_baseline: list[int] = []
+        block_candidate: list[int] = []
+        for sample in block.samples:
+            record = sample.record
+            if record is None:
+                raise ContractError(
+                    "cannot compute statistics from an incomplete measurement block",
+                    code=FailureCode.RUNTIME_FAILURE,
+                )
+            timing = compute_sample_timing(record.runner_elapsed_ns, record.stderr)
+            (block_baseline if sample.arm == "baseline" else block_candidate).append(timing.point_estimate_ns)
+        baseline_points.append(block_baseline)
+        candidate_points.append(block_candidate)
+    return baseline_points, candidate_points
 
 
 class Evaluator:
@@ -412,61 +465,106 @@ class Evaluator:
             isolation_verifier_identity = None
             isolation_requirements = None
 
+        # Wave B sequential sampling: start at policy.measurement_runs
+        # blocks; while the bootstrap verdict stays inconclusive, extend one
+        # block at a time up to policy.max_measurement_runs, recomputing the
+        # verdict after every new block and stopping early on a decisive
+        # one.  Extending rebuilds the measurement plan at the new, larger
+        # block count -- block identity (block_id/sequence) only depends on
+        # an index, so every previously-run block's samples stay valid slot
+        # bindings and are never re-executed (see executed_block_ids).  The
+        # bootstrap seed is drawn once, up front, and reused unchanged at
+        # every peek so the whole procedure -- and any later independent
+        # recomputation of it -- is a pure function of (seed, resamples,
+        # differences-at-that-peek).
         count = self._block_count
-        measurement_plan = PairedMeasurementPlan.create(
-            count,
-            candidate_id=proposal.candidate_id,
-            workload_hash=proposal.workload_hash,
-            baseline_runner_id=baseline_plan.runner_id,
-            baseline_runner_digest=baseline_plan.runner_digest,
-            candidate_runner_id=candidate_plan.runner_id,
-            candidate_runner_digest=candidate_plan.runner_digest,
-            oracle=self._oracle,
-            require_isolation=True,
-            isolation_provider_id=isolation_provider_id,
-            isolation_identity=isolation_identity,
-            isolation_verifier_id=isolation_verifier_id,
-            isolation_verifier_identity=isolation_verifier_identity,
-            isolation_requirements=isolation_requirements,
-        )
+        bootstrap_seed = secrets.randbits(63)
         samples: list[MeasurementSample] = []
         thermal_blocks: list[dict[str, Any]] = []
-        for block in measurement_plan.blocks:
-            # Preflight before this block's own samples, not once for the
-            # whole evaluate() call -- thermal state can change between
-            # blocks over a multi-minute evaluation.
-            preflight = dict(self._thermal_preflight())
-            thermally_suspect = bool(preflight.get("thermally_suspect"))
-            refused = thermally_suspect and self._policy.thermal_gate_policy == "refuse"
-            thermal_blocks.append(
-                {
-                    "block_id": block.block_id,
-                    "block_index": block.block_index,
-                    "policy": self._policy.thermal_gate_policy,
-                    "preflight": preflight,
-                    "refused": refused,
-                }
+        executed_block_ids: set[str] = set()
+        measurement_plan: PairedMeasurementPlan
+        measurements: PairedMeasurementBundle
+        statistics_result: Mapping[str, Any] | None = None
+
+        while True:
+            measurement_plan = PairedMeasurementPlan.create(
+                count,
+                candidate_id=proposal.candidate_id,
+                workload_hash=proposal.workload_hash,
+                baseline_runner_id=baseline_plan.runner_id,
+                baseline_runner_digest=baseline_plan.runner_digest,
+                candidate_runner_id=candidate_plan.runner_id,
+                candidate_runner_digest=candidate_plan.runner_digest,
+                oracle=self._oracle,
+                require_isolation=True,
+                isolation_provider_id=isolation_provider_id,
+                isolation_identity=isolation_identity,
+                isolation_verifier_id=isolation_verifier_id,
+                isolation_verifier_identity=isolation_verifier_identity,
+                isolation_requirements=isolation_requirements,
             )
-            if refused:
-                # Skip this block's samples entirely; the measurement
-                # bundle's existing missing-sample handling rejects the
-                # block the same way it would for any other incomplete
-                # block -- no separate rejection code needed.
-                continue
-            for slot in block.slots:
-                execution_plan = baseline_plan if slot.arm == "baseline" else candidate_plan
-                observation = self._run(execution_plan, slot.sample_id, slot.arm)
-                samples.append(
-                    MeasurementSample(
-                        sample_id=slot.sample_id,
-                        block_id=slot.block_id,
-                        slot_index=slot.slot_index,
-                        arm=slot.arm,
-                        record=observation.record,
-                        oracle=observation.oracle,
-                    )
+            for block in measurement_plan.blocks:
+                if block.block_id in executed_block_ids:
+                    continue
+                # Preflight before this block's own samples, not once for
+                # the whole evaluate() call -- thermal state can change
+                # between blocks over a multi-minute evaluation.
+                preflight = dict(self._thermal_preflight())
+                thermally_suspect = bool(preflight.get("thermally_suspect"))
+                refused = thermally_suspect and self._policy.thermal_gate_policy == "refuse"
+                thermal_blocks.append(
+                    {
+                        "block_id": block.block_id,
+                        "block_index": block.block_index,
+                        "policy": self._policy.thermal_gate_policy,
+                        "preflight": preflight,
+                        "refused": refused,
+                    }
                 )
-        measurements = assemble_measurement_bundle(measurement_plan, samples)
+                executed_block_ids.add(block.block_id)
+                if refused:
+                    # Skip this block's samples entirely; the measurement
+                    # bundle's existing missing-sample handling rejects the
+                    # block the same way it would for any other incomplete
+                    # block -- no separate rejection code needed.
+                    continue
+                for slot in block.slots:
+                    execution_plan = baseline_plan if slot.arm == "baseline" else candidate_plan
+                    observation = self._run(execution_plan, slot.sample_id, slot.arm)
+                    samples.append(
+                        MeasurementSample(
+                            sample_id=slot.sample_id,
+                            block_id=slot.block_id,
+                            slot_index=slot.slot_index,
+                            arm=slot.arm,
+                            record=observation.record,
+                            oracle=observation.oracle,
+                        )
+                    )
+            measurements = assemble_measurement_bundle(measurement_plan, samples)
+            if not measurements.accepted:
+                # No valid, complete evidence to compute a verdict from --
+                # stop extending; the bundle surfaces as unaccepted/failed
+                # exactly as before Wave B, just without a statistics field.
+                statistics_result = None
+                break
+            baseline_points, candidate_points = _block_point_estimates(measurements)
+            verdict = compute_statistics_verdict(
+                block_baseline_points=baseline_points,
+                block_candidate_points=candidate_points,
+                k_repetitions=self._policy.k_repetitions,
+                measurement_runs=self._policy.measurement_runs,
+                max_measurement_runs=self._policy.max_measurement_runs,
+                min_effect_bps=self._policy.min_effect_bps,
+                bootstrap_resamples=self._policy.bootstrap_resamples,
+                bootstrap_seed=bootstrap_seed,
+                calibration=self._policy.calibration,
+            )
+            statistics_result = verdict.to_dict()
+            if verdict.verdict != VERDICT_INCONCLUSIVE or count >= self._policy.max_measurement_runs:
+                break
+            count += 1
+
         return ObservationBundle(
             candidate_id=proposal.candidate_id,
             workload_hash=proposal.workload_hash,
@@ -490,6 +588,7 @@ class Evaluator:
             execution_policy=self._execution_policy,
             oracle=self._oracle,
             oracle_descriptor=self._oracle.descriptor,
+            statistics=statistics_result,
         )
 
 

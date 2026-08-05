@@ -116,6 +116,17 @@ class EvaluatorTests(unittest.TestCase):
         self.temp.cleanup()
 
     def _evaluator(self, *, provider=None, authority=None, policy=None, thermal_preflight=None) -> Evaluator:
+        # No explicit execution_policy= here: Evaluator derives it from
+        # `policy` (see _execution_policy_from_contract), which now also
+        # binds policy.k_repetitions into AUTO_MLX_K_REPETITIONS -- a
+        # hand-built ExecutionPolicy would need to replicate that exactly
+        # or Evaluator.__init__ rejects the mismatch.  These fixture
+        # policies also fix max_measurement_runs == measurement_runs (no
+        # Wave B sequential extension): the fake runner script prints the
+        # same "ok" on both arms with no real timing signal, so an
+        # inconclusive verdict would otherwise extend every call here to
+        # the (default 20-block) cap -- these are structural/isolation
+        # tests, not statistics tests.
         return Evaluator(
             self.registry,
             baseline_runner_id="baseline",
@@ -123,14 +134,10 @@ class EvaluatorTests(unittest.TestCase):
             oracle=ExactOutputOracle(b"ok\n"),
             artifact_root=str(self.root),
             policy=policy
-            or EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=1, max_output_bytes=4096),
-            thermal_preflight=thermal_preflight,
-            execution_policy=ExecutionPolicy(
-                timeout_seconds=1,
-                max_stdout_bytes=4096,
-                max_stderr_bytes=4096,
-                max_output_bytes=4096,
+            or EvaluationPolicy(
+                warmup_runs=1, measurement_runs=2, timeout_seconds=1, max_output_bytes=4096, max_measurement_runs=2
             ),
+            thermal_preflight=thermal_preflight,
             provider=self.provider if provider is None else provider,
             authority=self.authority if authority is None else authority,
         )
@@ -367,12 +374,6 @@ class EvaluatorTests(unittest.TestCase):
             oracle=ExactOutputOracle(b"ok\n"),
             artifact_root=str(self.root),
             policy=EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=2, max_output_bytes=4096),
-            execution_policy=ExecutionPolicy(
-                timeout_seconds=2,
-                max_stdout_bytes=4096,
-                max_stderr_bytes=4096,
-                max_output_bytes=4096,
-            ),
             provider=self.provider,
             authority=EligibleFixtureAuthority(),
         )
@@ -388,12 +389,6 @@ class EvaluatorTests(unittest.TestCase):
             oracle=ExactOutputOracle(b"ok\n"),
             artifact_root=str(self.root),
             policy=EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=2, max_output_bytes=4096),
-            execution_policy=ExecutionPolicy(
-                timeout_seconds=2,
-                max_stdout_bytes=4096,
-                max_stderr_bytes=4096,
-                max_output_bytes=4096,
-            ),
             provider=self.provider,
             authority=EligibleFixtureAuthority(),
         )
@@ -477,12 +472,13 @@ class EvaluatorLocalSandboxTests(unittest.TestCase):
             candidate_runner_id="candidate",
             oracle=ExactOutputOracle(b"ok\n"),
             artifact_root=str(self.root),
-            policy=EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=5, max_output_bytes=4096),
-            execution_policy=ExecutionPolicy(
-                timeout_seconds=5,
-                max_stdout_bytes=4096,
-                max_stderr_bytes=4096,
-                max_output_bytes=4096,
+            # max_measurement_runs == measurement_runs: this fake runner
+            # prints the same "ok" on both arms with no real timing signal,
+            # so an inconclusive verdict would otherwise extend this real,
+            # fully-sandboxed evaluation to the (default 20-block) cap --
+            # this test checks structural acceptance, not the verdict.
+            policy=EvaluationPolicy(
+                warmup_runs=1, measurement_runs=2, timeout_seconds=5, max_output_bytes=4096, max_measurement_runs=2
             ),
             provider=LocalSandboxProvider(),
             authority=LocalSandboxAuthority(),
@@ -525,12 +521,6 @@ class EvaluatorLocalSandboxTests(unittest.TestCase):
             oracle=ExactOutputOracle(b"ok\n"),
             artifact_root=str(self.root),
             policy=EvaluationPolicy(warmup_runs=1, measurement_runs=1, timeout_seconds=5, max_output_bytes=4096),
-            execution_policy=ExecutionPolicy(
-                timeout_seconds=5,
-                max_stdout_bytes=4096,
-                max_stderr_bytes=4096,
-                max_output_bytes=4096,
-            ),
             provider=ExplodingLocalSandboxProvider(),
             authority=LocalSandboxAuthority(),
         )

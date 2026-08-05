@@ -20,25 +20,28 @@ from auto_mlx.receipts import (
     receipt_attestation,
     validate_receipt,
 )
+from _wave_b_fixtures import build_evaluator_bundle_receipt
 
 
 class PromotionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.workload = FrozenWorkload("promotion-test", knobs=(Knob("mode", "enum", values=("eager",)),))
         self.candidate = CandidateProposal("grid", self.workload, {"mode": "eager"})
-        self.policy = EvaluationPolicy(warmup_runs=0, measurement_runs=2)
+        # max_measurement_runs == measurement_runs: these fixtures hand-build
+        # exactly measurement_runs blocks (no real sequential-extension loop
+        # ran), so any verdict -- decisive or not -- is a legitimate place to
+        # have stopped (see _validate_evaluator_bundle_wire).
+        self.policy = EvaluationPolicy(warmup_runs=0, measurement_runs=2, max_measurement_runs=2)
         self.runtime = RuntimeIdentity("python", "3.11.0", "Darwin", "arm64")
-        self.receipt = Receipt(
-            self.workload,
-            self.candidate,
-            self.policy,
-            self.runtime,
-            (
-                RawSample(0, 100, 120, "ok", "ok", 0),
-                RawSample(1, 110, 130, "ok", "ok", 0),
-            ),
-            created_at_ns=100,
-        )
+        # Wave B: promotion now gates on the independently recomputed
+        # statistics verdict, which only exists for evaluator-bundle-backed
+        # receipts (the raw-sample lane has no paired-block/per-iteration
+        # evidence to derive one from, so it is correctly never promotable
+        # -- see auto_mlx.promotion's fail-closed statistics_missing gate).
+        # This fixture is a genuinely decisive "improved" receipt so the
+        # activation-mechanics tests below (HMAC recompute, identity,
+        # staleness, tampering, rollback) still exercise a real ACTIVATE.
+        self.receipt = build_evaluator_bundle_receipt(self.workload, self.candidate, self.policy, self.runtime)
         self.key = b"supervisor-key-for-tests"
 
     def validation(self, artifact_root: str):
@@ -132,16 +135,12 @@ class PromotionTests(unittest.TestCase):
             self.assertEqual(store.current_decision_id(), "native_fallback")
 
     def test_signed_slower_receipt_is_storable_evidence_but_never_activates(self) -> None:
-        slower = Receipt(
-            self.workload,
-            self.candidate,
-            self.policy,
-            self.runtime,
-            (
-                RawSample(0, 150, 100, "ok", "ok", 0),
-                RawSample(1, 160, 110, "ok", "ok", 0),
-            ),
-            created_at_ns=100,
+        # baseline_iteration_ns < candidate_iteration_ns: the candidate is
+        # decisively slower, a "regressed" Wave B verdict (the direct
+        # replacement for the old bare gain_not_positive reason).
+        slower = build_evaluator_bundle_receipt(
+            self.workload, self.candidate, self.policy, self.runtime,
+            baseline_iteration_ns=10_000_000, candidate_iteration_ns=20_000_000,
         )
         with tempfile.TemporaryDirectory() as unresolved_root:
             raw_root = str(Path(unresolved_root).resolve())
@@ -150,10 +149,10 @@ class PromotionTests(unittest.TestCase):
             tag = receipt_attestation(slower, self.key)
             validation = validate_receipt(slower, artifact_root=raw_root, attestation=tag, attestation_key=self.key)
             self.assertTrue(validation.ok)
-            self.assertFalse(validation.recomputed["metrics"]["gain"]["improved"])
+            self.assertEqual(validation.recomputed["statistics"]["verdict"], "regressed")
             decision = activate(store, validation, artifact_root=raw_root, attestation_key=self.key, now_ns=110)
             self.assertEqual(decision.action, NATIVE)
-            self.assertEqual(decision.reason, "gain_not_positive")
+            self.assertEqual(decision.reason, "regressed")
             self.assertEqual(store.current_decision_id(), "native_fallback")
 
     def test_promotion_recomputes_hmac_instead_of_trusting_validation_marker(self) -> None:

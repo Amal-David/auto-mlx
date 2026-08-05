@@ -48,6 +48,7 @@ from auto_mlx.receipts import (
 )
 from auto_mlx.runners import BASELINE_RUNNER_ID, CANDIDATE_RUNNER_ID, register_reference_matmul_runners
 from auto_mlx.sandbox import LocalSandboxAuthority, LocalSandboxProvider
+from _wave_b_fixtures import build_evaluator_bundle_receipt
 from auto_mlx.supervisor import attest_receipt
 
 
@@ -242,12 +243,22 @@ class SupervisorUnitTests(unittest.TestCase):
         )
 
     def test_attest_receipt_matches_the_raw_hmac_and_lets_promotion_activate(self) -> None:
-        tag = attest_receipt(self.receipt, self.key)
-        self.assertEqual(tag, receipt_attestation(self.receipt, self.key))
+        # Wave B: promotion now gates on the independently recomputed
+        # statistics verdict, which only exists for evaluator-bundle-backed
+        # receipts -- self.receipt (the raw-sample lane, used by the other
+        # tests in this class for simpler forged-field checks) is correctly
+        # never promotable under that gate.  This test specifically checks
+        # that attest_receipt() + make_promotion_decision() can reach
+        # ACTIVATE, so it needs a genuinely decisive receipt -- see
+        # _wave_b_fixtures.
+        policy = EvaluationPolicy(warmup_runs=0, measurement_runs=2, max_measurement_runs=2)
+        receipt = build_evaluator_bundle_receipt(self.workload, self.candidate, policy, self.runtime)
+        tag = attest_receipt(receipt, self.key)
+        self.assertEqual(tag, receipt_attestation(receipt, self.key))
         with tempfile.TemporaryDirectory() as raw_root:
             artifact_root = str(Path(raw_root).resolve())
             validation = validate_receipt(
-                self.receipt, artifact_root=artifact_root, attestation=tag, attestation_key=self.key
+                receipt, artifact_root=artifact_root, attestation=tag, attestation_key=self.key
             )
             self.assertTrue(validation.ok)
             decision = make_promotion_decision(validation, now_ns=110, attestation_key=self.key)
@@ -465,7 +476,14 @@ class EvaluatorKeyIsolationTests(unittest.TestCase):
             "    evaluator = Evaluator(\n"
             "        registry, baseline_runner_id=BASELINE_RUNNER_ID, candidate_runner_id=CANDIDATE_RUNNER_ID,\n"
             "        oracle=oracle, artifact_root=root,\n"
-            "        policy=EvaluationPolicy(warmup_runs=1, measurement_runs=1, timeout_seconds=60, max_output_bytes=4096),\n"
+            # Bounded k_repetitions/max_measurement_runs: production
+            # defaults (k_repetitions=50, max_measurement_runs=20) can make
+            # a real inconclusive-verdict run exceed this test's subprocess
+            # timeout below; this test only checks module import hygiene.
+            "        policy=EvaluationPolicy(\n"
+            "            warmup_runs=1, measurement_runs=1, max_measurement_runs=2, k_repetitions=5,\n"
+            "            bootstrap_resamples=500, timeout_seconds=60, max_output_bytes=4096,\n"
+            "        ),\n"
             "        provider=LocalSandboxProvider(), authority=LocalSandboxAuthority(),\n"
             "    )\n"
             "    evaluator.evaluate(proposal)\n"
@@ -526,7 +544,12 @@ class SupervisorEndToEndChainTests(unittest.TestCase):
         self.assertIs(probe_record.status, ExecutionStatus.SUCCESS, probe_record.failure)
         oracle = ExactOutputOracle(probe_record.stdout)
 
-        policy = EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=60, max_output_bytes=4096)
+        # Bounded k_repetitions/max_measurement_runs/bootstrap_resamples --
+        # see ReferenceMatmulEvaluatorLoopTests's identical comment.
+        policy = EvaluationPolicy(
+            warmup_runs=1, measurement_runs=2, max_measurement_runs=4, k_repetitions=5, bootstrap_resamples=500,
+            timeout_seconds=60, max_output_bytes=4096,
+        )
         evaluator = Evaluator(
             self.registry,
             baseline_runner_id=BASELINE_RUNNER_ID,
@@ -569,16 +592,19 @@ class SupervisorEndToEndChainTests(unittest.TestCase):
         self.assertTrue(validation.ok)
 
         decision = make_promotion_decision(validation, now_ns=100, attestation_key=key)
-        gain = validation.recomputed["metrics"]["gain"]
-        # The decision must reflect whatever the real, evidence-based gain
-        # says -- not a wished-for outcome. Assert the policy logic, not a
-        # specific verdict: a positive, well-formed gain activates; anything
-        # else must fall back to native with the gain reason.
-        if gain.get("improved") is True and gain.get("delta_ns", 0) > 0:
+        # The decision must reflect whatever the real, evidence-based Wave B
+        # statistics verdict says -- not a wished-for outcome. Assert the
+        # policy logic, not a specific verdict: a decisive "improved"
+        # activates; "regressed"/"inconclusive" must fall back to native
+        # with the matching reason code (see auto_mlx.promotion).
+        statistics = validation.recomputed["statistics"]
+        self.assertIsNotNone(statistics)
+        if statistics["verdict"] == "improved":
             self.assertEqual(decision.action, ACTIVATE)
         else:
+            self.assertIn(statistics["verdict"], {"regressed", "inconclusive"})
             self.assertEqual(decision.action, NATIVE)
-            self.assertEqual(decision.reason, "gain_not_positive")
+            self.assertEqual(decision.reason, statistics["verdict"])
 
         activated = activate(store, validation, artifact_root=str(self.artifact_root), attestation_key=key, now_ns=100)
         self.assertEqual(activated.action, decision.action)

@@ -36,7 +36,7 @@ from auto_mlx.executor import (
     local_sandbox_primitives_available,
 )
 from auto_mlx.oracle import ExactOutputOracle
-from auto_mlx.receipts import Receipt
+from auto_mlx.receipts import Receipt, validate_receipt
 from auto_mlx.runners import (
     BASELINE_RUNNER_ID,
     CANDIDATE_RUNNER_ID,
@@ -330,7 +330,18 @@ class ReferenceMatmulEvaluatorLoopTests(unittest.TestCase):
         self.assertIs(probe_record.status, ExecutionStatus.SUCCESS, probe_record.failure)
         oracle = ExactOutputOracle(probe_record.stdout)
 
-        policy = EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=60, max_output_bytes=4096)
+        # Bounded k_repetitions/max_measurement_runs/bootstrap_resamples:
+        # the production defaults (k_repetitions=50, max_measurement_runs=20)
+        # would make this real, fully-sandboxed run take minutes if the
+        # eager-vs-compiled verdict stays inconclusive (plausible for this
+        # small toy workload -- see docs/measurement.md's Wave B section).
+        # This test checks plumbing/structural correctness, not a
+        # performance claim, so keeping it fast matters more than exercising
+        # the full sequential range.
+        policy = EvaluationPolicy(
+            warmup_runs=1, measurement_runs=2, max_measurement_runs=4, k_repetitions=5, bootstrap_resamples=500,
+            timeout_seconds=60, max_output_bytes=4096,
+        )
         evaluator = Evaluator(
             self.registry,
             baseline_runner_id=BASELINE_RUNNER_ID,
@@ -371,9 +382,14 @@ class ReferenceMatmulEvaluatorLoopTests(unittest.TestCase):
         # Wave A receipt fields, populated from a real evaluate() call (not
         # synthetic wire data): thermal annotations, one per measurement
         # block, and a warm_state note derived from real runner stderr.
+        # Wave B: the real block count can exceed policy.measurement_runs
+        # (sequential extension on an inconclusive verdict), up to the
+        # policy's max_measurement_runs cap -- see receipt.statistics below.
         self.assertIsNotNone(receipt.evaluator_bundle)
         thermal_blocks = receipt.evaluator_bundle["thermal_blocks"]
-        self.assertEqual(len(thermal_blocks), policy.measurement_runs)
+        self.assertGreaterEqual(len(thermal_blocks), policy.measurement_runs)
+        self.assertLessEqual(len(thermal_blocks), policy.max_measurement_runs)
+        self.assertEqual(len(thermal_blocks), receipt.statistics["block_count_used"])
         for entry in thermal_blocks:
             self.assertIn(entry["preflight"]["initial"]["state"], {"nominal", "throttled", "unknown"})
             self.assertIn(entry["preflight"]["final"]["state"], {"nominal", "throttled", "unknown"})
@@ -411,6 +427,17 @@ class ReferenceMatmulEvaluatorLoopTests(unittest.TestCase):
         # runner_elapsed_ns values recomputed here independently.
         gain = receipt.metrics["gain"]
         self.assertEqual(gain["baseline_sum_ns"] + gain["candidate_sum_ns"], sum(runner_spans))
+
+        # Wave B: a real end-to-end run populates a real statistics verdict
+        # -- no performance claim is asserted (the verdict can honestly be
+        # any of the three), but it must be present, closed, and the
+        # receipt's independent recomputation must reproduce it exactly.
+        self.assertIsNotNone(receipt.statistics)
+        self.assertIn(receipt.statistics["verdict"], {"improved", "regressed", "inconclusive"})
+        self.assertFalse(receipt.statistics["calibration"])
+        validation = validate_receipt(receipt)
+        self.assertTrue(validation.valid, [f.message for f in validation.failures])
+        self.assertEqual(validation.recomputed["statistics"], receipt.statistics)
 
 
 if __name__ == "__main__":

@@ -108,7 +108,16 @@ class CLILoopEndToEndTests(unittest.TestCase):
         self.key_dir = self.base / "keys"
         self.workload = _toy_matmul_workload()
         self.candidate = CandidateProposal("cli-loop-provider", self.workload, {"mode": "compiled", "tile": 24})
-        self.policy = EvaluationPolicy(warmup_runs=1, measurement_runs=2, timeout_seconds=60, max_output_bytes=4096)
+        # Bounded k_repetitions/max_measurement_runs/bootstrap_resamples:
+        # this test runs a REAL, fully-sandboxed `evaluate` TWICE (see the
+        # end of the test), and production defaults (k_repetitions=50,
+        # max_measurement_runs=20) would make each call take minutes if the
+        # verdict stays inconclusive -- this test checks CLI plumbing, not
+        # a performance claim.
+        self.policy = EvaluationPolicy(
+            warmup_runs=1, measurement_runs=2, max_measurement_runs=4, k_repetitions=5, bootstrap_resamples=500,
+            timeout_seconds=60, max_output_bytes=4096,
+        )
         self.runtime = RuntimeIdentity.current()
         self.workload_path = _write(self.base / "workload.json", self.workload.to_dict())
         self.candidate_path = _write(self.base / "candidate.json", self.candidate.to_dict())
@@ -164,11 +173,22 @@ class CLILoopEndToEndTests(unittest.TestCase):
         promoted = json.loads(stdout)
         self.assertTrue(promoted["ok"])
         self.assertTrue(promoted["attested"])
-        if gain.get("improved") is True and gain.get("delta_ns", 0) > 0:
+        # Wave B: activation now reads the independently recomputed
+        # statistics verdict, never the bare gain sign -- match the
+        # receipt's OWN recomputed verdict, never a hardcoded outcome (real
+        # toy-matmul timing on this host can honestly land as improved,
+        # regressed, or inconclusive).
+        statistics = promoted.get("statistics")
+        self.assertIsNotNone(statistics, promoted)
+        verdict = statistics["verdict"]
+        if verdict == "improved":
             self.assertEqual(promoted["action"], "activate")
         else:
+            self.assertIn(verdict, {"inconclusive", "regressed"})
             self.assertEqual(promoted["action"], "native_fallback")
-            self.assertEqual(promoted["reason"], "gain_not_positive")
+            # promotion.py's reason codes for these two verdicts are the
+            # verdict strings themselves -- see make_promotion_decision.
+            self.assertEqual(promoted["reason"], verdict)
         activated = promoted["action"] == "activate"
 
         # --- dispatch (no --execute): reflects the just-written pointer.

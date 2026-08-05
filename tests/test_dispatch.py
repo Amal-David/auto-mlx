@@ -13,25 +13,26 @@ from auto_mlx.canonical import MAX_JSON_DEPTH
 from auto_mlx.dispatch import CANDIDATE_MODE, NATIVE_MODE, dispatch
 from auto_mlx.promotion import activate, rollback
 from auto_mlx.receipts import ContentAddressedStore, RawSample, Receipt, receipt_attestation, validate_receipt
+from _wave_b_fixtures import build_evaluator_bundle_receipt
 
 
 class DispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         self.workload = FrozenWorkload("dispatch-test", knobs=(Knob("mode", "enum", values=("eager", "slow")),))
         self.candidate = CandidateProposal("grid", self.workload, {"mode": "eager"})
-        self.policy = EvaluationPolicy(warmup_runs=0, measurement_runs=2)
+        # max_measurement_runs == measurement_runs: see test_promotion.py's
+        # identical comment -- this fixture hand-builds exactly
+        # measurement_runs blocks, so any verdict is a legitimate place to
+        # have stopped.
+        self.policy = EvaluationPolicy(warmup_runs=0, measurement_runs=2, max_measurement_runs=2)
         self.runtime = RuntimeIdentity("python", "3.11.0", "Darwin", "arm64")
-        self.receipt = Receipt(
-            self.workload,
-            self.candidate,
-            self.policy,
-            self.runtime,
-            (
-                RawSample(0, 100, 120, "ok", "ok", 0),
-                RawSample(1, 110, 130, "ok", "ok", 0),
-            ),
-            created_at_ns=100,
-        )
+        # Wave B: dispatch now gates on the independently recomputed
+        # statistics verdict too (see auto_mlx.dispatch), which only exists
+        # for evaluator-bundle-backed receipts -- so this fixture builds a
+        # genuinely decisive "improved" one (see _wave_b_fixtures) rather
+        # than the older raw-sample lane, which is now correctly never
+        # promotable.
+        self.receipt = build_evaluator_bundle_receipt(self.workload, self.candidate, self.policy, self.runtime)
         self.key = b"supervisor-key-for-tests"
 
     def active_store(self) -> tuple[ContentAddressedStore, str, str]:

@@ -28,7 +28,43 @@ from auto_mlx.receipts import (
     receipt_attestation,
     validate_receipt,
 )
+from auto_mlx.statistics import compute_sample_timing, compute_statistics_verdict
 from auto_mlx.thermal import ThermalReading
+
+
+def _statistics_for(measurements, policy: EvaluationPolicy, *, bootstrap_seed: int = 1) -> dict:
+    """Hand-built-bundle helper: the real Wave B verdict for an already-assembled bundle.
+
+    Test fixtures that hand-construct an ``ObservationBundle`` (rather than
+    going through a real ``Evaluator.evaluate()`` sequential loop) need to
+    supply a genuine, independently-recomputable ``statistics`` dict too --
+    mirrors ``auto_mlx.evaluator._block_point_estimates`` +
+    ``Evaluator.evaluate()``'s own statistics call exactly, so
+    ``_validate_evaluator_bundle_wire``'s recompute-and-compare accepts it.
+    """
+
+    baseline_points: list[list[int]] = []
+    candidate_points: list[list[int]] = []
+    for block in measurements.blocks:
+        block_baseline: list[int] = []
+        block_candidate: list[int] = []
+        for sample in block.samples:
+            timing = compute_sample_timing(sample.record.runner_elapsed_ns, sample.record.stderr)
+            (block_baseline if sample.arm == "baseline" else block_candidate).append(timing.point_estimate_ns)
+        baseline_points.append(block_baseline)
+        candidate_points.append(block_candidate)
+    verdict = compute_statistics_verdict(
+        block_baseline_points=baseline_points,
+        block_candidate_points=candidate_points,
+        k_repetitions=policy.k_repetitions,
+        measurement_runs=policy.measurement_runs,
+        max_measurement_runs=policy.max_measurement_runs,
+        min_effect_bps=policy.min_effect_bps,
+        bootstrap_resamples=policy.bootstrap_resamples,
+        bootstrap_seed=bootstrap_seed,
+        calibration=policy.calibration,
+    )
+    return verdict.to_dict()
 
 
 def _nominal_thermal_blocks(plan, *, policy: EvaluationPolicy) -> tuple[dict, ...]:
@@ -270,8 +306,15 @@ class ReceiptTests(unittest.TestCase):
         oracle = ExactOutputOracle(b"ok\n", label="receipt-oracle")
         provider = _ReceiptIsolationProvider()
         authority = _ReceiptTestAuthority()
+        # max_measurement_runs == measurement_runs: this hand-built bundle
+        # has exactly self.policy.measurement_runs blocks (no Wave B
+        # sequential-extension loop actually ran), so its statistics
+        # verdict is legitimate to stop at regardless of whether it turns
+        # out decisive -- see _validate_evaluator_bundle_wire's
+        # inconclusive-before-the-cap check.
+        policy = replace(self.policy, max_measurement_runs=self.policy.measurement_runs)
         plan = PairedMeasurementPlan.create(
-            self.policy.measurement_runs,
+            policy.measurement_runs,
             candidate_id=self.candidate.candidate_id,
             workload_hash=self.workload.workload_hash,
             baseline_runner_id="baseline",
@@ -319,6 +362,7 @@ class ReceiptTests(unittest.TestCase):
                 current = record(slot.sample_id, slot.arm, 100 + slot.slot_index + block.block_index * 10)
                 samples.append(MeasurementSample(slot.sample_id, slot.block_id, slot.slot_index, slot.arm, current, oracle.evaluate(current.stdout)))
         measurements = assemble_measurement_bundle(plan, samples)
+        statistics = _statistics_for(measurements, policy)
         bundle = ObservationBundle(
             candidate_id=self.candidate.candidate_id,
             workload_hash=self.workload.workload_hash,
@@ -334,14 +378,15 @@ class ReceiptTests(unittest.TestCase):
             isolation_requirements=frozenset({"network_denial", "descendant_containment"}),
             warmups=warmups,
             measurements=measurements,
-            thermal_blocks=_nominal_thermal_blocks(plan, policy=self.policy),
-            policy_digest=sha256_hex(self.policy.to_dict()),
-            execution_policy_digest=_execution_policy_digest(_execution_policy_from_contract(self.policy)),
-            measurement_block_count=self.policy.measurement_runs,
-            evaluation_policy=self.policy,
-            execution_policy=_execution_policy_from_contract(self.policy),
+            thermal_blocks=_nominal_thermal_blocks(plan, policy=policy),
+            policy_digest=sha256_hex(policy.to_dict()),
+            execution_policy_digest=_execution_policy_digest(_execution_policy_from_contract(policy)),
+            measurement_block_count=policy.measurement_runs,
+            evaluation_policy=policy,
+            execution_policy=_execution_policy_from_contract(policy),
             oracle=oracle,
             oracle_descriptor=oracle.descriptor,
+            statistics=statistics,
         )
         # Every warmup and sample here carries real, matched isolation
         # evidence and a matching oracle, so the G1 evidence layer correctly
@@ -362,7 +407,7 @@ class ReceiptTests(unittest.TestCase):
             bundle,
             self.workload,
             self.candidate,
-            self.policy,
+            policy,
             oracle=oracle,
             created_at_ns=100,
         )
@@ -446,6 +491,11 @@ class ReceiptTests(unittest.TestCase):
                     MeasurementSample(slot.sample_id, slot.block_id, slot.slot_index, slot.arm, current, oracle.evaluate(current.stdout))
                 )
         measurements = assemble_measurement_bundle(plan, samples)
+        # A 20x runner-span separation is decisive on the very first peek
+        # (n=1 block still collapses the bootstrap CI to a point at the
+        # observed difference, well past the min-effect threshold either
+        # way), so no max_measurement_runs override is needed here.
+        statistics = _statistics_for(measurements, policy)
         bundle = ObservationBundle(
             candidate_id=self.candidate.candidate_id,
             workload_hash=self.workload.workload_hash,
@@ -469,11 +519,13 @@ class ReceiptTests(unittest.TestCase):
             execution_policy=_execution_policy_from_contract(policy),
             oracle=oracle,
             oracle_descriptor=oracle.descriptor,
+            statistics=statistics,
         )
         self.assertTrue(bundle.accepted)
         receipt = Receipt.from_observation_bundle(
             bundle, self.workload, self.candidate, policy, oracle=oracle, created_at_ns=100,
         )
+        self.assertEqual(receipt.statistics["verdict"], "regressed")
         gain = receipt.metrics["gain"]
         self.assertEqual(gain["baseline_sum_ns"], runner_ns["baseline"] * 2)
         self.assertEqual(gain["candidate_sum_ns"], runner_ns["candidate"] * 2)

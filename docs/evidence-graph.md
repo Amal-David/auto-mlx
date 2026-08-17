@@ -50,7 +50,13 @@ carries the structured effect and points outward through typed binary edges
 basis points (-2.57% is `-257`); a single unrepeated run is a point interval
 with a `sample_note` recording the caveat. `verdict` is closed to
 `improved`/`regressed`/`inconclusive`. `receipt_id`, when present, is a
-64-hex content address.
+64-hex content address. The optional `metric_direction`
+(`higher_is_better`/`lower_is_better`) makes decisive verdicts mechanically
+checkable: with a direction declared, the WHOLE interval must sit strictly
+on the claimed side of zero -- `improved` under `higher_is_better` requires
+`lower > 0`, so `[0, 100]` and any zero-touching or zero-straddling interval
+are rejected. Touching zero does not support a sign; the honest verdict for
+such an interval is `inconclusive`, which is never sign-constrained.
 
 **Provenance is a ladder, never flattened.** `official_verified`,
 `code_verified`, `local_measured`, `author_claim`, `contributor_claim`,

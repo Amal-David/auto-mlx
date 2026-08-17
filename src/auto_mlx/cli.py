@@ -42,6 +42,7 @@ from .contracts import (
 from .dispatch import CANDIDATE_MODE, DEFAULT_MAX_AGE_NS, NATIVE_MODE
 from .dispatch import dispatch as run_dispatch
 from .errors import AutoMLXError, CanonicalJSONError, ContractError, FailureCode, KeyMaterialError, SupervisorRefusalError
+from . import advisor as advisor_module
 from .evaluator import Evaluator
 from .graph import EvidenceGraph
 from .executor import (
@@ -312,6 +313,12 @@ def _tune_context_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-candidates", type=int,
         help="race at most this many pre-filtered candidates (kept in provider/warm-start order)",
+    )
+    parser.add_argument(
+        "--no-advice", action="store_true",
+        help="ignore stored prior verdicts for this exact (workload, runtime) identity; race every legal "
+        "candidate from the bottom rung (advice only ever prunes cited decisive regressions and reorders; "
+        "it never promotes and never prunes on inconclusive evidence)",
     )
 
 
@@ -1423,9 +1430,24 @@ def _run_tune_command(args: argparse.Namespace) -> dict[str, Any]:
 
     legal, pruned = tune_module.prefilter_candidates(provider, workload)
     considered = len(provider.configs)
-    ordered_capped, max_candidates_dropped = tune_module.apply_max_candidates(legal, args.max_candidates)
 
     store = store_config.open_store(args.store, key_dir=args.key_dir)
+
+    # Advice from stored prior evidence at this exact (workload, runtime)
+    # identity: prune cited decisive regressions before spending the
+    # measurement budget, seed the stored winner, demote prior inconclusives.
+    # Advice happens before --max-candidates truncation on purpose -- pruning
+    # known losers first lets the cap admit unmeasured candidates instead.
+    advice: advisor_module.RaceAdvice | None = None
+    advice_prunes: tuple[dict[str, Any], ...] = ()
+    advised = legal
+    if not getattr(args, "no_advice", False):
+        advice = advisor_module.advise_candidates(
+            legal, store=store, workload_hash=workload.workload_hash, runtime_identity=runtime.identity
+        )
+        advised, advice_prunes = advisor_module.apply_advice(legal, advice)
+
+    ordered_capped, max_candidates_dropped = tune_module.apply_max_candidates(advised, args.max_candidates)
     ordered = tune_module.warm_start_order(
         ordered_capped, store=store, workload_hash=workload.workload_hash, runtime_identity=runtime.identity
     )
@@ -1501,7 +1523,7 @@ def _run_tune_command(args: argparse.Namespace) -> dict[str, Any]:
         provider_id=provider.provider_id,
         base_policy=policy,
         considered=considered,
-        pruned=pruned,
+        pruned=tuple(pruned) + advice_prunes,
         max_candidates=args.max_candidates,
         max_candidates_dropped=max_candidates_dropped,
         outcome=outcome,
@@ -1513,6 +1535,7 @@ def _run_tune_command(args: argparse.Namespace) -> dict[str, Any]:
     result["ok"] = True
     result["command"] = "tune"
     result["store"] = str(store.root)
+    result["advice"] = None if advice is None else advice.to_dict()
     return result
 
 

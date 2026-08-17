@@ -426,6 +426,7 @@ _TUNING_SUMMARY_FIELDS: Final = {
     "prefilter", "budget", "entrants", "winner", "baseline", "summary_id",
 }
 _PRUNE_FIELDS: Final = {"config", "reason", "message"}
+_PRUNE_CITATION_FIELDS: Final = _PRUNE_FIELDS | {"receipt_id", "summary_id"}
 _PREFILTER_FIELDS: Final = {"considered", "pruned", "max_candidates", "max_candidates_dropped", "raced_count"}
 _BUDGET_FIELDS: Final = {"budget_measurements", "budget_seconds", "blocks_spent", "seconds_spent_ns", "exhausted"}
 _ENTRANT_FIELDS: Final = {
@@ -437,10 +438,16 @@ _BASELINE_FIELDS: Final = {"status", "note"}
 
 def _validate_prune_entry(value: Any, *, index: int) -> None:
     data = _object(value, label=f"prefilter.pruned[{index}]")
-    _exact(data, _PRUNE_FIELDS, label=f"prefilter.pruned[{index}]")
+    # Two closed shapes: a plain contract prune, or an advisor prune that
+    # must cite both the prior receipt and the tuning summary it came from.
+    cited = "receipt_id" in data or "summary_id" in data
+    _exact(data, _PRUNE_CITATION_FIELDS if cited else _PRUNE_FIELDS, label=f"prefilter.pruned[{index}]")
     _config_dict(data["config"], label=f"prefilter.pruned[{index}].config")
     _string(data["reason"], label=f"prefilter.pruned[{index}].reason")
     _string(data["message"], label=f"prefilter.pruned[{index}].message", non_empty=False)
+    if cited:
+        validate_sha256(data["receipt_id"])
+        validate_sha256(data["summary_id"])
 
 
 def _validate_entrant_entry(value: Any, *, index: int) -> None:

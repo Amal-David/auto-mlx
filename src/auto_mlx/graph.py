@@ -104,6 +104,30 @@ PROVENANCES: Final = frozenset(
 
 EFFECT_VERDICTS: Final = frozenset({"improved", "regressed", "inconclusive"})
 
+METRIC_DIRECTIONS: Final = frozenset({"higher_is_better", "lower_is_better"})
+
+# The id prefix (everything before the first colon) must match the node's
+# kind, so an id can never silently disagree with what it names.
+KIND_ID_PREFIXES: Final[Mapping[str, str]] = {
+    "model": "model",
+    "trait": "trait",
+    "hardware": "hardware",
+    "workload": "workload",
+    "mechanism": "mechanism",
+    "applied_result": "result",
+    "hypothesis": "hypothesis",
+    "constraint": "constraint",
+    "finding": "finding",
+    "external_reference": "external",
+    "frontier": "frontier",
+}
+
+# A reified hyperedge is only a hyperedge if its anchors are complete and
+# unambiguous: every applied_result must bind exactly one model, hardware,
+# and workload, and instantiate at least one mechanism.
+REIFICATION_EXACTLY_ONE: Final = ("applied_on", "measured_on", "under_workload")
+REIFICATION_AT_LEAST_ONE: Final = ("instantiates",)
+
 EXACTNESS_CLASSES: Final = frozenset(
     {"exact_by_construction", "needs_parity_proof", "approximate_legal"}
 )
@@ -199,7 +223,7 @@ def _integer(value: Any, *, label: str, minimum: int | None = None, maximum: int
 
 
 _EFFECT_REQUIRED: Final = frozenset({"metric", "verdict", "delta_bp_ci"})
-_EFFECT_OPTIONAL: Final = frozenset({"receipt_id", "baseline_id", "sample_note"})
+_EFFECT_OPTIONAL: Final = frozenset({"metric_direction", "receipt_id", "baseline_id", "sample_note"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +233,7 @@ class GraphEffect:
     metric: str
     verdict: str
     delta_bp_ci: tuple[int, int]
+    metric_direction: str | None = None
     receipt_id: str | None = None
     baseline_id: str | None = None
     sample_note: str | None = None
@@ -224,6 +249,23 @@ class GraphEffect:
         _integer(upper, label="effect.delta_bp_ci[1]", minimum=-MAX_EFFECT_DELTA_BP, maximum=MAX_EFFECT_DELTA_BP)
         if lower > upper:
             raise ContractError("effect.delta_bp_ci lower bound cannot exceed upper bound", code=FailureCode.INVALID_VALUE)
+        if self.metric_direction is not None:
+            if self.metric_direction not in METRIC_DIRECTIONS:
+                raise ContractError("effect.metric_direction is not closed", code=FailureCode.INVALID_VALUE)
+            # With a declared direction, a decisive verdict must agree with
+            # the interval's sign; without one, no sign claim is checkable.
+            better = lower > 0 if self.metric_direction == "higher_is_better" else upper < 0
+            worse = upper < 0 if self.metric_direction == "higher_is_better" else lower > 0
+            if self.verdict == "improved" and not better:
+                raise ContractError(
+                    "effect.verdict 'improved' contradicts delta_bp_ci under the declared metric_direction",
+                    code=FailureCode.INVALID_VALUE,
+                )
+            if self.verdict == "regressed" and not worse:
+                raise ContractError(
+                    "effect.verdict 'regressed' contradicts delta_bp_ci under the declared metric_direction",
+                    code=FailureCode.INVALID_VALUE,
+                )
         if self.receipt_id is not None:
             validate_sha256(self.receipt_id)
         if self.baseline_id is not None:
@@ -237,6 +279,8 @@ class GraphEffect:
             "verdict": self.verdict,
             "delta_bp_ci": list(self.delta_bp_ci),
         }
+        if self.metric_direction is not None:
+            result["metric_direction"] = self.metric_direction
         if self.receipt_id is not None:
             result["receipt_id"] = self.receipt_id
         if self.baseline_id is not None:
@@ -256,6 +300,7 @@ class GraphEffect:
             metric=data["metric"],
             verdict=data["verdict"],
             delta_bp_ci=(ci[0], ci[1]),
+            metric_direction=data.get("metric_direction"),
             receipt_id=data.get("receipt_id"),
             baseline_id=data.get("baseline_id"),
             sample_note=data.get("sample_note"),
@@ -290,6 +335,12 @@ class GraphNode:
         _identifier(self.node_id, label="node.id")
         if self.kind not in NODE_KINDS:
             raise ContractError(f"node {self.node_id} has unknown kind {self.kind!r}", code=FailureCode.INVALID_VALUE)
+        expected_prefix = KIND_ID_PREFIXES[self.kind]
+        if self.node_id.split(":", 1)[0] != expected_prefix:
+            raise ContractError(
+                f"node {self.node_id} of kind {self.kind!r} must use the id prefix {expected_prefix!r}:",
+                code=FailureCode.IDENTITY_MISMATCH,
+            )
         _string(self.title, label=f"node {self.node_id} title", max_length=_MAX_TITLE_LENGTH)
         _string(self.status, label=f"node {self.node_id} status", max_length=_MAX_STATUS_LENGTH)
         if self.confidence not in CONFIDENCES:
@@ -299,6 +350,11 @@ class GraphNode:
         _string(self.summary, label=f"node {self.node_id} summary", max_length=_MAX_SUMMARY_LENGTH)
         if type(self.evidence) is not tuple:
             raise ContractError(f"node {self.node_id} evidence must be an array", code=FailureCode.WRONG_TYPE)
+        if not self.evidence:
+            raise ContractError(
+                f"node {self.node_id} must carry at least one evidence locator",
+                code=FailureCode.INVALID_VALUE,
+            )
         if len(self.evidence) > MAX_NODE_EVIDENCE_ENTRIES:
             raise ContractError(
                 f"node {self.node_id} evidence cannot exceed {MAX_NODE_EVIDENCE_ENTRIES} entries",
@@ -534,6 +590,30 @@ class EvidenceGraph:
                         f"{'/'.join(sorted(to_kinds))}, got {kinds[edge.to_id]!r} ({edge.to_id})",
                         code=FailureCode.INVALID_VALUE,
                     )
+        # A reified hyperedge must be complete and unambiguous: exactly one
+        # model, hardware, and workload anchor, at least one mechanism.
+        anchor_counts: dict[str, dict[str, int]] = {
+            node.node_id: dict.fromkeys(REIFICATION_EXACTLY_ONE + REIFICATION_AT_LEAST_ONE, 0)
+            for node in self.nodes
+            if node.kind == "applied_result"
+        }
+        for edge in self.edges:
+            counts = anchor_counts.get(edge.from_id)
+            if counts is not None and edge.relation in counts:
+                counts[edge.relation] += 1
+        for node_id, counts in anchor_counts.items():
+            for relation in REIFICATION_EXACTLY_ONE:
+                if counts[relation] != 1:
+                    raise ContractError(
+                        f"applied_result {node_id} must have exactly one {relation!r} edge, found {counts[relation]}",
+                        code=FailureCode.INVALID_VALUE,
+                    )
+            for relation in REIFICATION_AT_LEAST_ONE:
+                if counts[relation] < 1:
+                    raise ContractError(
+                        f"applied_result {node_id} must have at least one {relation!r} edge",
+                        code=FailureCode.INVALID_VALUE,
+                    )
 
     @property
     def graph_sha256(self) -> str:
@@ -594,10 +674,14 @@ __all__: Final = [
     "GraphEdge",
     "GraphEffect",
     "GraphNode",
+    "KIND_ID_PREFIXES",
     "MAX_EFFECT_DELTA_BP",
     "MAX_GRAPH_EDGES",
     "MAX_GRAPH_NODES",
+    "METRIC_DIRECTIONS",
     "NODE_KINDS",
     "PROVENANCES",
+    "REIFICATION_AT_LEAST_ONE",
+    "REIFICATION_EXACTLY_ONE",
     "TYPED_RELATION_ENDPOINTS",
 ]

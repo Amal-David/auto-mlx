@@ -46,16 +46,30 @@ Decisions locked with the user:
       proven by deterministic fixtures (test_advisor.py); a live pruning
       demo requires an effectful workload (Phase 2).
 
-## Phase 1b — knowledge repo re-architecture (sub-agent, parallel)
+## Phase 1b — knowledge repo re-architecture (sub-agent, parallel) — DONE 2026-08-18
 
-- [ ] Storage re-architecture in `mlx-porting-skill`: `graph/` canonical JSON
-      shards conforming to schema v2 + compiled index + validation tooling
-- [ ] Migrate the 712-node v1 graph + techniques/architectures/guidance YAML
-      into v2 nodes (mechanism/trait/external_reference/applied_result)
-- [ ] Port Qwen 3.8 campaign ledger + PR corpus into founding shards
-      (scrubbed: no tokens, no credentials, no private submission details)
-- [ ] Evidence-pack contribution format + validation script
-- [ ] SKILL.md rendering layer connected to the graph
+Delivered on branch `graph-v2` of `/Users/amal/Downloads/mlx-porting-skill`
+(commits 97704b8, 887ea11, 4183205, 9a5bae9), independently verified from
+this session:
+
+- [x] `mlx-model-porting/graph/`: schema copy, 16 shards (core/mechanisms/
+      models/campaigns/migrated/ecosystem), stdlib-only validate_graph.py +
+      compile_graph.py + validate_pack.py + render_graph_summary.py +
+      migrate_v1.py
+- [x] Compiled graph: 319 nodes / 575 edges (64 mechanisms, 37 traits,
+      38 applied_results — 15 regressed / 5 improved / rest inconclusive —
+      4 models, 3 hardware, 124 external references). v1 migration was
+      deliberately selective (contributor-candidate noise dropped, allowed
+      by brief).
+- [x] Verified: their validator OK; compile byte-deterministic (identical
+      sha256 across two runs); the compiled graph passes this repo's strict
+      `auto-mlx validate graph`; scrub scan clean (no ykn_ tokens, no
+      api keys, no /Users paths).
+- [x] Founding negative knowledge present, e.g. the head-step-cost response
+      surface (0.14 → −385bp, 0.18 → −132bp, 0.24 → −151bp), GH=2 grouped
+      SDPA −257bp, compiled MTP front −408bp — each cited to public PRs.
+- [x] Evidence-pack format + example pack + docs/evidence-packs.md + CI gates
+- [x] MECHANISM_INDEX.md rendering generated from the compiled graph
 
 ## Phase 2 — fingerprint + transfer (after Phase 1)
 

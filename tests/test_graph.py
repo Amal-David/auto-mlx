@@ -71,6 +71,25 @@ def _graph(nodes: list[dict], edges: list[dict]) -> dict:
     }
 
 
+def _reified_base() -> tuple[list[dict], list[dict]]:
+    """A minimal valid graph holding one fully-anchored applied_result."""
+
+    nodes = [
+        _node("mechanism:m", kind="mechanism"),
+        _node("model:m", kind="model"),
+        _node("hardware:h", kind="hardware"),
+        _node("workload:w", kind="workload"),
+        _result_node("result:r"),
+    ]
+    edges = [
+        _edge("result:r", "mechanism:m", "instantiates"),
+        _edge("result:r", "model:m", "applied_on"),
+        _edge("result:r", "hardware:h", "measured_on"),
+        _edge("result:r", "workload:w", "under_workload"),
+    ]
+    return nodes, edges
+
+
 class GraphEffectTests(unittest.TestCase):
     def test_round_trip(self) -> None:
         effect = GraphEffect.from_dict(_effect(receipt_id="a" * 64, baseline_id="baseline:x", sample_note="one run"))
@@ -210,17 +229,29 @@ class EvidenceGraphTests(unittest.TestCase):
             "applied_result": _result_node("result:r"),
             "hypothesis": _node("hypothesis:h", kind="hypothesis"),
         }
+        base_nodes, base_edges = _reified_base()
         for relation, (from_kinds, to_kinds) in TYPED_RELATION_ENDPOINTS.items():
             good_from = sorted(from_kinds)[0]
             good_to = sorted(to_kinds)[0]
             with self.subTest(relation=relation, case="accepts"):
-                EvidenceGraph.from_dict(
-                    _graph(
-                        [kind_examples[good_from], kind_examples[good_to]],
-                        [_edge(kind_examples[good_from]["id"], kind_examples[good_to]["id"], relation)],
+                if good_from == "applied_result":
+                    # The reified base already satisfies anchor cardinality;
+                    # confirms/refutes get their extra target added on top.
+                    nodes = list(base_nodes)
+                    edges = list(base_edges)
+                    if relation in {"confirms", "refutes"}:
+                        target = kind_examples[good_to]
+                        if all(node["id"] != target["id"] for node in nodes):
+                            nodes.append(target)
+                        edges.append(_edge("result:r", target["id"], relation))
+                    EvidenceGraph.from_dict(_graph(nodes, edges))
+                else:
+                    EvidenceGraph.from_dict(
+                        _graph(
+                            [kind_examples[good_from], kind_examples[good_to]],
+                            [_edge(kind_examples[good_from]["id"], kind_examples[good_to]["id"], relation)],
+                        )
                     )
-                )
-            bad_from = "constraint"
             with self.subTest(relation=relation, case="rejects_from"):
                 with self.assertRaises(ContractError):
                     EvidenceGraph.from_dict(
@@ -257,6 +288,58 @@ class EvidenceGraphTests(unittest.TestCase):
         self.assertEqual(graph.node("mechanism:a").kind, "mechanism")
         with self.assertRaises(ContractError):
             graph.node("mechanism:missing")
+
+
+class ReificationAndStrictnessTests(unittest.TestCase):
+    """Rules adopted from the knowledge-repo integration review."""
+
+    def test_id_prefix_must_match_kind(self) -> None:
+        with self.assertRaises(ContractError) as caught:
+            GraphNode.from_dict(_node("mechanism:x", kind="trait"))
+        self.assertEqual(caught.exception.code, FailureCode.IDENTITY_MISMATCH)
+        # applied_result and external_reference use their short prefixes.
+        with self.assertRaises(ContractError):
+            GraphNode.from_dict(_node("applied_result:x", kind="applied_result", effect=_effect()))
+        GraphNode.from_dict(_node("external:x", kind="external_reference"))
+
+    def test_evidence_must_be_non_empty(self) -> None:
+        with self.assertRaises(ContractError):
+            GraphNode.from_dict(_node(evidence=[]))
+
+    def test_applied_result_requires_complete_anchors(self) -> None:
+        nodes, edges = _reified_base()
+        EvidenceGraph.from_dict(_graph(nodes, edges))  # complete: valid
+        for missing in ("instantiates", "applied_on", "measured_on", "under_workload"):
+            with self.subTest(missing=missing):
+                with self.assertRaises(ContractError) as caught:
+                    EvidenceGraph.from_dict(
+                        _graph(nodes, [edge for edge in edges if edge["relation"] != missing])
+                    )
+                self.assertIn(missing, str(caught.exception))
+
+    def test_applied_result_rejects_ambiguous_anchor(self) -> None:
+        nodes, edges = _reified_base()
+        nodes = nodes + [_node("model:other", kind="model")]
+        edges = edges + [_edge("result:r", "model:other", "applied_on")]
+        with self.assertRaises(ContractError) as caught:
+            EvidenceGraph.from_dict(_graph(nodes, edges))
+        self.assertIn("exactly one", str(caught.exception))
+
+    def test_second_instantiates_edge_is_allowed(self) -> None:
+        nodes, edges = _reified_base()
+        nodes = nodes + [_node("mechanism:extra", kind="mechanism")]
+        edges = edges + [_edge("result:r", "mechanism:extra", "instantiates")]
+        EvidenceGraph.from_dict(_graph(nodes, edges))
+
+    def test_metric_direction_checks_verdict_sign(self) -> None:
+        GraphEffect.from_dict(_effect(metric_direction="higher_is_better"))  # regressed, CI < 0: consistent
+        with self.assertRaises(ContractError):
+            GraphEffect.from_dict(_effect(verdict="improved", metric_direction="higher_is_better"))
+        GraphEffect.from_dict(_effect(verdict="improved", metric_direction="lower_is_better"))
+        # Inconclusive never carries a sign claim, so any interval is fine.
+        GraphEffect.from_dict(_effect(verdict="inconclusive", delta_bp_ci=[-50, 50], metric_direction="higher_is_better"))
+        with self.assertRaises(ContractError):
+            GraphEffect.from_dict(_effect(metric_direction="sideways"))
 
 
 if __name__ == "__main__":

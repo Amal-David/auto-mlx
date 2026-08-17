@@ -87,4 +87,33 @@ this session:
 
 ## Review
 
-(to be filled as work completes)
+Phase 1 + 1b complete, 2026-08-18.
+
+- auto-mlx: 5 commits on main (6825c8e graph contract, 58fa8dd advisor,
+  a7143a7 docs, 8ce8eca todo, 12573f9 contract tightening). Full suite
+  389 passed / 0 failed / 38 skipped (sandbox+MLX gated under py3.14
+  runner; live loop verified separately under python3.13 + MLX 0.31.2).
+- Contract tightening adopted from the sub-agent's integration review:
+  effect required-on/exclusive-to applied_result in the JSON Schema too;
+  reification cardinality (exactly-one applied_on/measured_on/
+  under_workload, ≥1 instantiates); id prefix↔kind table; evidence
+  minItems 1; optional effect.metric_direction with verdict-sign
+  consistency; caps mirrored into the JSON Schema. The knowledge repo's
+  319-node compiled graph passes the stricter contract unchanged.
+- Knowledge repo (mlx-porting-skill) branch graph-v2: 16 shards,
+  319 nodes / 575 edges, packs format + CI, 581/581 tests in a clean
+  worktree. NOTE for user: graph-v2 was cut from fix/audit-remediation
+  (repo HEAD at the time), not main; merging graph-v2 brings that branch's
+  work along. Sub-agent findings worth keeping: E014 byte-identical rerun
+  spread ±130bp is the official-score noise floor and 18/38 campaign
+  results are honestly inconclusive under it; two promoted mechanisms
+  (+3/+9bp) are real promotions with unresolved effects; Huffman/2-bit
+  head lanes have ZERO official evidence (all six submissions failed
+  unscored) and are recorded as unresolved, not negative.
+- Follow-up queued for knowledge repo: re-copy updated schema from
+  auto-mlx into graph/schema/ (asked of sub-agent 2026-08-18).
+
+Next: Phase 2 — auto-mlx fingerprint (HF config → trait vector),
+transfer prediction from the founding graph, model #2 selection, first
+confirmed transfer with a fresh receipt. mlx-lm 0.31.3 + MLX 0.31.2
+already installed under python3.13 on this host.

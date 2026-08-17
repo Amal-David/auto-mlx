@@ -19,27 +19,32 @@ Decisions locked with the user:
   identity drift downgrades prune→reorder; `inconclusive` never prunes;
   everything fails closed; no floats (basis points for effects).
 
-## Phase 1 — v2 graph contracts + racer integration (this repo)
+## Phase 1 — v2 graph contracts + racer integration (this repo) — DONE 2026-08-17
 
-- [ ] Design shared evidence-graph schema v2 (traits, mechanisms, reified
-      applied_result, structured integer-bp effects, provenance tiers,
-      freshness) — `src/auto_mlx/schemas/evidence-graph.schema.json`
-- [ ] `src/auto_mlx/graph.py`: strict fail-closed contracts mirroring the
-      JSON schema, plus structural rules (unique ids, no dangling edges,
-      endpoint-kind constraints for typed relations, effect required on
-      applied_result)
-- [ ] CLI: `auto-mlx validate graph` / `auto-mlx inspect graph`
-- [ ] Tests: contract round-trips, fail-closed cases, schema parity
-- [ ] `src/auto_mlx/advisor.py`: pre-race advice from stored receipts +
-      tuning summaries at exact (workload_hash, runtime_identity) —
-      prune proven regressions (with receipt citation), seed proven winner,
-      never prune on inconclusive, downgrade on identity mismatch
-- [ ] Wire advisor into `auto-mlx tune` (opt-out flag) and surface
-      advice + citations in the tuning summary
-- [ ] Tests for advisor invariants (each maps to an acceptance criterion)
-- [ ] Build verification: full pytest suite green
-- [ ] Docs: README + docs/evidence-graph.md in the repo's candid register
-- [ ] Git checkpoints at each verified step
+- [x] Shared evidence-graph schema v2 — `src/auto_mlx/schemas/evidence_graph.json`
+      (renamed to house convention; surrogate propertyNames guards added)
+- [x] `src/auto_mlx/graph.py`: strict fail-closed contracts + structural
+      rules (unique ids, no dangling edges, endpoint-kind constraints,
+      effect required on and exclusive to applied_result)
+- [x] CLI: `auto-mlx validate graph` / `auto-mlx inspect graph` +
+      `examples/evidence-graph.json`
+- [x] Tests: round-trips, fail-closed cases, schema parity, packaging
+- [x] `src/auto_mlx/advisor.py` with the full invariant set
+- [x] Wired into `auto-mlx tune` (`--no-advice` opt-out); cited prunes land
+      in prefilter.pruned; advice block in CLI result
+- [x] Advisor invariant tests (9, each pinned to an invariant)
+- [x] Full pytest suite green: 383 passed, 0 failed, 38 skipped
+      (skips = sandbox/MLX-gated tests under the homebrew py3.14 runner)
+- [x] Docs: docs/evidence-graph.md + README section, candid register
+- [x] Git checkpoints: 6825c8e (graph), 58fa8dd (advisor), a7143a7 (docs)
+- [x] Live end-to-end on this M4 Pro (python3.13 + MLX 0.31.2, real
+      sandbox + attestation): cold tune 6 blocks/2 futile entrants/no
+      winner; warm tune consulted 1 stored summary and emitted 2 demote
+      advice entries each citing receipt_id + summary_id; no prune and no
+      block savings — correct, since toy-matmul yields only inconclusive
+      verdicts and inconclusive never prunes. Prune-path block savings are
+      proven by deterministic fixtures (test_advisor.py); a live pruning
+      demo requires an effectful workload (Phase 2).
 
 ## Phase 1b — knowledge repo re-architecture (sub-agent, parallel)
 

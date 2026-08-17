@@ -1,0 +1,132 @@
+{
+  "schema_version": 2,
+  "graph_id": "example-evidence-graph-v1",
+  "generated_at": "2026-08-17",
+  "nodes": [
+    {
+      "id": "model:example-decoder@rev0",
+      "kind": "model",
+      "title": "Example quantized decoder model",
+      "status": "active",
+      "confidence": "high",
+      "provenance": "code_verified",
+      "summary": "A placeholder pinned model identity used to demonstrate the evidence-graph contract shape.",
+      "evidence": ["examples/evidence-graph.json"],
+      "tags": ["example"],
+      "observed_at": "2026-08-17",
+      "identity": {"quant": "affine4-group-64", "revision": "rev0"}
+    },
+    {
+      "id": "trait:affine-q4-group-64",
+      "kind": "trait",
+      "title": "Affine 4-bit group-64 quantization",
+      "status": "active",
+      "confidence": "high",
+      "provenance": "code_verified",
+      "summary": "The model's dominant weight stream is affine 4-bit quantized at group size 64.",
+      "evidence": ["examples/evidence-graph.json"],
+      "tags": ["example", "quantization"],
+      "observed_at": "2026-08-17"
+    },
+    {
+      "id": "hardware:example-apple-silicon",
+      "kind": "hardware",
+      "title": "Example Apple Silicon host class",
+      "status": "active",
+      "confidence": "high",
+      "provenance": "local_measured",
+      "summary": "A placeholder hardware identity; real nodes pin chip class and memory.",
+      "evidence": ["examples/evidence-graph.json"],
+      "tags": ["example"],
+      "observed_at": "2026-08-17",
+      "identity": {"chip": "example", "memory_gb": 48}
+    },
+    {
+      "id": "workload:toy-matmul",
+      "kind": "workload",
+      "title": "Checked-in toy-matmul reference workload",
+      "status": "active",
+      "confidence": "high",
+      "provenance": "code_verified",
+      "summary": "The repository's declarative reference workload; it contains no real effect to find by construction.",
+      "evidence": ["examples/workload.json"],
+      "tags": ["example", "reference"],
+      "observed_at": "2026-08-17"
+    },
+    {
+      "id": "mechanism:example-compiled-mode",
+      "kind": "mechanism",
+      "title": "Compiled-graph execution mode",
+      "status": "measured",
+      "confidence": "high",
+      "provenance": "local_measured",
+      "summary": "Switching the reference runner from eager to compiled execution; measured indistinguishable from baseline on the toy workload at this host's noise floor.",
+      "evidence": ["docs/autotuning.md"],
+      "tags": ["example", "compile"],
+      "observed_at": "2026-08-17",
+      "exactness_class": "needs_parity_proof"
+    },
+    {
+      "id": "result:toy-matmul-compiled-inconclusive",
+      "kind": "applied_result",
+      "title": "Compiled mode vs eager on toy-matmul: inconclusive",
+      "status": "terminal",
+      "confidence": "high",
+      "provenance": "local_measured",
+      "summary": "95% CI roughly [-52us, +18us] against a ~19.2ms per-iteration baseline; straddles zero and is well inside the 2% min-effect threshold.",
+      "evidence": ["docs/autotuning.md"],
+      "tags": ["example", "aa-calibrated"],
+      "observed_at": "2026-08-17",
+      "effect": {
+        "metric": "iteration_time",
+        "verdict": "inconclusive",
+        "delta_bp_ci": [-27, 9],
+        "sample_note": "bootstrap CI over paired blocks; A/A noise floor roughly +/-45bp on this host"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "model:example-decoder@rev0",
+      "to": "trait:affine-q4-group-64",
+      "relation": "exhibits",
+      "confidence": "high",
+      "rationale": "The pinned revision's weight manifest declares affine4/group-64 projections."
+    },
+    {
+      "from": "mechanism:example-compiled-mode",
+      "to": "trait:affine-q4-group-64",
+      "relation": "applies_to",
+      "confidence": "medium",
+      "rationale": "Compiled execution is applicable to any model exhibiting the quantized projection trait; effect size is workload-dependent."
+    },
+    {
+      "from": "result:toy-matmul-compiled-inconclusive",
+      "to": "mechanism:example-compiled-mode",
+      "relation": "instantiates",
+      "confidence": "high",
+      "rationale": "This reified result measured the compiled-mode mechanism."
+    },
+    {
+      "from": "result:toy-matmul-compiled-inconclusive",
+      "to": "model:example-decoder@rev0",
+      "relation": "applied_on",
+      "confidence": "high",
+      "rationale": "The measurement ran against the example model identity."
+    },
+    {
+      "from": "result:toy-matmul-compiled-inconclusive",
+      "to": "hardware:example-apple-silicon",
+      "relation": "measured_on",
+      "confidence": "high",
+      "rationale": "The measurement ran on the example host class."
+    },
+    {
+      "from": "result:toy-matmul-compiled-inconclusive",
+      "to": "workload:toy-matmul",
+      "relation": "under_workload",
+      "confidence": "high",
+      "rationale": "The measurement used the checked-in toy-matmul workload."
+    }
+  ]
+}

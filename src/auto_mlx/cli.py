@@ -43,6 +43,7 @@ from .dispatch import CANDIDATE_MODE, DEFAULT_MAX_AGE_NS, NATIVE_MODE
 from .dispatch import dispatch as run_dispatch
 from .errors import AutoMLXError, CanonicalJSONError, ContractError, FailureCode, KeyMaterialError, SupervisorRefusalError
 from .evaluator import Evaluator
+from .graph import EvidenceGraph
 from .executor import (
     ExecutionPolicy,
     ExecutionStatus,
@@ -94,6 +95,7 @@ _NON_REGULAR_OPEN_ERRNOS: Final = frozenset(
 _CONTRACT_KINDS: Final = (
     "artifact",
     "candidate",
+    "graph",
     "knob",
     "policy",
     "provider",
@@ -772,6 +774,8 @@ def _as_document(kind: str, value: Any, *, workload_value: Any | None, artifact_
         return receipt
     if kind == "artifact":
         return Artifact.from_dict(value)
+    if kind == "graph":
+        return EvidenceGraph.from_dict(value)
     if kind == "knob":
         return Knob.from_dict(value)
     if kind == "policy":
@@ -808,6 +812,13 @@ def _to_dict(value: Any) -> Any:
 def _identity_fields(kind: str, value: Any, document: Any) -> dict[str, Any]:
     if kind == "artifact":
         return {"sha256": document.sha256, "size_bytes": document.size_bytes}
+    if kind == "graph":
+        return {
+            "graph_id": document.graph_id,
+            "graph_sha256": document.graph_sha256,
+            "node_count": len(document.nodes),
+            "edge_count": len(document.edges),
+        }
     if kind == "knob":
         return {"knob_id": sha256_hex(document.to_dict())}
     if kind == "policy":

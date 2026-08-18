@@ -19,10 +19,11 @@ auto-mlx rollback [--store DIR] [--key-dir DIR]
 auto-mlx keys ensure [--key-dir DIR]
 auto-mlx tune --workload FILE --provider FILE [--policy FILE] [--runtime FILE] --artifact-root DIR
                    [--store DIR] [--key-dir DIR] [--budget-measurements N] [--budget-seconds N] [--max-candidates N]
+                   [--no-advice]
 auto-mlx history --workload FILE [--store DIR]
 ```
 
-`KIND` is one of `artifact`, `candidate`, `knob`, `policy`, `provider`, `receipt`, `runtime`, `workload`, or `document`. A positional path is accepted in place of `--input`; exactly one spelling is required. Irrelevant options and ambiguous long-option abbreviations are rejected as usage errors.
+`KIND` is one of `artifact`, `candidate`, `graph`, `knob`, `policy`, `provider`, `receipt`, `runtime`, `workload`, or `document`. A positional path is accepted in place of `--input`; exactly one spelling is required. Irrelevant options and ambiguous long-option abbreviations are rejected as usage errors. The `graph` kind validates an evidence-graph document (schema version 2) through `auto_mlx.graph`'s full structural rules -- unique ids, no dangling edges, endpoint-kind and reification-cardinality constraints -- and `inspect graph` reports `graph_id`, `graph_sha256`, and node/edge counts; see [the evidence graph and the pre-race advisor](evidence-graph.md).
 
 The exact option matrix for `validate`/`inspect` is:
 
@@ -265,6 +266,13 @@ Racing properties, all of which the tests pin:
   is no shortcut evidence lane for search.
 - Budgets (`--budget-measurements`, `--budget-seconds`, `--max-candidates`) are honored strictly,
   and the summary reports whether the budget was exhausted with candidates still unresolved.
+- Before racing, **stored prior verdicts at the exact (workload, runtime) identity advise the race**:
+  a prior decisive regression prunes its candidate before any block is spent -- only when the prior
+  entrant was attested, its receipt still independently loads from the store, and no contradictory
+  `improved` verdict exists in history -- and the prune is recorded in `prefilter.pruned` with
+  `receipt_id`/`summary_id` citations. A stored winner is seeded first and still re-races in full;
+  futile or at-cap-inconclusive history only demotes racing order. `--no-advice` opts out entirely.
+  Advice never promotes; see [the evidence graph and the pre-race advisor](evidence-graph.md).
 
 The run emits a content-addressed `auto_mlx.tuning_summary.v1` document — stored alongside receipts
 and echoed on stdout — carrying the ranked entrants with their CI bounds and verdicts, elimination

@@ -73,6 +73,17 @@ is intentionally unconstrained. `confirms`/`refutes` close the transfer
 loop: only a reified measurement may confirm or refute a prediction, which
 is how transfer reliability becomes a measured quantity instead of a hope.
 
+**Reified hyperedges must be complete and unambiguous.** Every
+`applied_result` must carry exactly one `applied_on`, `measured_on`, and
+`under_workload` edge plus at least one `instantiates` edge -- an
+applied result with missing or duplicated anchors is not a hyperedge and
+fails validation. Node id prefixes must match their kind (`result:` for
+`applied_result`, `external:` for `external_reference`, otherwise the kind
+name), so an id can never silently disagree with what it names, and every
+node must carry at least one evidence locator. These rules were adopted
+from the knowledge repository's independent validator during integration;
+both sides now enforce them identically.
+
 Validate and inspect from the CLI:
 
 ```bash

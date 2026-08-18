@@ -16,6 +16,7 @@ SCHEMA_NAMES = {
     "candidate_proposal.json",
     "declarative_provider.json",
     "evaluation_policy.json",
+    "evidence_graph.json",
     "frozen_workload.json",
     "knob.json",
     "runtime_identity.json",

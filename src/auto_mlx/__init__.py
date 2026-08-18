@@ -71,6 +71,7 @@ from .dispatch import (
     resolve_dispatch,
 )
 from .evaluator import Evaluator, Observation, ObservationBundle
+from .graph import EvidenceGraph, GraphEdge, GraphEffect, GraphNode
 from .promotion import (
     ACTIVATE,
     DECISION_SCHEMA,
@@ -124,9 +125,13 @@ __all__ = [
     "DuplicateKeyError",
     "EvaluationPolicy",
     "Evaluator",
+    "EvidenceGraph",
     "Failure",
     "FailureCode",
     "FrozenWorkload",
+    "GraphEdge",
+    "GraphEffect",
+    "GraphNode",
     "KeyMaterialError",
     "Knob",
     "NATIVE",

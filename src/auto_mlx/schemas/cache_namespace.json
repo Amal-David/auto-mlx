@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "propertyNames": {
+    "$ref": "#/$defs/no_surrogate_string"
+  },
+  "$defs": {
+    "no_surrogate_string": {
+      "type": "string",
+      "not": {
+        "pattern": "[\\ud800-\\udfff]"
+      }
+    }
+  },
+  "title": "Cache identity prerequisite; not a cache or authorization",
+  "properties": {
+    "model_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "tokenizer_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "processor_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "template_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "adapter_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "draft_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cache_layout_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "tenant_namespace_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "ordered_media_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cache_abi": {
+      "type": "string",
+      "pattern": "^[a-zA-Z0-9._/-]{1,128}$"
+    }
+  },
+  "required": [
+    "model_sha256",
+    "tokenizer_sha256",
+    "processor_sha256",
+    "template_sha256",
+    "adapter_sha256",
+    "draft_sha256",
+    "cache_layout_sha256",
+    "tenant_namespace_sha256",
+    "ordered_media_sha256",
+    "cache_abi"
+  ]
+}

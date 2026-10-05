@@ -13,6 +13,8 @@ import sysconfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_NAMES = {
+    "cache_namespace.json",
+    "serving_comparison_context.json",
     "artifact.json",
     "candidate_proposal.json",
     "declarative_provider.json",

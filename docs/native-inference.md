@@ -214,3 +214,10 @@ AUTO_MLX_NATIVE_MODEL="$MODEL" AUTO_MLX_NATIVE_DEVICE=cpu \
 It exercises real repeated generation, context overflow, cancellation/reload,
 non-streaming completions and server-sent events. Setting the device to `gpu`
 tests the Metal gate rather than substituting a CPU result.
+
+## Serving observability update
+
+[Engine-survey adoption](engine-survey-adoption.md) adds explicit capabilities,
+bounded HTTP overload errors and parent handler-boundary latency metrics to both
+JSON and streaming completions. These are not new batch/cache/speculation features
+or fixes to the execution blockers described above.

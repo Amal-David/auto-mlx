@@ -1,0 +1,307 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "propertyNames": {
+    "$ref": "#/$defs/no_surrogate_string"
+  },
+  "$defs": {
+    "no_surrogate_string": {
+      "type": "string",
+      "not": {
+        "pattern": "[\\ud800-\\udfff]"
+      }
+    }
+  },
+  "title": "Declared serving comparability; not an attestation",
+  "properties": {
+    "engine": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {
+        "pattern": "[\\ud800-\\udfff]"
+      }
+    },
+    "engine_revision": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "model_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "tokenizer_processor_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "template_adapter_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "workload_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "sampling_policy_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "quality_contract_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hardware_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "measurement_protocol_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "cache_state": {
+      "enum": [
+        "cold",
+        "warm",
+        "partial"
+      ]
+    },
+    "cache_precision": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "not": {
+        "pattern": "[\\ud800-\\udfff]"
+      }
+    },
+    "model_load_state": {
+      "enum": [
+        "cold",
+        "resident"
+      ]
+    },
+    "concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+    },
+    "input_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 16777216
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1048576
+    },
+    "metric": {
+      "enum": [
+        "request_first_content_ns",
+        "request_end_to_end_ns",
+        "physical_prefill_tokens_per_second",
+        "logical_prefill_tokens_per_second",
+        "decode_tokens_per_second",
+        "aggregate_output_tokens_per_second",
+        "process_peak_rss_bytes",
+        "metal_allocated_bytes",
+        "first_audio_ns",
+        "audio_realtime_factor_bps"
+      ]
+    },
+    "unit": {
+      "enum": [
+        "basis_points",
+        "bytes",
+        "ns",
+        "tokens_per_second"
+      ]
+    },
+    "quality_passed": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "engine",
+    "engine_revision",
+    "model_sha256",
+    "tokenizer_processor_sha256",
+    "template_adapter_sha256",
+    "workload_sha256",
+    "sampling_policy_sha256",
+    "quality_contract_sha256",
+    "hardware_sha256",
+    "measurement_protocol_sha256",
+    "cache_state",
+    "cache_precision",
+    "model_load_state",
+    "concurrency",
+    "input_tokens",
+    "max_output_tokens",
+    "metric",
+    "unit",
+    "quality_passed"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "request_first_content_ns"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "ns"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "request_end_to_end_ns"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "ns"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "physical_prefill_tokens_per_second"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "tokens_per_second"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "logical_prefill_tokens_per_second"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "tokens_per_second"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "decode_tokens_per_second"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "tokens_per_second"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "aggregate_output_tokens_per_second"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "tokens_per_second"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "process_peak_rss_bytes"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "bytes"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "metal_allocated_bytes"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "bytes"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "first_audio_ns"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "ns"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "metric": {
+            "const": "audio_realtime_factor_bps"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "unit": {
+            "const": "basis_points"
+          }
+        }
+      }
+    }
+  ]
+}

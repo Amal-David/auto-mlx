@@ -80,6 +80,22 @@ The knowledge layer above receipts is the **evidence graph** (`auto-mlx validate
 
 Read [the architecture](docs/architecture.md), [the CLI reference](docs/cli.md), [how tuning decisions are made](docs/autotuning.md), [the evidence graph and advisor](docs/evidence-graph.md), [the threat model](docs/threat-model.md), [the measurement contract](docs/measurement.md), [evidence and promotion](docs/evidence-and-promotion.md), and [the research landscape](docs/research-landscape.md) before proposing a new lane.
 
+## Serving-engine research contracts
+
+The [engine-survey adoption record](docs/engine-survey-adoption.md) connects the
+companion 24-project survey to original, executable contracts: comparison-cell
+validation, future cache-namespace identity, truthful native capability reporting,
+parent-boundary response metrics and explicit HTTP overload errors.
+
+```bash
+auto-mlx compare-serving --baseline examples/serving-baseline.json --candidate examples/serving-candidate.json
+```
+
+These deliberately incompatible examples are synthetic declarations, not measured
+results. This command cannot attest a benchmark or promote a winner. The native
+preview still has no continuous batching, prefix cache, offload or speculation;
+its previously documented GPU and evaluator-staging blockers remain unresolved.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

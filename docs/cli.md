@@ -309,3 +309,11 @@ to `false`, is re-verified from recomputed statistics rather than trusted from a
 is covered by tests proving the relaxation cannot apply to ordinary non-racing receipts. It is
 retained as a tested, opt-in mechanism for a future incremental-extension search; treat it as unused
 today rather than as load-bearing.
+
+## compare-serving
+
+`auto-mlx compare-serving --baseline BASELINE.json --candidate CANDIDATE.json`
+validates two closed serving context documents and reports declared comparability.
+A well-formed mismatch returns `comparable=false`; malformed input uses the normal
+nonzero contract error. No engine is executed and no winner is promoted. See
+[the adoption record](engine-survey-adoption.md) for fields and examples.

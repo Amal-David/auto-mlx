@@ -2,6 +2,20 @@
 
 Auto MLX is a small, standalone G0 contract layer for evidence-gated MLX tuning. It records declarative workloads and bounded configuration spaces without allowing a candidate to choose commands, code, evaluator logic, or its own identity.
 
+## Native inference preview
+
+An experimental native MLX-LM path now adds artifact-bound model bundles,
+deterministic generation, a resident local worker, and a localhost text-completions
+API. The real Qwen CPU integration covers repeated generation, context rejection,
+cancellation/reload, and HTTP/SSE responses. **GPU execution and the full native
+evaluator/promotion loop still have reproduced validation blockers.** This is not
+a production engine, a GPU performance claim, or proof of source-model parity.
+
+See [native inference: commands, contracts, validation and open gates](docs/native-inference.md).
+The core installation remains dependency-free; execution packages are an optional
+`inference` extra. The skill/porting knowledge layer remains in the companion
+`mlx-porting-skill` repository.
+
 ## Implemented G0 capabilities
 
 - Strict JSON parsing: duplicate keys, floating-point values, non-finite numbers, unknown fields, and malformed contract shapes fail closed.

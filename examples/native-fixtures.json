@@ -1,0 +1,10 @@
+[
+  {
+    "prompt": "The capital of France is",
+    "max_tokens": 8
+  },
+  {
+    "prompt": "Write one sentence about a kayak.",
+    "max_tokens": 12
+  }
+]

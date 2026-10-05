@@ -149,6 +149,9 @@ _WORKLOAD_RUNNERS: Final[dict[str, Callable[[TrustedRunnerRegistry], tuple[str, 
 
 
 def _resolve_workload_runners(workload: FrozenWorkload, registry: TrustedRunnerRegistry) -> tuple[str, str]:
+    if workload.name == "mlx-lm-text-v1":
+        from .runners.mlx_lm import register_mlx_lm_runners
+        return register_mlx_lm_runners(workload, registry)
     registrar = _WORKLOAD_RUNNERS.get(workload.name)
     if registrar is None:
         raise ContractError(
@@ -156,6 +159,12 @@ def _resolve_workload_runners(workload: FrozenWorkload, registry: TrustedRunnerR
             code=FailureCode.PROVIDER_ERROR,
         )
     return registrar(registry)
+
+
+def _local_provider(workload: FrozenWorkload) -> LocalSandboxProvider:
+    # MLX-LM 0.31.3 sets RLIMIT_NOFILE=(2048,4096) while importing utils.
+    # Keep the existing sandbox, with a bounded native-backend-specific cap.
+    return LocalSandboxProvider(max_open_files=4096) if workload.name == "mlx-lm-text-v1" else LocalSandboxProvider()
 
 
 def _execution_policy_from_evaluation_policy(policy: EvaluationPolicy) -> ExecutionPolicy:
@@ -449,6 +458,8 @@ def build_parser() -> argparse.ArgumentParser:
     keys_ensure_parser.add_argument(
         "--key-dir", help="attestation key directory (defaults to AUTO_MLX_KEY_DIR or ~/.auto-mlx/keys)"
     )
+    from .inference_cli import add_arguments
+    add_arguments(subparsers, JSONArgumentParser)
     return parser
 
 
@@ -1180,6 +1191,9 @@ def _load_evaluation_context(
     artifact_root = args.artifact_root
     workload_value = _read_document_json(args.workload, kind="workload")
     workload = _as_document("workload", workload_value, workload_value=None, artifact_root=artifact_root)
+    if workload.name == "mlx-lm-text-v1":
+        from .model_bundle import bundle_from_workload
+        bundle_from_workload(workload).verify(Path(artifact_root), check_runtime=True)
     candidate_value = _read_document_json(args.candidate, kind="candidate")
     candidate = _as_document("candidate", candidate_value, workload_value=workload_value, artifact_root=artifact_root)
     if args.policy is not None:
@@ -1228,7 +1242,7 @@ def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
     probe_record = probe_plan.execute(
         execution_policy,
         registry=registry,
-        provider=LocalSandboxProvider(),
+        provider=_local_provider(workload),
         authority=LocalSandboxAuthority(),
     )
     if probe_record.status is not ExecutionStatus.SUCCESS:
@@ -1247,7 +1261,7 @@ def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
         artifact_root=artifact_root,
         policy=policy,
         execution_policy=execution_policy,
-        provider=LocalSandboxProvider(),
+        provider=_local_provider(workload),
         authority=LocalSandboxAuthority(),
     )
     bundle = evaluator.evaluate(candidate)
@@ -1295,10 +1309,15 @@ def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
 def _run_promote_command(args: argparse.Namespace) -> dict[str, Any]:
     store = store_config.open_store(args.store, key_dir=args.key_dir)
     receipt = store.get_receipt(args.receipt_id)
+    if receipt.workload.name == "mlx-lm-text-v1":
+        from .model_bundle import bundle_from_workload
+        bundle_from_workload(receipt.workload)
     # Strict, non-generating load: promote never silently mints a fresh key
     # for a receipt it did not itself just evaluate.
     key = keys_module.load_attestation_key(key_dir=args.key_dir)
     artifact_root = args.artifact_root if args.artifact_root is not None else str(Path.cwd())
+    if receipt.workload.name == "mlx-lm-text-v1":
+        bundle_from_workload(receipt.workload).verify(Path(artifact_root), check_runtime=True)
 
     attestation: str | None = None
     attestation_refusal: str | None = None
@@ -1372,7 +1391,7 @@ def _run_dispatch_command(args: argparse.Namespace) -> dict[str, Any]:
         record = plan.execute(
             execution_policy,
             registry=registry,
-            provider=LocalSandboxProvider(),
+            provider=_local_provider(workload),
             authority=LocalSandboxAuthority(),
         )
         if record.status is not ExecutionStatus.SUCCESS:
@@ -1393,6 +1412,9 @@ def _load_tune_context(
     artifact_root = args.artifact_root
     workload_value = _read_document_json(args.workload, kind="workload")
     workload = _as_document("workload", workload_value, workload_value=None, artifact_root=artifact_root)
+    if workload.name == "mlx-lm-text-v1":
+        from .model_bundle import bundle_from_workload
+        bundle_from_workload(workload).verify(Path(artifact_root), check_runtime=True)
     provider_value = _read_document_json(args.provider, kind="provider")
     provider = _as_document("provider", provider_value, workload_value=None, artifact_root=None)
     if args.policy is not None:
@@ -1458,7 +1480,7 @@ def _run_tune_command(args: argparse.Namespace) -> dict[str, Any]:
         probe_record = probe_plan.execute(
             probe_execution_policy,
             registry=registry,
-            provider=LocalSandboxProvider(),
+            provider=_local_provider(workload),
             authority=LocalSandboxAuthority(),
         )
         if probe_record.status is not ExecutionStatus.SUCCESS:
@@ -1480,7 +1502,7 @@ def _run_tune_command(args: argparse.Namespace) -> dict[str, Any]:
                 artifact_root=artifact_root,
                 policy=rung_policy,
                 execution_policy=rung_execution_policy,
-                provider=LocalSandboxProvider(),
+                provider=_local_provider(workload),
                 authority=LocalSandboxAuthority(),
             )
             return evaluator.evaluate(candidate)
@@ -1590,7 +1612,13 @@ def _exit_for_error(error: AutoMLXError) -> int:
     return EXIT_CONTRACT
 
 
+from .inference_cli import run_bundle, run_inference
+
+
 _COMMAND_HANDLERS: Final[dict[str, Callable[[argparse.Namespace], dict[str, Any]]]] = {
+    "bundle": run_bundle,
+    "generate": run_inference,
+    "serve": run_inference,
     "validate": _run_document_command,
     "inspect": _run_document_command,
     "evaluate": _run_evaluate_command,

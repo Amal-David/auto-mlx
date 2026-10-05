@@ -71,7 +71,18 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(metadata["Name"], "auto-mlx")
             self.assertEqual(metadata["Version"], "0.1.0")
             self.assertEqual(metadata["Requires-Python"], ">=3.11")
-            self.assertIsNone(metadata.get("Requires-Dist"))
+            # Optional native dependencies must never become core dependencies.
+            self.assertEqual(metadata.get_all("Provides-Extra"), ["inference"])
+            requirements = metadata.get_all("Requires-Dist", [])
+            self.assertEqual(len(requirements), 5)
+            self.assertEqual(
+                {requirement.split(";", 1)[0].strip() for requirement in requirements},
+                {"mlx==0.32.0", "mlx-lm==0.31.3", "transformers==5.16.0", "tokenizers==0.23.1", "safetensors==0.8.0"},
+            )
+            for requirement in requirements:
+                self.assertRegex(requirement, r'; \(sys_platform == "darwin" and platform_machine == "arm64"\) and extra == "inference"$')
+            for native_file in ("model_bundle.py", "inference.py", "inference_cli.py", "inference_server.py", "runners/mlx_lm.py", "runners/mlx_lm_runner.py"):
+                self.assertIn("auto_mlx/" + native_file, names)
             self.assertIn("# Auto MLX", metadata.get_payload())
             entry_points_name = next(name for name in names if name.endswith(".dist-info/entry_points.txt"))
             self.assertIn("auto-mlx = auto_mlx.cli:main", archive.read(entry_points_name).decode("utf-8"))

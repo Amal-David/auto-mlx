@@ -9,6 +9,7 @@ import time
 import uuid
 
 from .canonical import strict_json_loads
+from .serving_evidence import native_capabilities
 from .errors import AutoMLXError
 from .model_bundle import integer, require
 from .runners.mlx_lm_runner import validate_request
@@ -30,7 +31,15 @@ class LocalInferenceServer(ThreadingMixIn, HTTPServer):
 
     def process_request(self, request, address):
         if not self._slots.acquire(blocking=False):
-            self.shutdown_request(request)
+            # Bound the overload path and return a real error, not a silent reset.
+            body = b'{"error":{"message":"local HTTP admission limit reached"}}'
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
             return
         try:
             super().process_request(request, address)
@@ -75,7 +84,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
         try:
             self._local_request()
             if self.path == "/health":
-                self._json(200, {"ok": True, "bundle_id": self.server.session.bundle.bundle_id, "scope": "single-user-local"})
+                self._json(200, {"ok": True, "bundle_id": self.server.session.bundle.bundle_id, "scope": "single-user-local", "capabilities": native_capabilities(getattr(self.server.session.bundle, "device", "unknown"))})
             elif self.path == "/v1/models":
                 self._json(200, {"object": "list", "data": [{"id": self.server.session.bundle.bundle_id, "object": "model", "owned_by": "local"}]})
             else:
@@ -84,6 +93,8 @@ class InferenceHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": str(exc)}})
 
     def do_POST(self):
+        handler_started_ns = time.perf_counter_ns()
+        first_content_ns = None
         stream = None
         headers_sent = False
         try:
@@ -107,12 +118,23 @@ class InferenceHandler(BaseHTTPRequestHandler):
             # Advance before success headers: admission, tokenization, context,
             # model loading and first-token failures become ordinary HTTP errors.
             first = next(stream)
+            if first.get("event") == "delta" and first.get("text"):
+                first_content_ns = time.perf_counter_ns() - handler_started_ns
             identifier = "cmpl-" + uuid.uuid4().hex
             created = int(time.time())
             base = {"id": identifier, "object": "text_completion", "created": created, "model": self.server.session.bundle.bundle_id}
             def events():
-                yield first
-                yield from stream
+                nonlocal first_content_ns
+                def observed(event):
+                    nonlocal first_content_ns
+                    if first_content_ns is None and event.get("event") == "delta" and event.get("text"):
+                        first_content_ns = time.perf_counter_ns() - handler_started_ns
+                    return event
+                yield observed(first)
+                for event in stream:
+                    yield observed(event)
+            def response_metrics(final):
+                return {"measurement_boundary": "handler-entry-after-headers-to-generation-complete-before-final-response-write", "request_first_content_ns": first_content_ns, "request_end_to_end_ns": time.perf_counter_ns() - handler_started_ns, "memory_metric": final.get("memory_metric", "unknown"), **{key: final[key] for key in ("time_to_first_token_ns", "generation_elapsed_ns", "peak_memory_bytes") if key in final}}
             if body.get("stream", False):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
@@ -124,7 +146,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
                     result = {**base, "choices": [{"index": 0, "text": "" if done else event["text"], "finish_reason": event.get("finish_reason") if done else None}]}
                     if done:
                         result["usage"] = {"prompt_tokens": event["prompt_tokens"], "completion_tokens": event["completion_tokens"], "total_tokens": event["prompt_tokens"] + event["completion_tokens"]}
-                        result["auto_mlx"] = profile
+                        result["auto_mlx"] = {**profile, "metrics": response_metrics(event), "capabilities": native_capabilities(getattr(self.server.session.bundle, "device", "unknown"))}
                     self.wfile.write(b"data: " + json.dumps(result).encode() + b"\n\n")
                     self.wfile.flush()
                 self.wfile.write(b"data: [DONE]\n\n")
@@ -135,7 +157,7 @@ class InferenceHandler(BaseHTTPRequestHandler):
                     if event["event"] == "done":
                         final = event
                 require(final is not None, "generation ended without a final event")
-                self._json(200, {**base, "choices": [{"index": 0, "text": final["text"], "finish_reason": final["finish_reason"]}], "usage": {"prompt_tokens": final["prompt_tokens"], "completion_tokens": final["completion_tokens"], "total_tokens": final["prompt_tokens"] + final["completion_tokens"]}, "auto_mlx": {**profile, "metrics": {"memory_metric": final.get("memory_metric", "unknown"), **{k: final[k] for k in ("time_to_first_token_ns", "generation_elapsed_ns", "peak_memory_bytes")}}}})
+                self._json(200, {**base, "choices": [{"index": 0, "text": final["text"], "finish_reason": final["finish_reason"]}], "usage": {"prompt_tokens": final["prompt_tokens"], "completion_tokens": final["completion_tokens"], "total_tokens": final["prompt_tokens"] + final["completion_tokens"]}, "auto_mlx": {**profile, "metrics": response_metrics(final), "capabilities": native_capabilities(getattr(self.server.session.bundle, "device", "unknown"))}})
         except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
             pass  # Iterator close below cancels work on disconnect/read timeout.
         except (AutoMLXError, ValueError, TypeError, StopIteration) as exc:

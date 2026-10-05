@@ -137,6 +137,8 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(
             set(schema_names()),
             {
+                "cache_namespace.json",
+                "serving_comparison_context.json",
                 "artifact.json",
                 "candidate_proposal.json",
                 "declarative_provider.json",

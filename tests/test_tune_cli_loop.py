@@ -179,7 +179,26 @@ class TuneCLIEndToEndTests(unittest.TestCase):
         status, stdout, stderr = _run_cli("tune", *flags)
         self.assertEqual(status, 0, stderr)
         second_summary = json.loads(stdout)
-        self.assertEqual(len(second_summary["entrants"]), 2)
+        # Prior measured regressions can legitimately prune the second race.
+        # Account for every configuration and require its exact stored evidence;
+        # assuming two measured entrants makes this test timing-dependent.
+        from auto_mlx.advisor import PRUNE_REASON
+        pruned = second_summary["prefilter"]["pruned"]
+        accounted = second_summary["entrants"] + pruned
+        self.assertEqual(len(accounted), 2)
+        self.assertEqual(
+            {canonical_json(row["config"]) for row in accounted},
+            {canonical_json(dict(config)) for config in second_provider.configs},
+        )
+        first_receipts = {row["receipt_id"]: row for row in entrants}
+        for row in pruned:
+            self.assertEqual(row["reason"], PRUNE_REASON)
+            self.assertEqual(row["summary_id"], summary["summary_id"])
+            self.assertIn(row["receipt_id"], first_receipts)
+            original = first_receipts[row["receipt_id"]]
+            self.assertTrue(original["attested"])
+            self.assertEqual(original["statistics"]["verdict"], "regressed")
+            self.assertEqual(store.get_receipt(row["receipt_id"]).receipt_id, row["receipt_id"])
 
         status, stdout, stderr = _run_cli(
             "history",

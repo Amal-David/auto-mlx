@@ -460,6 +460,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     from .inference_cli import add_arguments
     add_arguments(subparsers, JSONArgumentParser)
+    compare_parser = subparsers.add_parser("compare-serving", help="check declared serving benchmark comparability without execution or promotion", allow_abbrev=False)
+    compare_parser.add_argument("--baseline", required=True, help="baseline comparison context JSON")
+    compare_parser.add_argument("--candidate", required=True, help="candidate comparison context JSON")
     return parser
 
 
@@ -1615,10 +1618,18 @@ def _exit_for_error(error: AutoMLXError) -> int:
 from .inference_cli import run_bundle, run_inference
 
 
+def _run_compare_serving_command(args: argparse.Namespace) -> dict[str, Any]:
+    from .serving_evidence import ServingComparisonContext, compare_contexts
+    baseline = ServingComparisonContext.from_dict(_read_json(args.baseline))
+    candidate = ServingComparisonContext.from_dict(_read_json(args.candidate))
+    return {"ok": True, "command": "compare-serving", **compare_contexts(baseline, candidate)}
+
+
 _COMMAND_HANDLERS: Final[dict[str, Callable[[argparse.Namespace], dict[str, Any]]]] = {
     "bundle": run_bundle,
     "generate": run_inference,
     "serve": run_inference,
+    "compare-serving": _run_compare_serving_command,
     "validate": _run_document_command,
     "inspect": _run_document_command,
     "evaluate": _run_evaluate_command,

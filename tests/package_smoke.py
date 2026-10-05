@@ -4,6 +4,7 @@ import argparse
 from importlib import metadata
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -64,8 +65,23 @@ def main() -> int:
             raise AssertionError(f"repo-only or relocated material leaked into the installed wheel: {leaked}")
 
     distribution = metadata.distribution("auto-mlx")
-    if distribution.requires not in (None, []):
-        raise AssertionError(f"runtime dependencies were installed: {distribution.requires}")
+    # Requires-Dist describes optional extras as well as core dependencies.
+    # Verify both their scope and the actual clean-wheel environment.
+    optional = {"mlx", "mlx-lm", "transformers", "tokenizers", "safetensors"}
+    requirements = distribution.requires or []
+    if len(requirements) != len(optional):
+        raise AssertionError(f"unexpected dependency metadata: {requirements}")
+    for requirement in requirements:
+        if not re.fullmatch(r'[a-z-]+==[0-9.]+; \(sys_platform == "darwin" and platform_machine == "arm64"\) and extra == "inference"', requirement):
+            raise AssertionError(f"a dependency escaped the optional inference extra: {requirement}")
+    if {value.split("==", 1)[0] for value in requirements} != optional:
+        raise AssertionError("unexpected native dependency set")
+    for package in optional:
+        try:
+            metadata.distribution(package)
+        except metadata.PackageNotFoundError:
+            continue
+        raise AssertionError(f"optional native package installed by core wheel: {package}")
 
     for command in ([sys.executable, "-m", "auto_mlx", "--version"], [str(args.console_script), "--version"]):
         version_result = _run(command, cwd=args.workdir)
